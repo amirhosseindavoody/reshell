@@ -1,0 +1,32 @@
+[workspace]
+name = "reshell"
+version = "2026.7.17+0"
+description = "Keep shells alive across SSH disconnects with explicit attach/detach sessions"
+authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+preview = ["pixi-build"]
+
+[package]
+name = "reshell"
+version = "2026.7.17+0"
+
+[package.build]
+backend = { name = "pixi-build-rattler-build", version = "0.*" }
+
+[feature.dev.dependencies]
+rust = ">=1.97.1,<1.98"
+
+[feature.test.dependencies]
+reshell = { path = "." }
+
+[tasks]
+build = "cargo build --release"
+reshell = "cargo run --release --"
+test = "cargo test"
+conda-package = "pixi publish --target-dir dist"
+update-version = "scripts/update-version.sh"
+
+[environments]
+default = { features = ["dev"] }
+test = { features = ["test"] }

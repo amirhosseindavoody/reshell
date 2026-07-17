@@ -1,0 +1,9 @@
+# pixi
+.pixi/
+
+# Rust
+target/
+
+# Packaging / build artifacts
+dist/
+*.conda

@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/prefix-dev/recipe-format/main/schema.json
+
+context:
+  version: 2026.7.17+0
+
+package:
+  name: reshell
+  version: ${{ version }}
+
+source:
+  path: ..
+  use_gitignore: true
+
+build:
+  number: 0
+  script:
+    - |
+      set -euo pipefail
+      cd "$SRC_DIR"
+      host="$(rustc -vV | sed -n 's/^host: //p')"
+      cargo build --locked --release
+      install -Dm755 "target/${host}/release/reshell" "$PREFIX/bin/reshell"
+      rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
+
+requirements:
+  build:
+    - ${{ compiler('rust') }}
+    - ${{ compiler('c') }}
+
+tests:
+  - script:
+      - reshell --help
+
+about:
+  summary: Keep shells alive across SSH disconnects with explicit attach/detach sessions
+  license: MIT
+  license_file: LICENSE
