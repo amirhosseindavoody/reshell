@@ -9,7 +9,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Explicit sessions: `new` / `attach` / `list` / `kill`
 - Detach with **Ctrl+\** (client exits; session keeps running)
 - Targeted at SSH sessions into Linux servers
-- Supports bash, zsh, and fish (any interactive `$SHELL`)
+- Defaults to **zsh** (`/bin/zsh`); override with `--shell` for bash, fish, etc.
 
 ## Quick start
 
@@ -50,10 +50,10 @@ pixi global install --git https://github.com/amirhosseindavoody/reshell.git --br
 ## Usage
 
 ```bash
-# Create a detached session (prints the name)
+# Create a detached session (prints the name); default shell is /bin/zsh
 reshell new demo
 # or: reshell new          # auto-generated name
-# or: reshell new demo --shell /bin/zsh
+# or: reshell new demo --shell /bin/bash
 
 # Attach (Ctrl+\ detaches without killing the shell)
 reshell attach demo

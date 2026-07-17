@@ -31,8 +31,8 @@ enum Commands {
     New {
         /// Session name (generated if omitted)
         name: Option<String>,
-        /// Shell to run (default: $SHELL or /bin/sh)
-        #[arg(long, env = "SHELL")]
+        /// Shell to run (default: /bin/zsh)
+        #[arg(long)]
         shell: Option<String>,
         /// Attach immediately after creating the session
         #[arg(long, short = 'a')]
@@ -119,7 +119,7 @@ fn run() -> Result<()> {
 }
 
 fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    "/bin/zsh".into()
 }
 
 fn format_unix(ts: u64) -> String {

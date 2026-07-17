@@ -47,7 +47,7 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `kill` |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `kill`; default shell `/bin/zsh` |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/kill, attach lock |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
@@ -79,13 +79,14 @@ Session names are limited to `[A-Za-z0-9._-]`, max 64 characters.
 ## Session creation (`new`)
 
 1. Validate name; refuse if a live session with that name already exists.
-2. Create the session directory.
-3. `pipe` + `fork`:
+2. Resolve shell: `--shell <path>` if given, otherwise **`/bin/zsh`** (not `$SHELL`).
+3. Create the session directory.
+4. `pipe` + `fork`:
    - **Parent:** close write end; block until child writes one readiness byte (or timeout / EOF).
    - **Child:** `setsid`, ignore `SIGHUP`/`SIGINT`/`SIGPIPE`, reopen stdio to `/dev/null`, run the daemon.
-4. Daemon `openpty`, forks the shell on the slave (`TIOCSCTTY`, dup2 0/1/2, `exec` shell).
-5. Daemon binds `session.sock`, writes `meta.json` (pid = daemon), signals readiness.
-6. Parent prints the session name and exits (optionally continues into `attach` with `-a`).
+5. Daemon `openpty`, forks the shell on the slave (`TIOCSCTTY`, dup2 0/1/2, `exec` shell).
+6. Daemon binds `session.sock`, writes `meta.json` (pid = daemon), signals readiness.
+7. Parent prints the session name and exits (optionally continues into `attach` with `-a`).
 
 The daemon ignores `SIGHUP` so an SSH disconnect of the creating terminal does not
 tear it down. The shell keeps default signal disposition so Ctrl+C reaches it via
