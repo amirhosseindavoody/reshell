@@ -24,40 +24,65 @@ pub enum Message {
     Attach(Winsize),
 }
 
-pub fn write_message(w: impl Write, msg: &Message) -> Result<()> {
-    match msg {
-        Message::Data(data) => {
-            write_framed(w, MSG_DATA, data)?;
-        }
-        Message::Resize(ws) => {
-            let mut payload = [0u8; 4];
-            payload[0..2].copy_from_slice(&ws.rows.to_le_bytes());
-            payload[2..4].copy_from_slice(&ws.cols.to_le_bytes());
-            write_framed(w, MSG_RESIZE, &payload)?;
-        }
-        Message::Detach => {
-            write_framed(w, MSG_DETACH, &[])?;
-        }
-        Message::Attach(ws) => {
-            let mut payload = [0u8; 4];
-            payload[0..2].copy_from_slice(&ws.rows.to_le_bytes());
-            payload[2..4].copy_from_slice(&ws.cols.to_le_bytes());
-            write_framed(w, MSG_ATTACH, &payload)?;
-        }
-    }
+pub fn write_message(mut w: impl Write, msg: &Message) -> Result<()> {
+    let bytes = encode_message(msg)?;
+    w.write_all(&bytes).context("write message")?;
     Ok(())
 }
 
-fn write_framed(mut w: impl Write, kind: u8, payload: &[u8]) -> Result<()> {
+/// Encode a message to a complete framed byte buffer (safe to write partially).
+pub fn encode_message(msg: &Message) -> Result<Vec<u8>> {
+    let (kind, payload): (u8, &[u8]) = match msg {
+        Message::Data(data) => (MSG_DATA, data.as_slice()),
+        Message::Resize(ws) => {
+            return encode_winsize(MSG_RESIZE, *ws);
+        }
+        Message::Detach => (MSG_DETACH, &[]),
+        Message::Attach(ws) => {
+            return encode_winsize(MSG_ATTACH, *ws);
+        }
+    };
+    encode_framed(kind, payload)
+}
+
+fn encode_winsize(kind: u8, ws: Winsize) -> Result<Vec<u8>> {
+    let mut payload = [0u8; 4];
+    payload[0..2].copy_from_slice(&ws.rows.to_le_bytes());
+    payload[2..4].copy_from_slice(&ws.cols.to_le_bytes());
+    encode_framed(kind, &payload)
+}
+
+fn encode_framed(kind: u8, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > u32::MAX as usize {
         bail!("message payload too large");
     }
-    w.write_all(&[kind])
-        .context("write message type")?;
-    w.write_all(&(payload.len() as u32).to_le_bytes())
-        .context("write message length")?;
-    w.write_all(payload).context("write message payload")?;
-    Ok(())
+    let mut out = Vec::with_capacity(1 + 4 + payload.len());
+    out.push(kind);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// Push bytes into `buf` and decode as many complete messages as possible.
+pub fn drain_messages(buf: &mut Vec<u8>) -> Result<Vec<Message>> {
+    let mut out = Vec::new();
+    loop {
+        if buf.len() < 5 {
+            break;
+        }
+        let len = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+        let total = 5 + len;
+        if buf.len() < total {
+            break;
+        }
+        let frame: Vec<u8> = buf.drain(..total).collect();
+        let mut cursor = io::Cursor::new(frame);
+        match read_message(&mut cursor)? {
+            Some(msg) => out.push(msg),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 pub fn read_message(mut r: impl Read) -> Result<Option<Message>> {

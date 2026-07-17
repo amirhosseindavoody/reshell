@@ -82,3 +82,7 @@ pixi run conda-package     # build .conda into dist/
 ```
 
 Always use `pixi run` / `pixi run -- cargo …` so the conda Rust toolchain is used.
+
+## Design docs
+
+Internal architecture notes: [docs/internal/](docs/internal/).

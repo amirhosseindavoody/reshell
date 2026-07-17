@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -21,10 +21,66 @@ use crate::session::{
     self, cleanup_session_files, now_unix, set_attached, write_meta, SessionMeta, SessionPaths,
 };
 
+/// Stop reading the PTY into the client buffer beyond this size so the shell
+/// experiences backpressure instead of unbounded memory growth.
+const OUTBOUND_HIGH_WATER: usize = 256 * 1024;
+
 pub struct NewSessionOpts {
     pub name: String,
     pub shell: String,
     pub base: std::path::PathBuf,
+}
+
+struct ClientConn {
+    stream: UnixStream,
+    outbound: Vec<u8>,
+    inbound: Vec<u8>,
+}
+
+impl ClientConn {
+    fn new(stream: UnixStream) -> Result<Self> {
+        set_nonblocking(stream.as_raw_fd())?;
+        Ok(Self {
+            stream,
+            outbound: Vec::new(),
+            inbound: Vec::new(),
+        })
+    }
+
+    fn enqueue(&mut self, msg: &Message) -> Result<()> {
+        let bytes = protocol::encode_message(msg)?;
+        self.outbound.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    fn flush_outbound(&mut self) -> Result<bool> {
+        while !self.outbound.is_empty() {
+            match self.stream.write(&self.outbound) {
+                Ok(0) => return Ok(true), // disconnect
+                Ok(n) => {
+                    self.outbound.drain(..n);
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    fn read_inbound(&mut self) -> Result<bool> {
+        let mut buf = [0u8; 8192];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(n) => self.inbound.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Create a new detached session daemon and return once it is listening.
@@ -45,12 +101,10 @@ pub fn create_session(opts: NewSessionOpts) -> Result<()> {
     fs::create_dir_all(&paths.dir)
         .with_context(|| format!("create session dir {}", paths.dir.display()))?;
 
-    // Readiness pipe: child writes one byte when socket is ready.
     let (read_fd, write_fd) = nix::unistd::pipe().context("create readiness pipe")?;
 
     match unsafe { fork() }.context("fork session daemon")? {
         ForkResult::Parent { child: _ } => {
-            // Close write end in parent; keep ownership of read_fd.
             let read_raw = read_fd.as_raw_fd();
             drop(write_fd);
             wait_for_ready(read_raw, &paths)?;
@@ -59,9 +113,7 @@ pub fn create_session(opts: NewSessionOpts) -> Result<()> {
         }
         ForkResult::Child => {
             drop(read_fd);
-            // Detach from controlling terminal / parent session.
             let _ = setsid();
-            // Ignore SIGHUP so SSH disconnect of creator does not kill us.
             unsafe {
                 let _ = signal::signal(Signal::SIGHUP, SigHandler::SigIgn);
                 let _ = signal::signal(Signal::SIGINT, SigHandler::SigIgn);
@@ -157,11 +209,7 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
             let slave_fd = slave.as_raw_fd();
             let _ = setsid();
 
-            // Make slave the controlling terminal (Linux).
-            let ret = unsafe { nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0) };
-            if ret < 0 {
-                // Non-fatal on some environments; shell may still work.
-            }
+            let _ = unsafe { nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0) };
 
             dup2(slave_fd, 0).context("dup2 slave stdin")?;
             dup2(slave_fd, 1).context("dup2 slave stdout")?;
@@ -202,13 +250,6 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-fn set_blocking(fd: RawFd) -> Result<()> {
-    let flags = fcntl(fd, FcntlArg::F_GETFL).context("F_GETFL")?;
-    let flags = OFlag::from_bits_truncate(flags) - OFlag::O_NONBLOCK;
-    fcntl(fd, FcntlArg::F_SETFL(flags)).context("F_SETFL blocking")?;
-    Ok(())
-}
-
 fn set_cloexec(fd: RawFd) -> Result<()> {
     let flags = fcntl(fd, FcntlArg::F_GETFD).context("F_GETFD")?;
     fcntl(
@@ -240,7 +281,7 @@ fn server_loop(
     paths: &SessionPaths,
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
-    let mut client: Option<UnixStream> = None;
+    let mut client: Option<ClientConn> = None;
     let mut buf = [0u8; 8192];
 
     loop {
@@ -256,11 +297,24 @@ fn server_loop(
             Err(e) => return Err(e).context("waitpid"),
         }
 
+        let want_pty_read = match &client {
+            Some(c) => c.outbound.len() < OUTBOUND_HIGH_WATER,
+            None => true, // drain + discard while detached
+        };
+
         let mut fds = Vec::with_capacity(3);
-        fds.push(PollFd::new(master.as_fd(), PollFlags::POLLIN));
+        let mut pty_flags = PollFlags::empty();
+        if want_pty_read {
+            pty_flags |= PollFlags::POLLIN;
+        }
+        fds.push(PollFd::new(master.as_fd(), pty_flags));
         fds.push(PollFd::new(listener.as_fd(), PollFlags::POLLIN));
         if let Some(ref c) = client {
-            fds.push(PollFd::new(c.as_fd(), PollFlags::POLLIN));
+            let mut interest = PollFlags::POLLIN;
+            if !c.outbound.is_empty() {
+                interest |= PollFlags::POLLOUT;
+            }
+            fds.push(PollFd::new(c.stream.as_fd(), interest));
         }
 
         match poll(&mut fds, 500u16) {
@@ -280,15 +334,19 @@ fn server_loop(
         if listen_revents.contains(PollFlags::POLLIN) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    set_nonblocking(stream.as_raw_fd())?;
                     if client.is_some() {
                         drop(stream);
                     } else {
-                        client = Some(stream);
-                        let _ = set_attached(paths, true);
+                        match ClientConn::new(stream) {
+                            Ok(c) => {
+                                client = Some(c);
+                                let _ = set_attached(paths, true);
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e).context("accept"),
             }
         }
@@ -298,13 +356,11 @@ fn server_loop(
                 Ok(0) => break,
                 Ok(n) => {
                     if let Some(ref mut c) = client {
-                        if protocol::write_message(&mut *c, &Message::Data(buf[..n].to_vec()))
-                            .is_err()
-                            || c.flush().is_err()
-                        {
+                        if c.enqueue(&Message::Data(buf[..n].to_vec())).is_err() {
                             drop_client(&mut client, paths);
                         }
                     }
+                    // else discarded (still drained)
                 }
                 Err(Errno::EAGAIN) => {}
                 Err(Errno::EIO) => break,
@@ -317,20 +373,35 @@ fn server_loop(
             break;
         }
 
-        if client.is_some()
-            && client_revents.intersects(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP)
-        {
-            if client_revents.contains(PollFlags::POLLIN) {
-                let disconnect = match handle_client_readable(client.as_mut().unwrap(), master_fd) {
-                    Ok(false) => false,
-                    Ok(true) => true,
-                    Err(_) => true,
-                };
-                if disconnect {
-                    drop_client(&mut client, paths);
-                }
-            } else {
+        if let Some(ref mut c) = client {
+            if client_revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
                 drop_client(&mut client, paths);
+            } else {
+                let mut dead = false;
+                if client_revents.contains(PollFlags::POLLOUT) || !c.outbound.is_empty() {
+                    dead = c.flush_outbound()?;
+                }
+                if !dead
+                    && client_revents
+                        .intersects(PollFlags::POLLIN | PollFlags::POLLHUP)
+                {
+                    dead = c.read_inbound()?;
+                    if !dead {
+                        match handle_client_messages(c, master_fd) {
+                            Ok(true) => dead = true,
+                            Ok(false) => {}
+                            Err(_) => dead = true,
+                        }
+                    }
+                }
+                if dead {
+                    drop_client(&mut client, paths);
+                } else if !c.outbound.is_empty() {
+                    // Opportunistic flush after enqueue from PTY.
+                    if c.flush_outbound()? {
+                        drop_client(&mut client, paths);
+                    }
+                }
             }
         }
     }
@@ -340,38 +411,26 @@ fn server_loop(
     Ok(())
 }
 
-fn drop_client(client: &mut Option<UnixStream>, paths: &SessionPaths) {
+fn drop_client(client: &mut Option<ClientConn>, paths: &SessionPaths) {
     *client = None;
     let _ = set_attached(paths, false);
 }
 
-/// Returns Ok(true) if client should be disconnected (detach / EOF / error).
-fn handle_client_readable(client: &mut UnixStream, master_fd: RawFd) -> Result<bool> {
-    set_blocking(client.as_raw_fd())?;
-    let msg = match protocol::read_message(&mut *client) {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            let _ = set_nonblocking(client.as_raw_fd());
-            return Ok(true);
+/// Returns Ok(true) if client should disconnect (Detach).
+fn handle_client_messages(client: &mut ClientConn, master_fd: RawFd) -> Result<bool> {
+    let messages = protocol::drain_messages(&mut client.inbound)?;
+    for msg in messages {
+        match msg {
+            Message::Attach(ws) | Message::Resize(ws) => {
+                apply_winsize(master_fd, ws)?;
+            }
+            Message::Data(data) => {
+                write_all_fd(master_fd, &data)?;
+            }
+            Message::Detach => return Ok(true),
         }
-        Err(_) => {
-            let _ = set_nonblocking(client.as_raw_fd());
-            return Ok(true);
-        }
-    };
-    set_nonblocking(client.as_raw_fd())?;
-
-    match msg {
-        Message::Attach(ws) | Message::Resize(ws) => {
-            apply_winsize(master_fd, ws)?;
-            Ok(false)
-        }
-        Message::Data(data) => {
-            write_all_fd(master_fd, &data)?;
-            Ok(false)
-        }
-        Message::Detach => Ok(true),
     }
+    Ok(false)
 }
 
 fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Result<()> {

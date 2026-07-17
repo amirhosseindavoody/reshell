@@ -1,0 +1,25 @@
+---
+description: Keep README.md and docs/ in sync after code changes
+alwaysApply: true
+---
+
+# Keep documentation updated
+
+After any change that affects behavior, CLI, config, architecture, or protocol, update the docs in the same change. Do not leave documentation for a follow-up.
+
+## What to update
+
+| Change type | Update |
+|-------------|--------|
+| User-facing CLI, install, usage, features, env vars | Root [README.md](README.md) |
+| Process model, session layout, modules, attach/detach | [docs/internal/design.md](docs/internal/design.md) |
+| Socket framing / client–server messages | [docs/internal/protocol.md](docs/internal/protocol.md) |
+| New or renamed internal doc | Index tables in [docs/README.md](docs/README.md) and [docs/internal/README.md](docs/internal/README.md) |
+
+## Rules
+
+- Prefer editing existing docs over adding new files. Add a new doc only when the topic does not fit `design.md` or `protocol.md`.
+- Keep README user-facing: install, commands, detach key, session dir. Put internals in `docs/internal/`.
+- If a change makes a documented claim false (flags, defaults, paths, protocol fields), fix that claim in the same edit.
+- Pure refactors with no behavioral or interface change need no doc update — say so briefly if asked.
+- Do not invent features in docs that are not implemented.

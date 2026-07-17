@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::rc::Rc;
@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::termios::{
@@ -52,6 +53,7 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
 
     let mut stream = UnixStream::connect(&paths.socket)
         .with_context(|| format!("connect to {}", paths.socket.display()))?;
+    set_nonblocking(stream.as_raw_fd())?;
 
     let orig = tcgetattr(io::stdin().as_fd()).context("tcgetattr")?;
     let mut raw = orig.clone();
@@ -75,8 +77,11 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
     }
 
     let ws = current_winsize(stdin_fd)?;
+    // Attach must be written atomically; briefly use blocking for the small control message.
+    set_blocking(stream.as_raw_fd())?;
     protocol::write_message(&mut stream, &Message::Attach(ws))?;
     stream.flush()?;
+    set_nonblocking(stream.as_raw_fd())?;
 
     let result = client_loop(&mut stream, stdin_fd);
     drop(restore_on_drop);
@@ -142,26 +147,46 @@ fn current_winsize(fd: i32) -> Result<Winsize> {
     })
 }
 
+fn set_nonblocking(fd: i32) -> Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFL).context("F_GETFL")?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).context("F_SETFL O_NONBLOCK")?;
+    Ok(())
+}
+
+fn set_blocking(fd: i32) -> Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFL).context("F_GETFL")?;
+    let flags = OFlag::from_bits_truncate(flags) - OFlag::O_NONBLOCK;
+    fcntl(fd, FcntlArg::F_SETFL(flags)).context("F_SETFL blocking")?;
+    Ok(())
+}
+
 fn client_loop(stream: &mut UnixStream, stdin_fd: i32) -> Result<()> {
     let stdout_fd = io::stdout().as_raw_fd();
     let mut stdin_buf = [0u8; 4096];
+    let mut sock_buf = [0u8; 8192];
     let mut pending_stdin: Vec<u8> = Vec::new();
+    let mut inbound: Vec<u8> = Vec::new();
+    let mut outbound: Vec<u8> = Vec::new();
 
     loop {
         if HUP_FLAG.swap(false, Ordering::Relaxed) {
-            let _ = protocol::write_message(&mut *stream, &Message::Detach);
-            let _ = stream.flush();
+            outbound.extend(protocol::encode_message(&Message::Detach)?);
+            let _ = flush_outbound(stream, &mut outbound);
             return Ok(());
         }
         if WINCH_FLAG.swap(false, Ordering::Relaxed) {
             let ws = current_winsize(stdin_fd)?;
-            protocol::write_message(&mut *stream, &Message::Resize(ws))?;
-            stream.flush()?;
+            outbound.extend(protocol::encode_message(&Message::Resize(ws))?);
         }
 
+        let mut sock_interest = PollFlags::POLLIN;
+        if !outbound.is_empty() {
+            sock_interest |= PollFlags::POLLOUT;
+        }
         let mut fds = [
             PollFd::new(unsafe { BorrowedFd::borrow_raw(stdin_fd) }, PollFlags::POLLIN),
-            PollFd::new(stream.as_fd(), PollFlags::POLLIN),
+            PollFd::new(stream.as_fd(), sock_interest),
         ];
         match poll(&mut fds, 200u16) {
             Ok(_) => {}
@@ -175,33 +200,43 @@ fn client_loop(stream: &mut UnixStream, stdin_fd: i32) -> Result<()> {
         if stdin_ev.contains(PollFlags::POLLIN) {
             match nix_read(stdin_fd, &mut stdin_buf) {
                 Ok(0) => {
-                    let _ = protocol::write_message(&mut *stream, &Message::Detach);
+                    outbound.extend(protocol::encode_message(&Message::Detach)?);
+                    let _ = flush_outbound(stream, &mut outbound);
                     return Ok(());
                 }
                 Ok(n) => {
                     pending_stdin.extend_from_slice(&stdin_buf[..n]);
-                    if drain_stdin_to_session(stream, &mut pending_stdin)? {
+                    if enqueue_stdin(&mut outbound, &mut pending_stdin)? {
+                        let _ = flush_outbound(stream, &mut outbound);
                         return Ok(());
                     }
                 }
-                Err(Errno::EINTR) => {}
+                Err(Errno::EINTR) | Err(Errno::EAGAIN) => {}
                 Err(e) => return Err(e).context("read stdin"),
             }
         }
 
+        if sock_ev.contains(PollFlags::POLLOUT) || !outbound.is_empty() {
+            if flush_outbound(stream, &mut outbound)? {
+                return Ok(());
+            }
+        }
+
         if sock_ev.contains(PollFlags::POLLIN) {
-            match protocol::read_message(&mut *stream) {
-                Ok(Some(Message::Data(data))) => {
+            loop {
+                match stream.read(&mut sock_buf) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => inbound.extend_from_slice(&sock_buf[..n]),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e).context("read from session"),
+                }
+            }
+            let messages = protocol::drain_messages(&mut inbound)?;
+            for msg in messages {
+                if let Message::Data(data) = msg {
                     write_all_fd(stdout_fd, &data)?;
                 }
-                Ok(Some(_)) => {
-                    // Ignore unexpected control messages from server.
-                }
-                Ok(None) => {
-                    // Session ended.
-                    return Ok(());
-                }
-                Err(e) => return Err(e).context("read from session"),
             }
         }
 
@@ -209,30 +244,45 @@ fn client_loop(stream: &mut UnixStream, stdin_fd: i32) -> Result<()> {
             return Ok(());
         }
         if stdin_ev.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-            let _ = protocol::write_message(&mut *stream, &Message::Detach);
+            outbound.extend(protocol::encode_message(&Message::Detach)?);
+            let _ = flush_outbound(stream, &mut outbound);
             return Ok(());
         }
     }
 }
 
-/// Forward stdin bytes; returns true if detach was requested.
-fn drain_stdin_to_session(stream: &mut UnixStream, pending: &mut Vec<u8>) -> Result<bool> {
+/// Queue stdin bytes; returns true if detach was requested.
+fn enqueue_stdin(outbound: &mut Vec<u8>, pending: &mut Vec<u8>) -> Result<bool> {
     if pending.is_empty() {
         return Ok(false);
     }
     if let Some(pos) = pending.iter().position(|&b| b == DETACH_BYTE) {
         let before = pending[..pos].to_vec();
         if !before.is_empty() {
-            protocol::write_message(&mut *stream, &Message::Data(before))?;
+            outbound.extend(protocol::encode_message(&Message::Data(before))?);
         }
-        protocol::write_message(&mut *stream, &Message::Detach)?;
-        stream.flush()?;
+        outbound.extend(protocol::encode_message(&Message::Detach)?);
         pending.clear();
         return Ok(true);
     }
     let data = std::mem::take(pending);
-    protocol::write_message(&mut *stream, &Message::Data(data))?;
-    stream.flush()?;
+    outbound.extend(protocol::encode_message(&Message::Data(data))?);
+    Ok(false)
+}
+
+/// Returns true if the peer closed the connection.
+fn flush_outbound(stream: &mut UnixStream, outbound: &mut Vec<u8>) -> Result<bool> {
+    while !outbound.is_empty() {
+        match stream.write(outbound) {
+            Ok(0) => return Ok(true),
+            Ok(n) => {
+                outbound.drain(..n);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e).context("write to session"),
+        }
+    }
     Ok(false)
 }
 
