@@ -117,9 +117,18 @@ reshell does not keep a scrollback or screen buffer. Instead the daemon:
 1. Parses PTY output for DEC private modes (alt-screen, mouse tracking, bracketed
    paste, focus events, cursor visibility, …), including while detached.
 2. On `Attach`, sends those modes back to the new client as the first `Data`
-   payload (so the local TTY enables mouse again, enters alt-screen, etc.).
-3. Forces a `SIGWINCH` to the PTY foreground group even when the winsize is
-   unchanged (brief size bump + `TIOCGPGRP`/`SIGWINCH`), so TUI apps redraw.
+   payload (so the local TTY enables mouse again, enters alt-screen, etc.), then
+   clears the local screen.
+3. Forces a full child redraw that differential TUIs (notably ratatui/crossterm
+   apps such as [fresh](https://github.com/sinelaw/fresh)) will actually emit:
+   - Apply a temporary winsize (rows±1) so the app invalidates its previous cell
+     buffer and dumps a full frame to the newly attached client.
+   - After ~50ms of PTY output (or 250ms max), restore the real winsize for a
+     second full paint at the correct geometry.
+
+Instant same-size `SIGWINCH` is not enough: fresh redraws in memory, but
+crossterm only writes cells that differ from its previous buffer, so a blank
+reattach TTY stays blank until the user moves the mouse over dirty regions.
 
 PTY bytes are not forwarded to a client until `Attach` has been processed, so
 mode restore runs before any redraw data.
@@ -177,7 +186,8 @@ conda Rust toolchain is used, not an older system rustup.
 - Integration (`tests/session_smoke.rs`): `new` → speak protocol over the socket →
   detach → reconnect → confirm the same shell is still alive → `kill`.
 - Integration (`tests/attach_restore.rs`): child enables mouse/alt-screen → detach →
-  reattach observes restored CSI modes and a forced redraw signal path.
+  reattach observes restored CSI modes; SIGWINCH reporter confirms temporary then
+  final winsize (two-phase full paint for differential TUIs).
 
 Attach’s TTY path is exercised manually or via an external PTY driver; the smoke
 test intentionally talks the wire protocol so CI does not need a controlling TTY.
