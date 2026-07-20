@@ -77,6 +77,24 @@ reshell kill demo
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
+## Why reshell instead of tmux, screen, or Zellij?
+
+reshell is a **session manager**, not a terminal multiplexer. It keeps one interactive shell (and its children) alive across SSH disconnects, then lets you reattach. It is closer to [dtach](https://github.com/crigler/dtach) / [abduco](https://github.com/martanne/abduco) than to tmux.
+
+| | reshell | tmux / screen / Zellij |
+|---|---|---|
+| **Job** | Survive hangups; reattach to the same PTY | Windows, panes, tabs, status bars, layouts |
+| **Keys** | Only **Ctrl+\\** detaches | Prefix chord (`Ctrl+b`, `Ctrl+a`, …) steals shortcuts from nested apps |
+| **Nested TUIs** | Raw passthrough — editors, ratatui apps, and mouse just work | Often need extra config; mouse/keys can conflict with the multiplexer |
+| **VS Code / Cursor** | OSC 633 passes through; sticky scroll tracks commands *inside* the session | Multiplexers often eat or rewrite escape sequences unless specially wrapped |
+| **Complexity** | One session ↔ one shell | Full virtual terminal + UI chrome |
+
+**Choose reshell when** you mainly want “SSH died but my shell is still there,” especially with full-screen editors or other TUIs, and you do not want another layer of keybindings.
+
+**Choose tmux / screen / Zellij when** you need split panes, multiple windows, shared sessions, or a persistent scrollback/UI inside the multiplexer itself.
+
+You can also run a multiplexer *inside* a reshell session if you want both hangup survival and panes — reshell will not fight it for keys.
+
 ## Development
 
 ```bash
