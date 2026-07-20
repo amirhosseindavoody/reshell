@@ -3,7 +3,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
@@ -26,6 +26,15 @@ use crate::termstate::TermState;
 /// experiences backpressure instead of unbounded memory growth.
 const OUTBOUND_HIGH_WATER: usize = 256 * 1024;
 
+/// After attach, keep the temporary (bumped) winsize at least this long so
+/// differential TUIs (ratatui/crossterm) can emit a full cell dump at the new
+/// geometry before we restore the real size.
+const ATTACH_REDRAW_MIN: Duration = Duration::from_millis(50);
+
+/// Always restore the real winsize by this deadline even if no PTY output
+/// arrived (plain shells may not redraw on SIGWINCH).
+const ATTACH_REDRAW_MAX: Duration = Duration::from_millis(250);
+
 pub struct NewSessionOpts {
     pub name: String,
     pub shell: String,
@@ -38,6 +47,18 @@ struct ClientConn {
     inbound: Vec<u8>,
     /// True after the client has sent `Attach` (modes restored, winsize applied).
     ready: bool,
+}
+
+/// Two-phase attach redraw: hold a temporary winsize long enough for the child
+/// to full-paint, then restore the client's real size (another full paint).
+///
+/// Instant bump+restore is coalesced by apps like fresh (ratatui): crossterm
+/// only writes cells that differ from its previous buffer, so a same-size
+/// redraw after reattach emits almost nothing onto a blank client TTY.
+struct PendingAttachRedraw {
+    final_ws: Winsize,
+    started: Instant,
+    saw_output: bool,
 }
 
 impl ClientConn {
@@ -278,19 +299,21 @@ fn apply_winsize(master: RawFd, ws: Winsize) -> Result<()> {
     Ok(())
 }
 
-/// Apply winsize such that the kernel always delivers `SIGWINCH` to the PTY
-/// foreground group, even when the geometry matches the previous size.
-///
-/// Linux only sends `SIGWINCH` on an actual size change; TUI apps often rely on
-/// that signal to full-redraw after reattach.
-fn force_winsize(master: RawFd, ws: Winsize) -> Result<()> {
-    let bumped = Winsize {
-        rows: if ws.rows > 1 { ws.rows - 1 } else { ws.rows.saturating_add(1) },
+/// Winsize that differs from `ws` so `TIOCSWINSZ` delivers `SIGWINCH` and
+/// ratatui-style apps invalidate their previous cell buffer (full paint).
+fn temporary_redraw_winsize(ws: Winsize) -> Winsize {
+    Winsize {
+        rows: if ws.rows > 1 {
+            ws.rows - 1
+        } else {
+            ws.rows.saturating_add(1)
+        },
         cols: ws.cols,
-    };
-    apply_winsize(master, bumped)?;
+    }
+}
+
+fn apply_winsize_and_signal(master: RawFd, ws: Winsize) -> Result<()> {
     apply_winsize(master, ws)?;
-    // Belt-and-suspenders: some setups miss the ioctl-triggered signal.
     signal_foreground_winch(master);
     Ok(())
 }
@@ -303,6 +326,14 @@ fn signal_foreground_winch(master: RawFd) {
     }
 }
 
+fn pending_redraw_ready(pending: &PendingAttachRedraw) -> bool {
+    let elapsed = pending.started.elapsed();
+    if elapsed >= ATTACH_REDRAW_MAX {
+        return true;
+    }
+    pending.saw_output && elapsed >= ATTACH_REDRAW_MIN
+}
+
 fn server_loop(
     master: OwnedFd,
     listener: UnixListener,
@@ -312,6 +343,7 @@ fn server_loop(
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
     let mut term = TermState::new();
+    let mut pending_redraw: Option<PendingAttachRedraw> = None;
     let mut buf = [0u8; 8192];
 
     loop {
@@ -325,6 +357,14 @@ fn server_loop(
             Ok(_) => {}
             Err(Errno::ECHILD) => break,
             Err(e) => return Err(e).context("waitpid"),
+        }
+
+        if let Some(ref pending) = pending_redraw {
+            if pending_redraw_ready(pending) {
+                let final_ws = pending.final_ws;
+                pending_redraw = None;
+                let _ = apply_winsize_and_signal(master_fd, final_ws);
+            }
         }
 
         let want_pty_read = match &client {
@@ -347,7 +387,10 @@ fn server_loop(
             fds.push(PollFd::new(c.stream.as_fd(), interest));
         }
 
-        match poll(&mut fds, 500u16) {
+        // Wake sooner while waiting to restore the real winsize after attach.
+        let timeout_ms: u16 = if pending_redraw.is_some() { 20 } else { 500 };
+
+        match poll(&mut fds, timeout_ms) {
             Ok(_) => {}
             Err(Errno::EINTR) => continue,
             Err(e) => return Err(e).context("poll"),
@@ -390,7 +433,11 @@ fn server_loop(
                     term.feed(&buf[..n]);
                     if let Some(ref mut c) = client {
                         if c.ready {
+                            if let Some(ref mut pending) = pending_redraw {
+                                pending.saw_output = true;
+                            }
                             if c.enqueue(&Message::Data(buf[..n].to_vec())).is_err() {
+                                pending_redraw = None;
                                 drop_client(&mut client, paths);
                             }
                         }
@@ -411,6 +458,7 @@ fn server_loop(
 
         if let Some(ref mut c) = client {
             if client_revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                pending_redraw = None;
                 drop_client(&mut client, paths);
             } else {
                 let mut dead = false;
@@ -423,7 +471,7 @@ fn server_loop(
                 {
                     dead = c.read_inbound()?;
                     if !dead {
-                        match handle_client_messages(c, master_fd, &term) {
+                        match handle_client_messages(c, master_fd, &term, &mut pending_redraw) {
                             Ok(true) => dead = true,
                             Ok(false) => {}
                             Err(_) => dead = true,
@@ -431,10 +479,12 @@ fn server_loop(
                     }
                 }
                 if dead {
+                    pending_redraw = None;
                     drop_client(&mut client, paths);
                 } else if !c.outbound.is_empty() {
                     // Opportunistic flush after enqueue from PTY.
                     if c.flush_outbound()? {
+                        pending_redraw = None;
                         drop_client(&mut client, paths);
                     }
                 }
@@ -457,6 +507,7 @@ fn handle_client_messages(
     client: &mut ClientConn,
     master_fd: RawFd,
     term: &TermState,
+    pending_redraw: &mut Option<PendingAttachRedraw>,
 ) -> Result<bool> {
     let messages = protocol::drain_messages(&mut client.inbound)?;
     for msg in messages {
@@ -464,15 +515,31 @@ fn handle_client_messages(
             Message::Attach(ws) => {
                 // Re-enable DEC modes (mouse, alt-screen, …) on the new TTY
                 // before asking the child to redraw.
-                let restore = term.restore_sequence();
-                if !restore.is_empty() {
-                    client.enqueue(&Message::Data(restore))?;
-                }
-                force_winsize(master_fd, ws)?;
+                let mut restore = term.restore_sequence();
+                // Clear whatever is currently visible so a differential TUI
+                // paint isn't merged onto stale local cells.
+                restore.extend_from_slice(b"\x1b[H\x1b[2J");
+                client.enqueue(&Message::Data(restore))?;
+
+                // Phase 1: temporary geometry so ratatui invalidates its
+                // previous buffer and emits a full cell dump to this client.
+                let temp = temporary_redraw_winsize(ws);
+                apply_winsize_and_signal(master_fd, temp)?;
+                *pending_redraw = Some(PendingAttachRedraw {
+                    final_ws: ws,
+                    started: Instant::now(),
+                    saw_output: false,
+                });
                 client.ready = true;
             }
             Message::Resize(ws) => {
-                apply_winsize(master_fd, ws)?;
+                if let Some(ref mut pending) = pending_redraw {
+                    // User resized during the attach redraw dance — land on
+                    // their latest size when we finish.
+                    pending.final_ws = ws;
+                } else {
+                    apply_winsize(master_fd, ws)?;
+                }
             }
             Message::Data(data) => {
                 write_all_fd(master_fd, &data)?;
