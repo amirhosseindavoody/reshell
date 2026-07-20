@@ -100,8 +100,10 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
 
 1. Require a local TTY on stdin.
 2. Resolve the session name: explicit argument, or the most recently active live
-   session (`last_active_unix`, falling back to `created_unix`). Bare `reshell attach`
-   prints `attaching to <name>` on stderr before connecting.
+   session (`last_active_unix`, falling back to `created_unix`). Bare `reshell`
+   (no subcommand) is an alias for `reshell attach`. If there are no live sessions,
+   bare attach creates a new one (same as `reshell new`). When resolving an
+   existing session, prints `attaching to <name>` on stderr before connecting.
 3. Refuse if meta missing, daemon dead, or `attached` lock already present.
 4. Connect to `session.sock`.
 5. Put local TTY in raw mode; restore on exit (`TermiosGuard`).

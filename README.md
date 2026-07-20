@@ -51,6 +51,10 @@ pixi global install --git https://github.com/amirhosseindavoody/reshell.git --br
 ## Usage
 
 ```bash
+# Attach to the most recent session, or create one if none exist
+reshell
+# same as: reshell attach
+
 # Create a session and attach (default shell is /bin/zsh)
 reshell new demo
 # or: reshell new          # auto-generated name
@@ -61,7 +65,7 @@ reshell new demo --detach
 
 # Attach (Ctrl+\ detaches without killing the shell)
 reshell attach demo
-# or: reshell attach       # most recently active session
+# or: reshell attach       # most recently active (or new if none)
 
 # List sessions
 reshell list

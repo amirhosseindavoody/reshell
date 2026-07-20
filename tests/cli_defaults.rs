@@ -1,5 +1,6 @@
 //! `reshell new` defaults to attach; `--detach` creates without attaching.
-//! `reshell attach` with no name picks the most recently active session.
+//! `reshell attach` with no name picks the most recently active session
+//! (or creates one if none exist). Bare `reshell` aliases `attach`.
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -176,14 +177,49 @@ fn attach_without_name_picks_most_recent() {
         .args(["--dir", base.to_str().unwrap(), "kill", "second"])
         .output();
 
+    // No sessions left: bare attach must not error with "no sessions" — it
+    // creates a new session (same as `new`). Default shell may be missing in
+    // CI, so only assert we left the "no sessions" path.
     let empty = Command::new(reshell_bin())
         .args(["--dir", base.to_str().unwrap(), "attach"])
         .output()
         .unwrap();
     assert!(!empty.status.success());
+    let err = String::from_utf8_lossy(&empty.stderr);
     assert!(
-        String::from_utf8_lossy(&empty.stderr).contains("no sessions"),
-        "{}",
-        String::from_utf8_lossy(&empty.stderr)
+        !err.contains("no sessions"),
+        "bare attach with no sessions should create one, got: {err}"
     );
+
+    // Clean up anything the fallback created, then seed a known session.
+    let listed = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "list"])
+        .output()
+        .unwrap();
+    for line in String::from_utf8_lossy(&listed.stdout).lines().skip(1) {
+        let name = line.split_whitespace().next().unwrap_or("");
+        if !name.is_empty() && name != "(no" {
+            let _ = Command::new(reshell_bin())
+                .args(["--dir", base.to_str().unwrap(), "kill", name])
+                .output();
+        }
+    }
+
+    new_detached(base, "alias-target");
+
+    // Bare `reshell` (no subcommand) is an alias for attach.
+    let bare = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!bare.status.success());
+    let bare_err = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        bare_err.contains("attaching to alias-target"),
+        "bare reshell should attach to the recent session, got: {bare_err}"
+    );
+
+    let _ = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "kill", "alias-target"])
+        .output();
 }
