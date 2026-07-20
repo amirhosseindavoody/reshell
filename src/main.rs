@@ -2,6 +2,7 @@ mod client;
 mod protocol;
 mod server;
 mod session;
+mod termstate;
 
 use std::path::PathBuf;
 

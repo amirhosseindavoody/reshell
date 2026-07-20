@@ -16,6 +16,7 @@ use nix::unistd::{read as nix_read, write as nix_write};
 
 use crate::protocol::{self, Message, Winsize, DETACH_BYTE};
 use crate::session::{self, SessionPaths};
+use crate::termstate::TermState;
 
 static WINCH_FLAG: AtomicBool = AtomicBool::new(false);
 static HUP_FLAG: AtomicBool = AtomicBool::new(false);
@@ -84,6 +85,10 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
     set_nonblocking(stream.as_raw_fd())?;
 
     let result = client_loop(&mut stream, stdin_fd);
+    // Leave the local TTY without mouse / alt-screen sticky state from the
+    // remote app (DEC private modes are not covered by termios restore).
+    let _ = write_all_fd(io::stdout().as_raw_fd(), &TermState::client_cleanup_sequence());
+    let _ = io::stdout().flush();
     drop(restore_on_drop);
     // Restore default handlers.
     unsafe {

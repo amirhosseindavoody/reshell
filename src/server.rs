@@ -20,6 +20,7 @@ use crate::protocol::{self, Message, Winsize};
 use crate::session::{
     self, cleanup_session_files, now_unix, set_attached, write_meta, SessionMeta, SessionPaths,
 };
+use crate::termstate::TermState;
 
 /// Stop reading the PTY into the client buffer beyond this size so the shell
 /// experiences backpressure instead of unbounded memory growth.
@@ -35,6 +36,8 @@ struct ClientConn {
     stream: UnixStream,
     outbound: Vec<u8>,
     inbound: Vec<u8>,
+    /// True after the client has sent `Attach` (modes restored, winsize applied).
+    ready: bool,
 }
 
 impl ClientConn {
@@ -44,6 +47,7 @@ impl ClientConn {
             stream,
             outbound: Vec::new(),
             inbound: Vec::new(),
+            ready: false,
         })
     }
 
@@ -274,6 +278,31 @@ fn apply_winsize(master: RawFd, ws: Winsize) -> Result<()> {
     Ok(())
 }
 
+/// Apply winsize such that the kernel always delivers `SIGWINCH` to the PTY
+/// foreground group, even when the geometry matches the previous size.
+///
+/// Linux only sends `SIGWINCH` on an actual size change; TUI apps often rely on
+/// that signal to full-redraw after reattach.
+fn force_winsize(master: RawFd, ws: Winsize) -> Result<()> {
+    let bumped = Winsize {
+        rows: if ws.rows > 1 { ws.rows - 1 } else { ws.rows.saturating_add(1) },
+        cols: ws.cols,
+    };
+    apply_winsize(master, bumped)?;
+    apply_winsize(master, ws)?;
+    // Belt-and-suspenders: some setups miss the ioctl-triggered signal.
+    signal_foreground_winch(master);
+    Ok(())
+}
+
+fn signal_foreground_winch(master: RawFd) {
+    let mut pgrp: nix::libc::pid_t = 0;
+    let ret = unsafe { nix::libc::ioctl(master, nix::libc::TIOCGPGRP as _, &mut pgrp) };
+    if ret == 0 && pgrp > 0 {
+        let _ = signal::kill(Pid::from_raw(-pgrp), Signal::SIGWINCH);
+    }
+}
+
 fn server_loop(
     master: OwnedFd,
     listener: UnixListener,
@@ -282,6 +311,7 @@ fn server_loop(
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
+    let mut term = TermState::new();
     let mut buf = [0u8; 8192];
 
     loop {
@@ -355,12 +385,18 @@ fn server_loop(
             match nix_read(master_fd, &mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // Always parse modes — including while detached — so reattach
+                    // can restore mouse / alt-screen on the new client TTY.
+                    term.feed(&buf[..n]);
                     if let Some(ref mut c) = client {
-                        if c.enqueue(&Message::Data(buf[..n].to_vec())).is_err() {
-                            drop_client(&mut client, paths);
+                        if c.ready {
+                            if c.enqueue(&Message::Data(buf[..n].to_vec())).is_err() {
+                                drop_client(&mut client, paths);
+                            }
                         }
+                        // else: wait for Attach (mode restore) before forwarding
                     }
-                    // else discarded (still drained)
+                    // else discarded (still drained; modes above still updated)
                 }
                 Err(Errno::EAGAIN) => {}
                 Err(Errno::EIO) => break,
@@ -387,7 +423,7 @@ fn server_loop(
                 {
                     dead = c.read_inbound()?;
                     if !dead {
-                        match handle_client_messages(c, master_fd) {
+                        match handle_client_messages(c, master_fd, &term) {
                             Ok(true) => dead = true,
                             Ok(false) => {}
                             Err(_) => dead = true,
@@ -417,11 +453,25 @@ fn drop_client(client: &mut Option<ClientConn>, paths: &SessionPaths) {
 }
 
 /// Returns Ok(true) if client should disconnect (Detach).
-fn handle_client_messages(client: &mut ClientConn, master_fd: RawFd) -> Result<bool> {
+fn handle_client_messages(
+    client: &mut ClientConn,
+    master_fd: RawFd,
+    term: &TermState,
+) -> Result<bool> {
     let messages = protocol::drain_messages(&mut client.inbound)?;
     for msg in messages {
         match msg {
-            Message::Attach(ws) | Message::Resize(ws) => {
+            Message::Attach(ws) => {
+                // Re-enable DEC modes (mouse, alt-screen, …) on the new TTY
+                // before asking the child to redraw.
+                let restore = term.restore_sequence();
+                if !restore.is_empty() {
+                    client.enqueue(&Message::Data(restore))?;
+                }
+                force_winsize(master_fd, ws)?;
+                client.ready = true;
+            }
+            Message::Resize(ws) => {
                 apply_winsize(master_fd, ws)?;
             }
             Message::Data(data) => {

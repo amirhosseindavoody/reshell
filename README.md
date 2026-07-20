@@ -8,6 +8,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
 - Explicit sessions: `new` / `attach` / `list` / `kill`
 - Detach with **Ctrl+\** (client exits; session keeps running)
+- Reattach restores TUI terminal modes (mouse, alt-screen, …) and forces a redraw
 - Targeted at SSH sessions into Linux servers
 - Defaults to **zsh** (`/bin/zsh`); override with `--shell` for bash, fish, etc.
 
