@@ -14,6 +14,10 @@ pub struct SessionMeta {
     pub shell: String,
     pub created_unix: u64,
     pub attached: bool,
+    /// Last attach/detach time; used by `reshell attach` with no name.
+    /// Older meta files omit this field (treated as 0 → fall back to created).
+    #[serde(default)]
+    pub last_active_unix: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +139,7 @@ pub fn set_attached(paths: &SessionPaths, attached: bool) -> Result<()> {
     }
     if let Ok(mut meta) = read_meta(paths) {
         meta.attached = attached;
+        meta.last_active_unix = now_unix();
         let _ = write_meta(paths, &meta);
     }
     Ok(())
@@ -178,6 +183,30 @@ pub fn list_sessions(base: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
     }
     out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     Ok(out)
+}
+
+/// Session activity timestamp: last attach/detach, else creation time.
+pub fn session_activity(meta: &SessionMeta) -> u64 {
+    if meta.last_active_unix > 0 {
+        meta.last_active_unix
+    } else {
+        meta.created_unix
+    }
+}
+
+/// Most recently active live session (by `last_active_unix`, then created).
+pub fn most_recent_session(base: &Path) -> Result<SessionMeta> {
+    let mut sessions = list_sessions(base)?;
+    if sessions.is_empty() {
+        bail!("no sessions found");
+    }
+    sessions.sort_by(|a, b| {
+        session_activity(&b.0)
+            .cmp(&session_activity(&a.0))
+            .then_with(|| b.0.created_unix.cmp(&a.0.created_unix))
+            .then_with(|| a.0.name.cmp(&b.0.name))
+    });
+    Ok(sessions.remove(0).0)
 }
 
 pub fn cleanup_session_files(paths: &SessionPaths) -> Result<()> {
@@ -233,10 +262,45 @@ mod tests {
             shell: "/bin/bash".into(),
             created_unix: 123,
             attached: false,
+            last_active_unix: 0,
         };
         write_meta(&paths, &meta).unwrap();
         let loaded = read_meta(&paths).unwrap();
         assert_eq!(loaded.name, "demo");
         assert_eq!(loaded.pid, 1);
+        assert_eq!(loaded.last_active_unix, 0);
+    }
+
+    #[test]
+    fn most_recent_prefers_last_active() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+
+        // Two fake metas with a live-looking pid (our own) so list_sessions
+        // keeps them; we won't actually run daemons.
+        let self_pid = std::process::id() as i32;
+        for (name, created, last) in [
+            ("older", 100u64, 100u64),
+            ("newer", 200u64, 500u64),
+            ("middle", 300u64, 300u64),
+        ] {
+            let paths = SessionPaths::for_name(base, name);
+            write_meta(
+                &paths,
+                &SessionMeta {
+                    name: name.into(),
+                    pid: self_pid,
+                    shell: "/bin/bash".into(),
+                    created_unix: created,
+                    attached: false,
+                    last_active_unix: last,
+                },
+            )
+            .unwrap();
+        }
+
+        let recent = most_recent_session(base).unwrap();
+        assert_eq!(recent.name, "newer");
     }
 }

@@ -41,6 +41,7 @@ fn create_detach_reconnect_keeps_shell() {
             base.to_str().unwrap(),
             "new",
             "smoke",
+            "--detach",
             "--shell",
             "/bin/bash",
         ])

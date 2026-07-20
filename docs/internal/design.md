@@ -47,8 +47,8 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `kill`; default shell `/bin/zsh` |
-| [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/kill, attach lock |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` (attach by default) / `attach` / `list` / `kill`; default shell `/bin/zsh` |
+| [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/kill, attach lock, most-recent session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
 | [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)) |
@@ -67,7 +67,7 @@ Per session name `$name`:
 
 ```
 $base/$name/
-  meta.json       # name, daemon pid, shell path, created_unix, attached
+  meta.json       # name, daemon pid, shell path, created_unix, last_active_unix, attached
   session.sock    # Unix domain socket (mode 0600)
   attached        # lock file present while a client is connected
 ```
@@ -87,7 +87,8 @@ Session names are limited to `[A-Za-z0-9._-]`, max 64 characters.
    - **Child:** `setsid`, ignore `SIGHUP`/`SIGINT`/`SIGPIPE`, reopen stdio to `/dev/null`, run the daemon.
 5. Daemon `openpty`, forks the shell on the slave (`TIOCSCTTY`, dup2 0/1/2, `exec` shell).
 6. Daemon binds `session.sock`, writes `meta.json` (pid = daemon), signals readiness.
-7. Parent prints the session name and exits (optionally continues into `attach` with `-a`).
+7. Parent prints the session name to stderr and **attaches** (default). Pass `--detach` / `-d`
+   to create only and print the name on stdout (for scripts / CI).
 
 The daemon ignores `SIGHUP` so an SSH disconnect of the creating terminal does not
 tear it down. The shell keeps default signal disposition so Ctrl+C reaches it via
@@ -98,17 +99,22 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
 ### Attach
 
 1. Require a local TTY on stdin.
-2. Refuse if meta missing, daemon dead, or `attached` lock already present.
-3. Connect to `session.sock`.
-4. Put local TTY in raw mode; restore on exit (`TermiosGuard`).
-5. Send `Attach` with current winsize; enter poll loop:
+2. Resolve the session name: explicit argument, or the most recently active live
+   session (`last_active_unix`, falling back to `created_unix`). Bare `reshell attach`
+   prints `attaching to <name>` on stderr before connecting.
+3. Refuse if meta missing, daemon dead, or `attached` lock already present.
+4. Connect to `session.sock`.
+5. Put local TTY in raw mode; restore on exit (`TermiosGuard`).
+6. Send `Attach` with current winsize; enter poll loop:
    - stdin → `Data` (or `Detach` if Ctrl+\ seen)
    - socket `Data` → stdout
    - `SIGWINCH` → `Resize`
    - `SIGHUP` → send `Detach` and exit (session keeps running)
-6. On client exit, write a best-effort DEC mode cleanup sequence (disable mouse /
+7. On client exit, write a best-effort DEC mode cleanup sequence (disable mouse /
    alt-screen / bracketed paste) before restoring termios, so the local shell is
    not left with sticky TUI modes.
+
+`last_active_unix` is updated whenever a client attaches or detaches.
 
 ### Reattach and full-screen apps
 

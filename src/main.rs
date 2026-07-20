@@ -28,21 +28,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Create a new detached session
+    /// Create a new session and attach to it
     New {
         /// Session name (generated if omitted)
         name: Option<String>,
         /// Shell to run (default: /bin/zsh)
         #[arg(long)]
         shell: Option<String>,
-        /// Attach immediately after creating the session
-        #[arg(long, short = 'a')]
-        attach: bool,
+        /// Create the session without attaching
+        #[arg(long, short = 'd')]
+        detach: bool,
     },
-    /// Attach to an existing session
+    /// Attach to an existing session (most recently active if name omitted)
     Attach {
-        /// Session name
-        name: String,
+        /// Session name (defaults to the most recently active session)
+        name: Option<String>,
     },
     /// List running sessions
     List,
@@ -71,7 +71,7 @@ fn run() -> Result<()> {
         Commands::New {
             name,
             shell,
-            attach,
+            detach,
         } => {
             let name = name.unwrap_or_else(generate_session_name);
             let shell = shell.unwrap_or_else(default_shell);
@@ -80,13 +80,26 @@ fn run() -> Result<()> {
                 shell,
                 base: base.clone(),
             })?;
-            println!("{name}");
-            if attach {
-                client::attach(&base, &name)?;
+            if detach {
+                println!("{name}");
+                Ok(())
+            } else {
+                // Name goes to stderr so it does not collide with the TTY session.
+                eprintln!("{name}");
+                client::attach(&base, &name)
             }
-            Ok(())
         }
-        Commands::Attach { name } => client::attach(&base, &name),
+        Commands::Attach { name } => {
+            let name = match name {
+                Some(n) => n,
+                None => {
+                    let meta = session::most_recent_session(&base)?;
+                    eprintln!("attaching to {}", meta.name);
+                    meta.name
+                }
+            };
+            client::attach(&base, &name)
+        }
         Commands::List => {
             let sessions = session::list_sessions(&base)?;
             if sessions.is_empty() {
