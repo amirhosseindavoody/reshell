@@ -42,6 +42,7 @@ fn large_pty_output_reaches_client() {
             base.to_str().unwrap(),
             "new",
             "flood",
+            "--detach",
             "--shell",
             "/bin/bash",
         ])

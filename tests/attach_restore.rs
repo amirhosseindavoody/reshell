@@ -77,6 +77,7 @@ fn reattach_restores_mouse_and_alt_screen() {
             base.to_str().unwrap(),
             "new",
             "restore",
+            "--detach",
             "--shell",
             "/bin/bash",
         ])
@@ -140,6 +141,7 @@ fn reattach_two_phase_winsize_for_full_paint() {
             base.to_str().unwrap(),
             "new",
             "winch",
+            "--detach",
             "--shell",
             "/bin/bash",
         ])

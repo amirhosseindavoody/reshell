@@ -212,12 +212,14 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
             }
             set_nonblocking(listener.as_raw_fd())?;
 
+            let created = now_unix();
             let meta = SessionMeta {
                 name: opts.name.clone(),
                 pid: Pid::this().as_raw(),
                 shell: shell_path,
-                created_unix: now_unix(),
+                created_unix: created,
                 attached: false,
+                last_active_unix: created,
             };
             write_meta(&paths, &meta)?;
 
