@@ -53,6 +53,7 @@ Single crate; binary name `reshell`.
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
 | [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)) |
 | [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode tracking for restore-on-attach |
+| [`src/vscode_si.rs`](../../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject |
 
 ## Session storage
 
@@ -117,6 +118,27 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
    not left with sticky TUI modes.
 
 `last_active_unix` is updated whenever a client attaches or detaches.
+
+### VS Code / Cursor sticky scroll
+
+VS Code sticky scroll follows **OSC 633** shell-integration command markers, not
+the OS process tree. Running `reshell` leaves the outer shell’s “current command”
+open, so the sticky line stays on `reshell`.
+
+reshell fixes that when `TERM_PROGRAM` is `vscode` (or Cursor is detected):
+
+1. **On attach**, the client writes `OSC 633;D` to the local TTY to finish the
+   outer `reshell` command so sticky scroll can move on.
+2. **On session create**, the daemon injects VS Code’s shell-integration script
+   into bash (`--init-file`) or zsh (`ZDOTDIR` + `VSCODE_INJECTION=1`) when it can
+   locate the script (`code`/`cursor --locate-shell-integration-path`, or a
+   `.vscode-server` install). The session shell then emits `A/B/E/C/D` for each
+   command; those bytes pass through the PTY pipe unchanged.
+3. Sessions created outside VS Code still work if the user’s rc manually sources
+   shell integration when `TERM_PROGRAM=vscode`.
+
+This is the same model as dtach/abduco (raw passthrough), not tmux (which must
+DCS-wrap OSC sequences).
 
 ### Reattach and full-screen apps
 

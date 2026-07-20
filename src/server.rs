@@ -2,7 +2,6 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -21,6 +20,7 @@ use crate::session::{
     self, cleanup_session_files, now_unix, set_attached, write_meta, SessionMeta, SessionPaths,
 };
 use crate::termstate::TermState;
+use crate::vscode_si;
 
 /// Stop reading the PTY into the client buffer beyond this size so the shell
 /// experiences backpressure instead of unbounded memory growth.
@@ -196,6 +196,7 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
     let OpenptyResult { master, slave } = pty::openpty(None, None).context("openpty")?;
 
     let shell_path = opts.shell.clone();
+    let session_dir = paths.dir.clone();
     match unsafe { fork() }.context("fork shell")? {
         ForkResult::Parent { child: shell_pid } => {
             drop(slave);
@@ -255,16 +256,11 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
                 std::env::set_var("TERM", "xterm-256color");
             }
 
-            let shell =
-                std::ffi::CString::new(opts.shell.as_str()).context("shell path contains NUL")?;
-            let argv0 = std::ffi::CString::new(
-                Path::new(&opts.shell)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("sh"),
-            )
-            .unwrap();
-            execvp(&shell, &[&argv0]).context("exec shell")?;
+            // When started from VS Code/Cursor, inject shell integration so the
+            // session shell emits OSC 633 command markers (sticky scroll, etc.).
+            let launch = vscode_si::prepare_shell_launch(&opts.shell, &session_dir)
+                .context("prepare shell launch")?;
+            execvp(&launch.program, &launch.argv).context("exec shell")?;
             unreachable!();
         }
     }
