@@ -37,7 +37,7 @@ Little-endian:
 
 | Message | Server action |
 |---------|---------------|
-| `Attach` | Replay tracked DEC private modes to the client as `Data`, then apply winsize with a forced `SIGWINCH` (size bump + foreground-group signal) so TUI apps full-redraw. PTY forwarding starts only after this message. |
+| `Attach` | Replay tracked DEC private modes to the client as `Data`, clear the local screen, apply a temporary winsize so differential TUIs full-paint, then restore the real winsize shortly after. PTY forwarding starts only after this message. |
 | `Resize` | Apply size with `TIOCSWINSZ` only (normal live resize). |
 
 ## Client conventions
@@ -63,14 +63,17 @@ Little-endian:
 ```text
 client                         daemon                         shell
   |-- Attach(24,80) ---------->|                                |
-  |<- Data(DEC mode restore) --|  (mouse / alt-screen / …)      |
-  |                            |-- TIOCSWINSZ + SIGWINCH ------>|
-  |<- Data(TUI redraw) --------|<-- full redraw ----------------|
+  |<- Data(DEC modes + clear) -|                                |
+  |                            |-- TIOCSWINSZ(23,80)+SIGWINCH ->|
+  |<- Data(full paint @23) ----|<-- ratatui invalidates buffer -|
+  |                            |-- (≈50ms later) --------------->|
+  |                            |-- TIOCSWINSZ(24,80)+SIGWINCH ->|
+  |<- Data(full paint @24) ----|<-- second full paint ----------|
   |-- Data("echo hi\n") ------>|-- write PTY ------------------>|
   |<- Data(prompt + "hi\n") ---|<-- read PTY -------------------|
   |-- Detach ----------------->|                                |
   |  (client exits; local DEC cleanup)
   |                            |  (shell still running)         |
-  |-- connect + Attach ------->|  restore modes + force winch   |
+  |-- connect + Attach ------->|  restore modes + two-phase winch
   |-- Data(...) -------------->| ...                            |
 ```
