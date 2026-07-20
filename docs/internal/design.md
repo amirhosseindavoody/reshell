@@ -16,7 +16,7 @@ prefix key chord that steals shortcuts from nested TUIs.
 ## Non-goals (v1)
 
 - Window splitting, tabs, or status bars
-- Scrollback capture / session logging
+- Scrollback capture / session logging (no frame buffer; apps must redraw on attach)
 - Multi-client shared attach (second attach is rejected)
 - macOS / Windows
 - Automatic `reshell ssh …` wrapper
@@ -52,6 +52,7 @@ Single crate; binary name `reshell`.
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
 | [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)) |
+| [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode tracking for restore-on-attach |
 
 ## Session storage
 
@@ -105,6 +106,23 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
    - socket `Data` → stdout
    - `SIGWINCH` → `Resize`
    - `SIGHUP` → send `Detach` and exit (session keeps running)
+6. On client exit, write a best-effort DEC mode cleanup sequence (disable mouse /
+   alt-screen / bracketed paste) before restoring termios, so the local shell is
+   not left with sticky TUI modes.
+
+### Reattach and full-screen apps
+
+reshell does not keep a scrollback or screen buffer. Instead the daemon:
+
+1. Parses PTY output for DEC private modes (alt-screen, mouse tracking, bracketed
+   paste, focus events, cursor visibility, …), including while detached.
+2. On `Attach`, sends those modes back to the new client as the first `Data`
+   payload (so the local TTY enables mouse again, enters alt-screen, etc.).
+3. Forces a `SIGWINCH` to the PTY foreground group even when the winsize is
+   unchanged (brief size bump + `TIOCGPGRP`/`SIGWINCH`), so TUI apps redraw.
+
+PTY bytes are not forwarded to a client until `Attach` has been processed, so
+mode restore runs before any redraw data.
 
 ### Detach vs kill
 
@@ -135,8 +153,8 @@ corrupt the stream, and freeze the attach client.
 
 When the outbound buffer exceeds a high-water mark, the daemon stops reading the
 PTY until it drains (backpressure). When no client is attached, PTY output is
-still read and discarded (no scrollback in v1). When the shell exits (`waitpid`),
-the daemon cleans up and exits.
+still read and discarded (no scrollback in v1), but DEC modes are still updated.
+When the shell exits (`waitpid`), the daemon cleans up and exits.
 
 ## Packaging and toolchain
 
@@ -154,9 +172,12 @@ conda Rust toolchain is used, not an older system rustup.
 
 ## Testing strategy
 
-- Unit tests: protocol roundtrip, session name validation, meta read/write.
+- Unit tests: protocol roundtrip, session name validation, meta read/write,
+  DEC mode parse/restore (`termstate`).
 - Integration (`tests/session_smoke.rs`): `new` → speak protocol over the socket →
   detach → reconnect → confirm the same shell is still alive → `kill`.
+- Integration (`tests/attach_restore.rs`): child enables mouse/alt-screen → detach →
+  reattach observes restored CSI modes and a forced redraw signal path.
 
 Attach’s TTY path is exercised manually or via an external PTY driver; the smoke
 test intentionally talks the wire protocol so CI does not need a controlling TTY.

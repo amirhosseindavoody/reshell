@@ -33,7 +33,12 @@ Little-endian:
 | 0–1 | `rows` (`u16`) |
 | 2–3 | `cols` (`u16`) |
 
-Server applies size with `TIOCSWINSZ` on the PTY master (shell typically gets `SIGWINCH`).
+### `Attach` vs `Resize`
+
+| Message | Server action |
+|---------|---------------|
+| `Attach` | Replay tracked DEC private modes to the client as `Data`, then apply winsize with a forced `SIGWINCH` (size bump + foreground-group signal) so TUI apps full-redraw. PTY forwarding starts only after this message. |
+| `Resize` | Apply size with `TIOCSWINSZ` only (normal live resize). |
 
 ## Client conventions
 
@@ -42,11 +47,14 @@ Server applies size with `TIOCSWINSZ` on the PTY master (shell typically gets `S
   not forward that byte to the session; it sends `Detach` and exits instead.
 - On local `SIGHUP`, send `Detach` (best effort) and exit.
 - On local `SIGWINCH`, send `Resize`.
+- On exit, write a DEC mode cleanup sequence to the local TTY (disable mouse /
+  alt-screen / bracketed paste) before restoring termios.
 
 ## Server conventions
 
 - At most one attached client. Extra accepts are closed immediately.
 - After `Detach` or client EOF/error, clear the attach lock and keep the shell.
+- Track DEC private modes from all PTY output (even while detached / discarded).
 - Unrecognized types are a protocol error for the reader; clients ignore unexpected
   control messages from the server (server currently only emits `Data`).
 
@@ -55,11 +63,14 @@ Server applies size with `TIOCSWINSZ` on the PTY master (shell typically gets `S
 ```text
 client                         daemon                         shell
   |-- Attach(24,80) ---------->|                                |
-  |                            |-- TIOCSWINSZ ----------------->|
+  |<- Data(DEC mode restore) --|  (mouse / alt-screen / …)      |
+  |                            |-- TIOCSWINSZ + SIGWINCH ------>|
+  |<- Data(TUI redraw) --------|<-- full redraw ----------------|
   |-- Data("echo hi\n") ------>|-- write PTY ------------------>|
   |<- Data(prompt + "hi\n") ---|<-- read PTY -------------------|
   |-- Detach ----------------->|                                |
-  |  (client exits)            |  (shell still running)         |
-  |-- connect + Attach ------->|                                |
+  |  (client exits; local DEC cleanup)
+  |                            |  (shell still running)         |
+  |-- connect + Attach ------->|  restore modes + force winch   |
   |-- Data(...) -------------->| ...                            |
 ```
