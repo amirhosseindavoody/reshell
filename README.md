@@ -9,6 +9,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Explicit sessions: `new` / `attach` / `list` / `kill`
 - Detach with **Ctrl+\** (client exits; session keeps running)
 - Reattach restores TUI terminal modes (mouse, alt-screen, …) and forces a redraw
+- VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session
 - Targeted at SSH sessions into Linux servers
 - Defaults to **zsh** (`/bin/zsh`); override with `--shell` for bash, fish, etc.
 

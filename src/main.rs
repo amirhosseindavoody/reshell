@@ -3,6 +3,7 @@ mod protocol;
 mod server;
 mod session;
 mod termstate;
+mod vscode_si;
 
 use std::path::{Path, PathBuf};
 

@@ -17,6 +17,7 @@ use nix::unistd::{read as nix_read, write as nix_write};
 use crate::protocol::{self, Message, Winsize, DETACH_BYTE};
 use crate::session::{self, SessionPaths};
 use crate::termstate::TermState;
+use crate::vscode_si;
 
 static WINCH_FLAG: AtomicBool = AtomicBool::new(false);
 static HUP_FLAG: AtomicBool = AtomicBool::new(false);
@@ -65,6 +66,14 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
         fd: stdin_fd,
         termios: Rc::new(orig),
     };
+
+    // VS Code sticky scroll treats `reshell` as the current command until it
+    // sees OSC 633;D. Close that outer command so per-command markers from the
+    // session shell can become sticky lines instead.
+    if vscode_si::running_in_vscode_terminal() {
+        let _ = write_all_fd(io::stdout().as_raw_fd(), vscode_si::OSC_633_COMMAND_FINISHED);
+        let _ = io::stdout().flush();
+    }
 
     unsafe {
         signal::signal(Signal::SIGWINCH, SigHandler::Handler(handle_winch))
