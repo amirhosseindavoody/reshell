@@ -60,8 +60,20 @@ fn attach_without_name_picks_most_recent() {
     new_detached(base, "first");
     std::thread::sleep(Duration::from_millis(50));
     new_detached(base, "second");
-    // Touch `first` so it becomes the most recently active.
-    std::thread::sleep(Duration::from_millis(50));
+    // `last_active_unix` is second-granularity; wait until the clock ticks so
+    // touching `first` is strictly newer than `second`'s create/activity time.
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        == before
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     protocol_attach_touch(base, "first");
 
     // Named attach without TTY fails the same way — proves the session exists.

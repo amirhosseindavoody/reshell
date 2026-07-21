@@ -125,9 +125,24 @@ fn info_inside_session_survives_rename() {
     let base = dir.path();
     new_detached(base, "before");
 
+    // Prove the shell starts with the old name, then detach before rename so we
+    // reattach on the moved socket path (avoids racing a live protocol client).
     let sock = wait_sock(base, "before");
     let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
     attach_winsize(&mut stream, 24, 80);
+    write_msg(
+        &mut stream,
+        1,
+        b"printf 'ENV=%s\\n' \"$RESHELL_SESSION\"\n",
+    );
+    let pre = collect_data(&mut stream, Instant::now() + Duration::from_secs(2));
+    write_msg(&mut stream, 3, &[]);
+    drop(stream);
+    assert!(
+        String::from_utf8_lossy(&pre).contains("ENV=before"),
+        "expected RESHELL_SESSION=before before rename, got: {:?}",
+        String::from_utf8_lossy(&pre)
+    );
 
     let renamed = Command::new(reshell_bin())
         .args([
@@ -147,6 +162,9 @@ fn info_inside_session_survives_rename() {
 
     // Shell still has RESHELL_SESSION=before; bare `info` should resolve via
     // ancestor pid to the renamed session.
+    let sock = wait_sock(base, "after");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    attach_winsize(&mut stream, 24, 80);
     let bin = reshell_bin();
     let cmd = format!(
         "\"{}\" --dir \"{}\" info\n",
