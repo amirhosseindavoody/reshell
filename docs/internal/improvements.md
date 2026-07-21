@@ -72,31 +72,31 @@ SIGTERM → SIGKILL escalation. The full raw-TTY client path is not exercised in
 
 ## Small features (still on-brand)
 
-### 7. Configurable detach key
+### 7. Configurable detach key — done
 
-**Today:** Only **Ctrl+\** (`0x1c`) detaches — intentional for nested TUI safety.
+**Was:** Only **Ctrl+\** (`0x1c`) detaches — intentional for nested TUI safety.
 
-**Proposal:** Allow override via flag and/or env (dtach-style), with Ctrl+\ as the
-default so existing muscle memory and TUI compatibility stay intact.
+**Now:** `--detach-key` / `RESHELL_DETACH_KEY` accept dtach-style forms (`^\`, `^a`,
+`0x1c`, or a single ASCII char). Default remains Ctrl+\.
 
-### 8. Human-readable `list` output
+### 8. Human-readable `list` output — done
 
-**Today:** `list` prints raw unix timestamps (“good enough for v1”).
+**Was:** `list` prints raw unix timestamps (“good enough for v1”).
 
-**Proposal:** Show relative or formatted times by default. Optional `--json` (or
-similar) for scripts that need stable machine-readable output.
+**Now:** Relative times by default (`2h ago`). `list --json` for stable
+machine-readable output.
 
-### 9. `reshell info <name>`
+### 9. `reshell info <name>` — done
 
-**Proposal:** Print pid, shell path, socket path, attached/detached, created /
-last-active times, and related paths. Useful when debugging “why won’t attach?”
-without digging through the session directory by hand.
+**Now:** Prints pid, shell, state, created / last-active, and all session paths.
+Optional `--json`. Name omitted → most recently active session.
 
-### 10. `reshell rename` and cleaner stale cleanup
+### 10. `reshell rename` and cleaner stale cleanup — done
 
-**Proposal:** Rename a live session’s directory + meta without recreate/kill.
-Continue improving stale-session cleanup (dead pid, leftover `attached` lock)
-especially when people rely on auto-generated names.
+**Now:** `reshell rename old new` moves a live session directory and updates
+`meta.name` (daemon holds a directory fd so file ops survive the rename).
+`reshell clean` (and automatic cleanup during `list` / `new`) removes dead-pid
+sessions, orphan dirs without meta, and stale attach locks.
 
 ---
 
@@ -134,7 +134,7 @@ so local session semantics stay clear.
 | Priority | Items                        | Why                                                   |
 | -------- | ---------------------------- | ----------------------------------------------------- |
 | First    | §§1–6 (hardening, CI, tests) | Correctness and maintainability without product drift |
-| Next     | §§7–11 (CLI polish)          | Low surface area; matches dtach/abduco ergonomics     |
+| Next     | §§7–10 done; §§11+ next  | Low surface area; matches dtach/abduco ergonomics     |
 | Later    | §§12–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
 
 When implementing any item, update user-facing README and/or `design.md` /

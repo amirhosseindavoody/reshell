@@ -1,11 +1,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::{open, Flock, FlockArg, OFlag};
+use nix::sys::stat::Mode;
 use nix::unistd::{getuid, Pid};
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +35,12 @@ pub struct SessionPaths {
 
 impl SessionPaths {
     pub fn for_name(base: &Path, name: &str) -> Self {
-        let dir = base.join(name);
+        Self::for_dir(base.join(name))
+    }
+
+    /// Build paths from an absolute session directory (survives rename when
+    /// resolved via `/proc/self/fd/<dirfd>`).
+    pub fn for_dir(dir: PathBuf) -> Self {
         Self {
             meta: dir.join("meta.json"),
             socket: dir.join("session.sock"),
@@ -44,19 +51,29 @@ impl SessionPaths {
     }
 }
 
+/// Resolve the current path of an open directory fd (Linux `/proc`).
+pub fn paths_from_dir_fd(dir_fd: RawFd) -> Result<SessionPaths> {
+    let link = PathBuf::from(format!("/proc/self/fd/{dir_fd}"));
+    let dir = fs::read_link(&link)
+        .with_context(|| format!("resolve session dir via {}", link.display()))?;
+    Ok(SessionPaths::for_dir(dir))
+}
+
 /// Exclusive advisory lock held by the session daemon while a client is attached.
 /// The kernel releases the flock if the daemon dies, which lets callers detect
 /// stale `attached` files.
+///
+/// Meta/lock updates go through `dir_fd` so a live `reshell rename` (directory
+/// move) does not leave the daemon writing to a stale path.
 pub struct AttachLock {
     _flock: Flock<File>,
-    paths: SessionPaths,
+    dir_fd: OwnedFd,
 }
 
 impl AttachLock {
     /// Create/open the attach lock file and take an exclusive non-blocking flock.
-    pub fn try_acquire(paths: &SessionPaths) -> Result<Self> {
-        fs::create_dir_all(&paths.dir)
-            .with_context(|| format!("create session dir {}", paths.dir.display()))?;
+    pub fn try_acquire(dir_fd: &OwnedFd) -> Result<Self> {
+        let paths = paths_from_dir_fd(dir_fd.as_raw_fd())?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -71,19 +88,40 @@ impl AttachLock {
             }
             Err((_, e)) => return Err(e).context("flock attach lock"),
         };
-        mark_attached(paths, true)?;
+        mark_attached(&paths, true)?;
+        let dir_fd = dup_fd(dir_fd)?;
         Ok(Self {
             _flock: flock,
-            paths: paths.clone(),
+            dir_fd,
         })
     }
 }
 
 impl Drop for AttachLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.paths.attach_lock);
-        let _ = mark_attached(&self.paths, false);
+        if let Ok(paths) = paths_from_dir_fd(self.dir_fd.as_raw_fd()) {
+            let _ = fs::remove_file(&paths.attach_lock);
+            let _ = mark_attached(&paths, false);
+        }
     }
+}
+
+fn dup_fd(fd: &OwnedFd) -> Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = nix::unistd::dup(fd.as_raw_fd()).context("dup session dir fd")?;
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Open the session directory as a directory fd (rename-safe).
+pub fn open_session_dir_fd(paths: &SessionPaths) -> Result<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let raw = open(
+        &paths.dir,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("open session dir {}", paths.dir.display()))?;
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 pub fn session_base_dir() -> Result<PathBuf> {
@@ -264,6 +302,7 @@ pub fn recover_stale_attach_lock(paths: &SessionPaths) -> bool {
 
 pub fn list_sessions(base: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
     ensure_base_dir(base)?;
+    let _ = cleanup_stale_sessions(base)?;
     let mut out = Vec::new();
     let entries = match fs::read_dir(base) {
         Ok(e) => e,
@@ -287,15 +326,141 @@ pub fn list_sessions(base: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
             Err(_) => continue,
         };
         if !process_alive(meta.pid) {
-            // Stale session leftovers.
-            let _ = cleanup_session_files(&paths);
             continue;
         }
         meta.attached = is_attached(&paths);
+        // Keep meta.name aligned with the directory name (after rename).
+        if meta.name != name {
+            meta.name = name.clone();
+            let _ = write_meta(&paths, &meta);
+        }
         out.push((meta, paths));
     }
     out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     Ok(out)
+}
+
+/// Remove dead-session leftovers, orphan dirs, and stale attach locks.
+/// Returns how many session directories were removed.
+pub fn cleanup_stale_sessions(base: &Path) -> Result<usize> {
+    ensure_base_dir(base)?;
+    let mut removed = 0usize;
+    let entries = match fs::read_dir(base) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).context("read session base dir"),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let paths = SessionPaths::for_name(base, &name);
+
+        if !paths.meta.exists() {
+            // Orphan dir (no meta): remove leftover sock/lock/log then the dir.
+            let _ = cleanup_session_files(&paths);
+            if !paths.dir.exists() {
+                removed += 1;
+            }
+            continue;
+        }
+
+        let meta = match read_meta(&paths) {
+            Ok(m) => m,
+            Err(_) => {
+                let _ = cleanup_session_files(&paths);
+                removed += 1;
+                continue;
+            }
+        };
+
+        if !process_alive(meta.pid) {
+            let _ = cleanup_session_files(&paths);
+            removed += 1;
+            continue;
+        }
+
+        // Live session: still recover a stale attach lock if present.
+        let _ = recover_stale_attach_lock(&paths);
+    }
+    Ok(removed)
+}
+
+/// Rename a live (or detached) session directory and update `meta.name`.
+///
+/// The daemon keeps a directory fd open so attach-lock / meta / log writes keep
+/// working after the directory moves.
+pub fn rename_session(base: &Path, old_name: &str, new_name: &str) -> Result<()> {
+    validate_session_name(old_name)?;
+    validate_session_name(new_name)?;
+    if old_name == new_name {
+        return Ok(());
+    }
+
+    let old_paths = SessionPaths::for_name(base, old_name);
+    let new_paths = SessionPaths::for_name(base, new_name);
+
+    if !old_paths.meta.exists() {
+        bail!("session '{old_name}' not found");
+    }
+    if new_paths.dir.exists() {
+        bail!("session '{new_name}' already exists");
+    }
+
+    let meta = read_meta(&old_paths)?;
+    if !process_alive(meta.pid) {
+        let _ = cleanup_session_files(&old_paths);
+        bail!("session '{old_name}' is not running (cleaned up stale files)");
+    }
+
+    fs::rename(&old_paths.dir, &new_paths.dir).with_context(|| {
+        format!(
+            "rename {} → {}",
+            old_paths.dir.display(),
+            new_paths.dir.display()
+        )
+    })?;
+
+    let mut meta = read_meta(&new_paths).with_context(|| {
+        format!(
+            "read meta after rename at {}",
+            new_paths.meta.display()
+        )
+    })?;
+    meta.name = new_name.to_string();
+    write_meta(&new_paths, &meta)?;
+    Ok(())
+}
+
+/// Load a live session for `info` (refuses dead/missing).
+pub fn session_info(base: &Path, name: &str) -> Result<(SessionMeta, SessionPaths)> {
+    validate_session_name(name)?;
+    let _ = cleanup_stale_sessions(base)?;
+    let paths = SessionPaths::for_name(base, name);
+    if !paths.meta.exists() {
+        bail!("session '{name}' not found");
+    }
+    let mut meta = read_meta(&paths)?;
+    if !process_alive(meta.pid) {
+        let _ = cleanup_session_files(&paths);
+        bail!("session '{name}' is not running (cleaned up leftovers)");
+    }
+    meta.attached = is_attached(&paths);
+    if meta.name != name {
+        meta.name = name.to_string();
+        let _ = write_meta(&paths, &meta);
+    }
+    Ok((meta, paths))
 }
 
 /// Session activity timestamp: last attach/detach, else creation time.
@@ -510,13 +675,73 @@ mod tests {
             },
         )
         .unwrap();
-        let held = AttachLock::try_acquire(&paths).unwrap();
+        let dir_fd = open_session_dir_fd(&paths).unwrap();
+        let held = AttachLock::try_acquire(&dir_fd).unwrap();
         assert!(is_attached(&paths));
-        assert!(AttachLock::try_acquire(&paths).is_err());
+        assert!(AttachLock::try_acquire(&dir_fd).is_err());
         drop(held);
         assert!(!is_attached(&paths));
-        let again = AttachLock::try_acquire(&paths).unwrap();
+        let again = AttachLock::try_acquire(&dir_fd).unwrap();
         drop(again);
+    }
+
+    #[test]
+    fn rename_updates_meta_and_directory() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+        let self_pid = std::process::id() as i32;
+        let old = SessionPaths::for_name(base, "old-name");
+        write_meta(
+            &old,
+            &SessionMeta {
+                name: "old-name".into(),
+                pid: self_pid,
+                shell: "/bin/bash".into(),
+                created_unix: 1,
+                attached: false,
+                last_active_unix: 1,
+            },
+        )
+        .unwrap();
+        rename_session(base, "old-name", "new-name").unwrap();
+        assert!(!old.dir.exists());
+        let new = SessionPaths::for_name(base, "new-name");
+        assert!(new.meta.exists());
+        let meta = read_meta(&new).unwrap();
+        assert_eq!(meta.name, "new-name");
+    }
+
+    #[test]
+    fn cleanup_stale_removes_dead_and_orphan() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+
+        // Orphan directory with no meta.
+        let orphan = base.join("orphan");
+        fs::create_dir_all(&orphan).unwrap();
+        File::create(orphan.join("session.sock")).unwrap();
+
+        // Definitely-dead pid session.
+        let dead = SessionPaths::for_name(base, "dead");
+        write_meta(
+            &dead,
+            &SessionMeta {
+                name: "dead".into(),
+                pid: i32::MAX - 1,
+                shell: "/bin/bash".into(),
+                created_unix: 1,
+                attached: false,
+                last_active_unix: 0,
+            },
+        )
+        .unwrap();
+
+        let n = cleanup_stale_sessions(base).unwrap();
+        assert!(n >= 2, "expected orphan+dead removed, got {n}");
+        assert!(!orphan.exists());
+        assert!(!dead.dir.exists());
     }
 
     #[test]

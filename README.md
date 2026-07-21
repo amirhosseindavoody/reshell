@@ -7,7 +7,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Keep shells alive and running after SSH disconnects
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
 - Explicit sessions: `new` / `attach` / `list` / `kill`
-- Detach with **Ctrl+\** (client exits; session keeps running)
+- Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
 - Reattach restores TUI terminal modes (mouse, alt-screen, …) and forces a redraw
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session
 - Targeted at SSH sessions into Linux servers
@@ -64,12 +64,23 @@ reshell new demo
 # Create without attaching (prints the name)
 reshell new demo --detach
 
-# Attach (Ctrl+\ detaches without killing the shell)
+# Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
 # or: reshell attach       # most recently active (or new if none)
+# or: reshell --detach-key '^a' attach demo
 
-# List sessions
+# List sessions (relative times; --json for scripts)
 reshell list
+reshell list --json
+
+# Session details (paths, pid, state, …)
+reshell info demo
+
+# Rename a live session
+reshell rename demo demo2
+
+# Remove dead-session leftovers (also runs as part of `list`)
+reshell clean
 
 # Kill a session
 reshell kill demo
@@ -78,6 +89,8 @@ reshell kill demo
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
+
+Detach key defaults to **Ctrl+\**. Override with `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or a single ASCII char).
 
 ## Why reshell?
 
@@ -94,7 +107,7 @@ windows, panes, status bars, and a prefix key chord.
 | | reshell | tmux / screen / Zellij / Byobu |
 |---|---|---|
 | **Job** | Survive hangups; reattach to the same PTY | Layouts, panes, tabs, shared scrollback UI |
-| **Keys** | Only **Ctrl+\\** detaches | Prefix chord (`Ctrl+b`, `Ctrl+a`, …) steals shortcuts from nested apps |
+| **Keys** | Detach byte only (default **Ctrl+\\**; configurable) | Prefix chord (`Ctrl+b`, `Ctrl+a`, …) steals shortcuts from nested apps |
 | **Nested TUIs** | Raw passthrough — editors, ratatui apps, and mouse just work | Often need extra config; mouse/keys conflict with the multiplexer |
 | **VS Code / Cursor** | OSC 633 passes through; sticky scroll tracks commands *inside* the session | Often eat or rewrite escape sequences unless specially wrapped |
 | **Complexity** | One session ↔ one shell | Full virtual terminal + UI chrome |
@@ -120,7 +133,7 @@ editors:
 | **Core model** | One PTY per named session; raw byte pipe | Same idea |
 | **Session UX** | `new` / `attach` / `list` / `kill`; bare `reshell` attaches (or creates) the most recent session | Minimal CLI; dtach has little session management; abduco lists sessions but is otherwise sparse |
 | **Reattach redraw** | Restores DEC modes (mouse, alt-screen, …) and forces a two-phase resize so differential TUIs (e.g. ratatui / Fresh) full-paint | Passthrough only — terminal modes and screen contents are not restored; abduco recommends nesting [dvtm](https://github.com/martanne/dvtm) for that |
-| **Detach** | **Ctrl+\\** | Configurable detach key (similar spirit) |
+| **Detach** | **Ctrl+\\** by default; overridable (`--detach-key` / `RESHELL_DETACH_KEY`) | Configurable detach key (similar spirit) |
 | **Editor / IDE terminals** | VS Code/Cursor sticky scroll: closes the outer `reshell` command and injects shell integration into the session | No awareness of OSC 633 / sticky scroll |
 | **Stack** | Modern Rust binary; Linux-focused packaging via pixi | Small C tools; widely packaged, very mature |
 

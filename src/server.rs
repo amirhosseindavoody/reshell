@@ -18,8 +18,8 @@ use nix::unistd::{read as nix_read, write as nix_write};
 
 use crate::protocol::{self, Message, Winsize};
 use crate::session::{
-    self, append_daemon_log, cleanup_session_files, now_unix, write_meta, AttachLock, SessionMeta,
-    SessionPaths,
+    self, append_daemon_log, cleanup_session_files, now_unix, open_session_dir_fd,
+    paths_from_dir_fd, write_meta, AttachLock, SessionMeta, SessionPaths,
 };
 use crate::termstate::TermState;
 use crate::vscode_si;
@@ -273,8 +273,8 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
                 &format!("ready pid={} socket={}", meta.pid, paths.socket.display()),
             );
 
-            server_loop(master, listener, shell_pid, &paths)?;
-            cleanup_session_files(&paths)?;
+            let dir_fd = open_session_dir_fd(&paths)?;
+            server_loop(master, listener, shell_pid, dir_fd)?;
             Ok(())
         }
         ForkResult::Child => {
@@ -382,7 +382,7 @@ fn server_loop(
     master: OwnedFd,
     listener: UnixListener,
     shell_pid: Pid,
-    paths: &SessionPaths,
+    dir_fd: OwnedFd,
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
@@ -392,10 +392,16 @@ fn server_loop(
     let mut pty_outbound: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
 
+    let log = |msg: &str| {
+        if let Ok(paths) = paths_from_dir_fd(dir_fd.as_raw_fd()) {
+            append_daemon_log(&paths, msg);
+        }
+    };
+
     loop {
         match waitpid(shell_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
-                drop_client(&mut client, &mut attach_lock, paths);
+                drop_client(&mut client, &mut attach_lock, &dir_fd);
                 break;
             }
             Ok(_) => {}
@@ -464,33 +470,24 @@ fn server_loop(
             match listener.accept() {
                 Ok((stream, _)) => {
                     if client.is_some() {
-                        append_daemon_log(paths, "reject attach: session already has a client");
+                        log("reject attach: session already has a client");
                         drop(stream);
                     } else {
-                        match (ClientConn::new(stream), AttachLock::try_acquire(paths)) {
+                        match (ClientConn::new(stream), AttachLock::try_acquire(&dir_fd)) {
                             (Ok(c), Ok(lock)) => {
                                 client = Some(c);
                                 attach_lock = Some(lock);
-                                append_daemon_log(paths, "client attached");
+                                log("client attached");
                             }
                             (Ok(_), Err(e)) => {
-                                append_daemon_log(
-                                    paths,
-                                    &format!("reject attach: could not take lock ({e})"),
-                                );
+                                log(&format!("reject attach: could not take lock ({e})"));
                             }
                             (Err(e), Ok(lock)) => {
                                 drop(lock);
-                                append_daemon_log(
-                                    paths,
-                                    &format!("reject attach: client setup failed ({e})"),
-                                );
+                                log(&format!("reject attach: client setup failed ({e})"));
                             }
                             (Err(e), Err(_)) => {
-                                append_daemon_log(
-                                    paths,
-                                    &format!("reject attach: client setup failed ({e})"),
-                                );
+                                log(&format!("reject attach: client setup failed ({e})"));
                             }
                         }
                     }
@@ -504,7 +501,7 @@ fn server_loop(
             match flush_pty_outbound(master_fd, &mut pty_outbound) {
                 Ok(()) => {}
                 Err(e) => {
-                    append_daemon_log(paths, &format!("pty write error: {e:#}"));
+                    log(&format!("pty write error: {e:#}"));
                     return Err(e);
                 }
             }
@@ -524,7 +521,7 @@ fn server_loop(
                             }
                             if c.enqueue(&Message::Data(buf[..n].to_vec())).is_err() {
                                 pending_redraw = None;
-                                drop_client(&mut client, &mut attach_lock, paths);
+                                drop_client(&mut client, &mut attach_lock, &dir_fd);
                             }
                         }
                         // else: wait for Attach (mode restore) before forwarding
@@ -545,7 +542,7 @@ fn server_loop(
         if let Some(ref mut c) = client {
             if client_revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
                 pending_redraw = None;
-                drop_client(&mut client, &mut attach_lock, paths);
+                drop_client(&mut client, &mut attach_lock, &dir_fd);
             } else {
                 let mut dead = false;
                 if client_revents.contains(PollFlags::POLLOUT) || !c.outbound.is_empty() {
@@ -575,12 +572,12 @@ fn server_loop(
                 }
                 if dead {
                     pending_redraw = None;
-                    drop_client(&mut client, &mut attach_lock, paths);
+                    drop_client(&mut client, &mut attach_lock, &dir_fd);
                 } else if !c.outbound.is_empty() {
                     // Opportunistic flush after enqueue from PTY.
                     if c.flush_outbound()? {
                         pending_redraw = None;
-                        drop_client(&mut client, &mut attach_lock, paths);
+                        drop_client(&mut client, &mut attach_lock, &dir_fd);
                     }
                 }
             }
@@ -589,17 +586,22 @@ fn server_loop(
 
     let _ = signal::kill(shell_pid, Signal::SIGHUP);
     let _ = waitpid(shell_pid, None);
+    if let Ok(paths) = paths_from_dir_fd(dir_fd.as_raw_fd()) {
+        cleanup_session_files(&paths)?;
+    }
     Ok(())
 }
 
 fn drop_client(
     client: &mut Option<ClientConn>,
     attach_lock: &mut Option<AttachLock>,
-    paths: &SessionPaths,
+    dir_fd: &OwnedFd,
 ) {
     *client = None;
     *attach_lock = None;
-    append_daemon_log(paths, "client detached");
+    if let Ok(paths) = paths_from_dir_fd(dir_fd.as_raw_fd()) {
+        append_daemon_log(&paths, "client detached");
+    }
 }
 
 /// Write as much of `pty_outbound` as the non-blocking PTY accepts.

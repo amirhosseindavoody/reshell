@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 
-use session::{allocate_session_name, session_base_dir};
+use protocol::parse_detach_key;
+use session::{allocate_session_name, now_unix, session_base_dir};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -27,6 +29,10 @@ struct Cli {
     /// Daemon log path (default: `$session/daemon.log`). Also accepts `RESHELL_LOG`.
     #[arg(long, global = true, env = "RESHELL_LOG")]
     log: Option<PathBuf>,
+
+    /// Detach key (default: Ctrl+\ ). Examples: ^\, ^a, 0x1c. Also `RESHELL_DETACH_KEY`.
+    #[arg(long, global = true, env = "RESHELL_DETACH_KEY", default_value = "^\\")]
+    detach_key: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -52,7 +58,28 @@ enum Commands {
         name: Option<String>,
     },
     /// List running sessions
-    List,
+    List {
+        /// Machine-readable JSON (stable fields for scripts)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details for a session
+    Info {
+        /// Session name (defaults to the most recently active session)
+        name: Option<String>,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a live session
+    Rename {
+        /// Current session name
+        old_name: String,
+        /// New session name
+        new_name: String,
+    },
+    /// Remove dead-session leftovers (also done automatically by `list`)
+    Clean,
     /// Terminate a session and its shell
     Kill {
         /// Session name
@@ -74,6 +101,7 @@ fn run() -> Result<()> {
         None => session_base_dir()?,
     };
     let log = cli.log;
+    let detach_key = parse_detach_key(&cli.detach_key)?;
 
     // Bare `reshell` is an alias for `reshell attach`.
     let command = cli.command.unwrap_or(Commands::Attach { name: None });
@@ -83,29 +111,21 @@ fn run() -> Result<()> {
             name,
             shell,
             detach,
-        } => cmd_new(&base, name, shell, detach, log),
-        Commands::Attach { name } => cmd_attach(&base, name, log),
-        Commands::List => {
-            let sessions = session::list_sessions(&base)?;
-            if sessions.is_empty() {
-                println!("(no sessions)");
-                return Ok(());
-            }
-            println!(
-                "{:<20} {:>8} {:<10} {:<20} SHELL",
-                "NAME", "PID", "STATE", "CREATED"
-            );
-            for (meta, _) in sessions {
-                let state = if meta.attached {
-                    "attached"
-                } else {
-                    "detached"
-                };
-                let created = format_unix(meta.created_unix);
-                println!(
-                    "{:<20} {:>8} {:<10} {:<20} {}",
-                    meta.name, meta.pid, state, created, meta.shell
-                );
+        } => cmd_new(&base, name, shell, detach, log, detach_key),
+        Commands::Attach { name } => cmd_attach(&base, name, log, detach_key),
+        Commands::List { json } => cmd_list(&base, json),
+        Commands::Info { name, json } => cmd_info(&base, name, json),
+        Commands::Rename { old_name, new_name } => {
+            session::rename_session(&base, &old_name, &new_name)?;
+            println!("renamed {old_name} → {new_name}");
+            Ok(())
+        }
+        Commands::Clean => {
+            let n = session::cleanup_stale_sessions(&base)?;
+            if n == 0 {
+                println!("(nothing to clean)");
+            } else {
+                println!("removed {n} stale session(s)");
             }
             Ok(())
         }
@@ -123,7 +143,9 @@ fn cmd_new(
     shell: Option<String>,
     detach: bool,
     log: Option<PathBuf>,
+    detach_key: u8,
 ) -> Result<()> {
+    let _ = session::cleanup_stale_sessions(base)?;
     let name = match name {
         Some(n) => n,
         None => allocate_session_name(base)?,
@@ -141,22 +163,138 @@ fn cmd_new(
     } else {
         // Name goes to stderr so it does not collide with the TTY session.
         eprintln!("{name}");
-        client::attach(base, &name)
+        client::attach(base, &name, detach_key)
     }
 }
 
-fn cmd_attach(base: &Path, name: Option<String>, log: Option<PathBuf>) -> Result<()> {
+fn cmd_attach(
+    base: &Path,
+    name: Option<String>,
+    log: Option<PathBuf>,
+    detach_key: u8,
+) -> Result<()> {
     match name {
-        Some(n) => client::attach(base, &n),
+        Some(n) => client::attach(base, &n, detach_key),
         None => {
             let sessions = session::list_sessions(base)?;
             if sessions.is_empty() {
                 // No live sessions — same as `reshell new`.
-                return cmd_new(base, None, None, false, log);
+                return cmd_new(base, None, None, false, log, detach_key);
             }
             let meta = session::most_recent_session(base)?;
             eprintln!("attaching to {}", meta.name);
-            client::attach(base, &meta.name)
+            client::attach(base, &meta.name, detach_key)
+        }
+    }
+}
+
+fn cmd_list(base: &Path, json: bool) -> Result<()> {
+    let sessions = session::list_sessions(base)?;
+    if json {
+        let rows: Vec<SessionJson> = sessions
+            .iter()
+            .map(|(meta, paths)| SessionJson::from_session(meta, paths))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if sessions.is_empty() {
+        println!("(no sessions)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:>8} {:<10} {:<16} SHELL",
+        "NAME", "PID", "STATE", "CREATED"
+    );
+    for (meta, _) in sessions {
+        let state = if meta.attached {
+            "attached"
+        } else {
+            "detached"
+        };
+        let created = format_time_human(meta.created_unix);
+        println!(
+            "{:<20} {:>8} {:<10} {:<16} {}",
+            meta.name, meta.pid, state, created, meta.shell
+        );
+    }
+    Ok(())
+}
+
+fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
+    let name = match name {
+        Some(n) => n,
+        None => session::most_recent_session(base)?.name,
+    };
+    let (meta, paths) = session::session_info(base, &name)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&SessionJson::from_session(&meta, &paths))?
+        );
+        return Ok(());
+    }
+    let state = if meta.attached {
+        "attached"
+    } else {
+        "detached"
+    };
+    println!("name:        {}", meta.name);
+    println!("pid:         {}", meta.pid);
+    println!("state:       {state}");
+    println!("shell:       {}", meta.shell);
+    println!(
+        "created:     {} ({})",
+        format_time_human(meta.created_unix),
+        meta.created_unix
+    );
+    let last = if meta.last_active_unix > 0 {
+        meta.last_active_unix
+    } else {
+        meta.created_unix
+    };
+    println!(
+        "last_active: {} ({})",
+        format_time_human(last),
+        last
+    );
+    println!("dir:         {}", paths.dir.display());
+    println!("socket:      {}", paths.socket.display());
+    println!("meta:        {}", paths.meta.display());
+    println!("attach_lock: {}", paths.attach_lock.display());
+    println!("daemon_log:  {}", paths.daemon_log.display());
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct SessionJson {
+    name: String,
+    pid: i32,
+    shell: String,
+    attached: bool,
+    created_unix: u64,
+    last_active_unix: u64,
+    dir: String,
+    socket: String,
+    meta: String,
+    attach_lock: String,
+    daemon_log: String,
+}
+
+impl SessionJson {
+    fn from_session(meta: &session::SessionMeta, paths: &session::SessionPaths) -> Self {
+        Self {
+            name: meta.name.clone(),
+            pid: meta.pid,
+            shell: meta.shell.clone(),
+            attached: meta.attached,
+            created_unix: meta.created_unix,
+            last_active_unix: meta.last_active_unix,
+            dir: paths.dir.display().to_string(),
+            socket: paths.socket.display().to_string(),
+            meta: paths.meta.display().to_string(),
+            attach_lock: paths.attach_lock.display().to_string(),
+            daemon_log: paths.daemon_log.display().to_string(),
         }
     }
 }
@@ -165,8 +303,25 @@ fn default_shell() -> String {
     "/bin/zsh".into()
 }
 
-fn format_unix(ts: u64) -> String {
-    // Keep formatting dependency-free: show unix timestamp.
-    // Good enough for list output in v1.
-    ts.to_string()
+/// Relative time for human list/info output (no extra time deps).
+fn format_time_human(ts: u64) -> String {
+    if ts == 0 {
+        return "-".into();
+    }
+    let now = now_unix();
+    if ts > now {
+        return "in the future".into();
+    }
+    let ago = now - ts;
+    if ago < 60 {
+        format!("{ago}s ago")
+    } else if ago < 3600 {
+        format!("{}m ago", ago / 60)
+    } else if ago < 86400 {
+        format!("{}h ago", ago / 3600)
+    } else if ago < 86400 * 30 {
+        format!("{}d ago", ago / 86400)
+    } else {
+        format!("{}d ago", ago / 86400)
+    }
 }

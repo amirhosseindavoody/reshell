@@ -14,7 +14,7 @@ use nix::sys::termios::{
 };
 use nix::unistd::{read as nix_read, write as nix_write};
 
-use crate::protocol::{self, Message, Winsize, DETACH_BYTE};
+use crate::protocol::{self, Message, Winsize};
 use crate::session::{self, SessionPaths};
 use crate::termstate::TermState;
 use crate::vscode_si;
@@ -30,7 +30,7 @@ extern "C" fn handle_hup(_: nix::libc::c_int) {
     HUP_FLAG.store(true, Ordering::Relaxed);
 }
 
-pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
+pub fn attach(base: &std::path::Path, name: &str, detach_key: u8) -> Result<()> {
     session::validate_session_name(name)?;
     let paths = SessionPaths::for_name(base, name);
     if !paths.meta.exists() {
@@ -116,7 +116,7 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
     stream.flush()?;
     set_nonblocking(stream.as_raw_fd())?;
 
-    let result = client_loop(&mut stream, stdin_fd);
+    let result = client_loop(&mut stream, stdin_fd, detach_key);
     // Leave the local TTY without mouse / alt-screen sticky state from the
     // remote app (DEC private modes are not covered by termios restore).
     let _ = write_all_fd(io::stdout().as_raw_fd(), &TermState::client_cleanup_sequence());
@@ -198,7 +198,7 @@ fn set_blocking(fd: i32) -> Result<()> {
     Ok(())
 }
 
-fn client_loop(stream: &mut UnixStream, stdin_fd: i32) -> Result<()> {
+fn client_loop(stream: &mut UnixStream, stdin_fd: i32, detach_key: u8) -> Result<()> {
     let stdout_fd = io::stdout().as_raw_fd();
     let mut stdin_buf = [0u8; 4096];
     let mut sock_buf = [0u8; 8192];
@@ -243,7 +243,7 @@ fn client_loop(stream: &mut UnixStream, stdin_fd: i32) -> Result<()> {
                 }
                 Ok(n) => {
                     pending_stdin.extend_from_slice(&stdin_buf[..n]);
-                    if enqueue_stdin(&mut outbound, &mut pending_stdin)? {
+                    if enqueue_stdin(&mut outbound, &mut pending_stdin, detach_key)? {
                         let _ = flush_outbound(stream, &mut outbound);
                         return Ok(());
                     }
@@ -289,11 +289,11 @@ fn client_loop(stream: &mut UnixStream, stdin_fd: i32) -> Result<()> {
 }
 
 /// Queue stdin bytes; returns true if detach was requested.
-fn enqueue_stdin(outbound: &mut Vec<u8>, pending: &mut Vec<u8>) -> Result<bool> {
+fn enqueue_stdin(outbound: &mut Vec<u8>, pending: &mut Vec<u8>, detach_key: u8) -> Result<bool> {
     if pending.is_empty() {
         return Ok(false);
     }
-    if let Some(pos) = pending.iter().position(|&b| b == DETACH_BYTE) {
+    if let Some(pos) = pending.iter().position(|&b| b == detach_key) {
         let before = pending[..pos].to_vec();
         if !before.is_empty() {
             outbound.extend(protocol::encode_message(&Message::Data(before))?);

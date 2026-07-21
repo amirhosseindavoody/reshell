@@ -43,8 +43,10 @@ Little-endian:
 ## Client conventions
 
 - After connect, send `Attach` with the current local winsize before any `Data`.
-- **Detach key:** byte `0x1c` (Ctrl+\) in the local stdin stream. The client must
-  not forward that byte to the session; it sends `Detach` and exits instead.
+- **Detach key:** by default byte `0x1c` (Ctrl+\) in the local stdin stream.
+  Overridable with `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or a
+  single ASCII char). The client must not forward that byte to the session; it
+  sends `Detach` and exits instead.
 - On local `SIGHUP`, send `Detach` (best effort) and exit.
 - On local `SIGWINCH`, send `Resize`.
 - On exit, write a DEC mode cleanup sequence to the local TTY (disable mouse /

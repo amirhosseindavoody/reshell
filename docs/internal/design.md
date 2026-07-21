@@ -8,8 +8,10 @@ prefix key chord that steals shortcuts from nested TUIs.
 ## Goals
 
 - Survive SSH hangup: client exit or `SIGHUP` must not kill the session shell.
-- Minimal input interception: only **Ctrl+\** (ASCII `0x1c`) detaches the client.
-- Explicit sessions: `new`, `attach`, `list`, `kill` — no transparent SSH wrap in v1.
+- Minimal input interception: only a single detach byte (default **Ctrl+\** /
+  ASCII `0x1c`; overridable via `--detach-key` / `RESHELL_DETACH_KEY`).
+- Explicit sessions: `new`, `attach`, `list`, `info`, `rename`, `clean`, `kill` —
+  no transparent SSH wrap in v1.
 - Shell-agnostic: PTY passthrough so bash, zsh, fish, and full-screen apps work.
 - Linux servers only (`linux-64` pixi platform).
 
@@ -47,10 +49,10 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` (attach by default) / `attach` / `list` / `kill`; default shell `/bin/zsh` |
-| [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/kill, attach lock, most-recent session |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `rename` / `clean` / `kill`; detach-key + log flags; default shell `/bin/zsh` |
+| [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O |
-| [`src/client.rs`](../../src/client.rs) | Raw TTY, detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
+| [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
 | [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)) |
 | [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode tracking for restore-on-attach |
 | [`src/vscode_si.rs`](../../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject |
@@ -78,14 +80,23 @@ Session names are limited to `[A-Za-z0-9._-]`, max 64 characters.
 Auto-generated names look like `session-{unix_secs}-{4 hex digits}` so concurrent
 `new` calls in the same second do not collide.
 
-`list` skips directories whose daemon pid is dead and removes stale files.
-It also recovers a leftover `attached` file when nobody holds the advisory flock
-(e.g. after a crashed daemon).
+`list` skips directories whose daemon pid is dead and removes stale files (also
+available explicitly as `reshell clean`). It recovers a leftover `attached` file
+when nobody holds the advisory flock (e.g. after a crashed daemon), and removes
+orphan session dirs that lack `meta.json`.
+`list` shows relative times by default (`2h ago`); `list --json` is stable for scripts.
+`info` prints pid, shell, state, timestamps, and all session paths (`info --json` too).
+`rename old new` renames a live session directory and updates `meta.name`. The
+daemon keeps a directory fd open so meta/lock/log writes survive the move; the
+Unix socket path moves with the directory.
 `kill` sends `SIGTERM` (then `SIGKILL`) to the daemon pid and deletes the session dir.
 Attach/kill failures include concrete reasons (dead pid, lock held, socket missing, …).
 
 Override the daemon log path with `--log` / `RESHELL_LOG` (fatal errors are written
 there; otherwise they go to `daemon.log`).
+
+Detach key defaults to Ctrl+\ (`^\`). Override with `--detach-key` / `RESHELL_DETACH_KEY`
+(`^a`, `0x1c`, or a single ASCII character).
 
 ## Session creation (`new`)
 
@@ -119,7 +130,7 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
 4. Connect to `session.sock`.
 5. Put local TTY in raw mode; restore on exit (`TermiosGuard`).
 6. Send `Attach` with current winsize; enter poll loop:
-   - stdin → `Data` (or `Detach` if Ctrl+\ seen)
+   - stdin → `Data` (or `Detach` if the configured detach byte is seen)
    - socket `Data` → stdout
    - `SIGWINCH` → `Resize`
    - `SIGHUP` → send `Detach` and exit (session keeps running)
@@ -177,7 +188,7 @@ mode restore runs before any redraw data.
 
 | Event | Client | Daemon | Shell |
 |-------|--------|--------|-------|
-| Ctrl+\ | exits | drops client, clears attach lock | keeps running |
+| Detach key (default Ctrl+\) | exits | drops client, clears attach lock | keeps running |
 | SSH hangup (`SIGHUP` to client) | exits after `Detach` | same as above | keeps running |
 | Client crash / socket close | gone | drops client | keeps running |
 | Shell exits | eventually EOF on socket | cleans up session files, exits | — |

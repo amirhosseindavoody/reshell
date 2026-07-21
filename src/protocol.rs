@@ -2,8 +2,51 @@ use std::io::{self, Read, Write};
 
 use anyhow::{bail, Context, Result};
 
-/// Detach key: Ctrl+\ (ASCII FS, 0x1c).
+/// Default detach key: Ctrl+\ (ASCII FS, 0x1c).
+/// Used as the documented default for `--detach-key` / `RESHELL_DETACH_KEY`.
+#[allow(dead_code)] // referenced by docs/tests; binary uses the parsed `^\` default
 pub const DETACH_BYTE: u8 = 0x1c;
+
+/// Parse a dtach-style detach key string into a single byte.
+///
+/// Accepted forms:
+/// - `^X` / `^x` — Ctrl+X (bit 0x1f); default is `^\` → `0x1c`
+/// - `0x1c` / `\x1c` — hex byte
+/// - a single ASCII character
+pub fn parse_detach_key(s: &str) -> Result<u8> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("detach key must not be empty");
+    }
+    if let Some(rest) = s.strip_prefix('^') {
+        let mut chars = rest.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if c.is_ascii() => {
+                return Ok((c as u8) & 0x1f);
+            }
+            _ => bail!("invalid detach key '{s}' (use ^X for Ctrl+X, e.g. ^\\)"),
+        }
+    }
+    if let Some(hex) = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .or_else(|| s.strip_prefix("\\x"))
+    {
+        if hex.len() == 2 {
+            if let Ok(b) = u8::from_str_radix(hex, 16) {
+                return Ok(b);
+            }
+        }
+        bail!("invalid hex detach key '{s}' (use 0x1c)");
+    }
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii() => Ok(c as u8),
+        _ => bail!(
+            "invalid detach key '{s}'; use ^\\ (default), ^a, a single ASCII char, or 0x1c"
+        ),
+    }
+}
 
 pub const MSG_DATA: u8 = 1;
 pub const MSG_RESIZE: u8 = 2;
@@ -155,5 +198,18 @@ mod tests {
                 _ => panic!("mismatch"),
             }
         }
+    }
+
+    #[test]
+    fn parse_detach_key_forms() {
+        assert_eq!(parse_detach_key("^\\").unwrap(), DETACH_BYTE);
+        assert_eq!(parse_detach_key("^a").unwrap(), 0x01);
+        assert_eq!(parse_detach_key("^A").unwrap(), 0x01);
+        assert_eq!(parse_detach_key("0x1c").unwrap(), 0x1c);
+        assert_eq!(parse_detach_key("\\x1d").unwrap(), 0x1d);
+        assert_eq!(parse_detach_key("x").unwrap(), b'x');
+        assert!(parse_detach_key("").is_err());
+        assert!(parse_detach_key("^ab").is_err());
+        assert!(parse_detach_key("too-long").is_err());
     }
 }
