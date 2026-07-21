@@ -86,6 +86,21 @@ reshell clean
 reshell kill demo
 ```
 
+### Shell completion
+
+```bash
+# bash
+eval "$(reshell completion bash)"
+
+# zsh
+eval "$(reshell completion zsh)"
+
+# fish
+reshell completion fish | source
+```
+
+To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
+
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.

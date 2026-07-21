@@ -127,6 +127,26 @@ fn clean_removes_orphan_dirs() {
 }
 
 #[test]
+fn completion_prints_shell_script() {
+    for shell in ["bash", "zsh", "fish"] {
+        let out = Command::new(reshell_bin())
+            .args(["completion", shell])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "completion {shell}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let txt = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            txt.contains("reshell"),
+            "completion {shell} missing binary name: {txt}"
+        );
+    }
+}
+
+#[test]
 fn detach_key_flag_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();

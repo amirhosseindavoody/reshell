@@ -8,7 +8,8 @@ mod vscode_si;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use serde::Serialize;
 
 use protocol::parse_detach_key;
@@ -85,6 +86,11 @@ enum Commands {
         /// Session name
         name: String,
     },
+    /// Print shell completion script to stdout
+    Completion {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
 }
 
 fn main() {
@@ -96,6 +102,14 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Generate completions without resolving session dirs or validating detach-key.
+    if let Some(Commands::Completion { shell }) = cli.command {
+        let mut cmd = Cli::command();
+        generate(shell, &mut cmd, "reshell", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let base = match cli.dir {
         Some(d) => d,
         None => session_base_dir()?,
@@ -134,6 +148,7 @@ fn run() -> Result<()> {
             println!("killed {name}");
             Ok(())
         }
+        Commands::Completion { .. } => unreachable!("handled above"),
     }
 }
 
