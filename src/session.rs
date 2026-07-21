@@ -626,8 +626,12 @@ mod tests {
     use nix::sys::signal::{signal, SigHandler, Signal};
     use nix::sys::wait::waitpid;
     use nix::unistd::{fork, ForkResult};
+    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    /// Serialize tests that mutate `RESHELL_SESSION` (process-global env).
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn validate_names() {
@@ -658,37 +662,6 @@ mod tests {
     }
 
     #[test]
-    fn current_session_from_env() {
-        let dir = tempdir().unwrap();
-        let base = dir.path();
-        ensure_base_dir(base).unwrap();
-        let self_pid = std::process::id() as i32;
-        for (name, last) in [("other", 200u64), ("mine", 100u64)] {
-            write_meta(
-                &SessionPaths::for_name(base, name),
-                &SessionMeta {
-                    name: name.into(),
-                    pid: self_pid,
-                    shell: "/bin/bash".into(),
-                    created_unix: 1,
-                    attached: false,
-                    last_active_unix: last,
-                },
-            )
-            .unwrap();
-        }
-        // SAFETY: test-only; no other threads rely on this env key here.
-        unsafe {
-            std::env::set_var(RESHELL_SESSION_ENV, "mine");
-        }
-        let cur = current_session(base).unwrap().expect("current");
-        unsafe {
-            std::env::remove_var(RESHELL_SESSION_ENV);
-        }
-        assert_eq!(cur.name, "mine");
-    }
-
-    #[test]
     fn current_session_from_ancestor_pid() {
         let dir = tempdir().unwrap();
         let base = dir.path();
@@ -708,15 +681,64 @@ mod tests {
             },
         )
         .unwrap();
-        // Stale env must not win over an ancestor match (rename case).
+        // Also write a decoy that `$RESHELL_SESSION` might point at after rename.
+        write_meta(
+            &SessionPaths::for_name(base, "stale-name"),
+            &SessionMeta {
+                name: "stale-name".into(),
+                pid: self_pid,
+                shell: "/bin/bash".into(),
+                created_unix: 1,
+                attached: false,
+                last_active_unix: 99,
+            },
+        )
+        .unwrap();
+        // Ancestor match must win over a live-but-unrelated env name (rename case).
+        // Serialize env mutation: other tests must not race on RESHELL_SESSION.
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: held behind ENV_TEST_LOCK; restored before unlock.
         unsafe {
-            std::env::set_var(RESHELL_SESSION_ENV, "gone");
+            std::env::set_var(RESHELL_SESSION_ENV, "stale-name");
         }
         let cur = current_session(base).unwrap().expect("current");
         unsafe {
             std::env::remove_var(RESHELL_SESSION_ENV);
         }
         assert_eq!(cur.name, "nested");
+    }
+
+    #[test]
+    fn current_session_from_env_when_not_nested() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+        // Use an alive pid that is not an ancestor (our own pid).
+        let self_pid = std::process::id() as i32;
+        for (name, last) in [("other", 200u64), ("mine", 100u64)] {
+            write_meta(
+                &SessionPaths::for_name(base, name),
+                &SessionMeta {
+                    name: name.into(),
+                    pid: self_pid,
+                    shell: "/bin/bash".into(),
+                    created_unix: 1,
+                    attached: false,
+                    last_active_unix: last,
+                },
+            )
+            .unwrap();
+        }
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        // SAFETY: held behind ENV_TEST_LOCK; restored before unlock.
+        unsafe {
+            std::env::set_var(RESHELL_SESSION_ENV, "mine");
+        }
+        let cur = current_session(base).unwrap().expect("current");
+        unsafe {
+            std::env::remove_var(RESHELL_SESSION_ENV);
+        }
+        assert_eq!(cur.name, "mine");
     }
 
     #[test]
