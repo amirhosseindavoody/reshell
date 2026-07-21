@@ -81,14 +81,20 @@ fn concurrent_connects_only_one_survives() {
     new_detached(base, "race");
     let sock = wait_sock(base, "race");
 
-    let barrier = Arc::new(Barrier::new(3));
+    // Two barriers: both sockets must be connected before either sends Attach,
+    // and neither may detach until both have finished reading. Otherwise a
+    // fast survivor can release the lock and the slower thread attaches too.
+    let start = Arc::new(Barrier::new(3));
+    let both_connected = Arc::new(Barrier::new(2));
     let mut handles = Vec::new();
     for _ in 0..2 {
         let sock = sock.clone();
-        let barrier = Arc::clone(&barrier);
+        let start = Arc::clone(&start);
+        let both_connected = Arc::clone(&both_connected);
         handles.push(thread::spawn(move || {
-            barrier.wait();
+            start.wait();
             let mut stream = UnixStream::connect(&sock).expect("connect");
+            both_connected.wait();
             attach_winsize(&mut stream, 24, 80);
             stream
                 .set_read_timeout(Some(Duration::from_millis(800)))
@@ -107,23 +113,26 @@ fn concurrent_connects_only_one_survives() {
                     None => break,
                 }
             }
-            if alive {
-                write_msg(&mut stream, 3, &[]);
-            }
-            alive
+            (alive, stream)
         }));
     }
-    barrier.wait();
+    start.wait();
 
-    let results: Vec<bool> = handles
+    let results: Vec<(bool, UnixStream)> = handles
         .into_iter()
         .map(|h| h.join().expect("thread"))
         .collect();
-    let survivors = results.iter().filter(|&&a| a).count();
+    let survivors = results.iter().filter(|(a, _)| *a).count();
     assert_eq!(
         survivors, 1,
-        "exactly one concurrent attach should survive, got {results:?}"
+        "exactly one concurrent attach should survive, got {:?}",
+        results.iter().map(|(a, _)| *a).collect::<Vec<_>>()
     );
+    for (alive, mut stream) in results {
+        if alive {
+            write_msg(&mut stream, 3, &[]);
+        }
+    }
 
     kill_session(base, "race");
 }

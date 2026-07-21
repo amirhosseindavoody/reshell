@@ -89,7 +89,9 @@ machine-readable output.
 ### 9. `reshell info <name>` — done
 
 **Now:** Prints pid, shell, state, created / last-active, and all session paths.
-Optional `--json`. Name omitted → most recently active session.
+Optional `--json`. Name omitted → current session when inside one (ancestor pid /
+`$RESHELL_SESSION`), else most recently active session. Session shells export
+`RESHELL_SESSION=<name>`.
 
 ### 10. `reshell rename` and cleaner stale cleanup — done
 

@@ -312,6 +312,8 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
             if std::env::var_os("TERM").is_none() {
                 std::env::set_var("TERM", "xterm-256color");
             }
+            // So bare `reshell info` (and scripts) can identify this session.
+            std::env::set_var("RESHELL_SESSION", &opts.name);
 
             // When started from VS Code/Cursor, inject shell integration so the
             // session shell emits OSC 633 command markers (sticky scroll, etc.).
