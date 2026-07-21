@@ -143,7 +143,64 @@ fn completion_prints_shell_script() {
             txt.contains("reshell"),
             "completion {shell} missing binary name: {txt}"
         );
+        assert!(
+            txt.contains("COMPLETE="),
+            "completion {shell} should use dynamic COMPLETE= registration: {txt}"
+        );
     }
+}
+
+#[test]
+fn attach_completion_lists_session_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "alpha");
+    new_detached(base, "beta");
+
+    let bin = reshell_bin();
+    // Words after `--`: reshell --dir <base> attach <name>  → name is index 4
+    let out = Command::new(&bin)
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "4")
+        .args([
+            "--",
+            "reshell",
+            "--dir",
+            base.to_str().unwrap(),
+            "attach",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "dynamic complete failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let txt = String::from_utf8_lossy(&out.stdout);
+    assert!(txt.contains("alpha"), "missing alpha in: {txt:?}");
+    assert!(txt.contains("beta"), "missing beta in: {txt:?}");
+
+    let filtered = Command::new(&bin)
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "4")
+        .args([
+            "--",
+            "reshell",
+            "--dir",
+            base.to_str().unwrap(),
+            "attach",
+            "al",
+        ])
+        .output()
+        .unwrap();
+    assert!(filtered.status.success());
+    let txt = String::from_utf8_lossy(&filtered.stdout);
+    assert!(txt.contains("alpha"), "prefix filter missed alpha: {txt:?}");
+    assert!(!txt.contains("beta"), "prefix filter should hide beta: {txt:?}");
+
+    kill_session(base, "alpha");
+    kill_session(base, "beta");
 }
 
 #[test]

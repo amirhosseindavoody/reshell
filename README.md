@@ -101,6 +101,8 @@ reshell completion fish | source
 
 To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
 
+Completions call back into `reshell` at tab time, so `attach` / `info` / `kill` / `rename` suggest live session names (honoring `--dir` / `RESHELL_DIR`).
+
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.

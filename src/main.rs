@@ -5,11 +5,13 @@ mod session;
 mod termstate;
 mod vscode_si;
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
+use clap_complete::{CompleteEnv, Shell};
 use serde::Serialize;
 
 use protocol::parse_detach_key;
@@ -56,6 +58,7 @@ enum Commands {
     /// With no sessions, creates a new one (same as `new`).
     Attach {
         /// Session name (defaults to the most recently active session)
+        #[arg(add = ArgValueCompleter::new(complete_session_name))]
         name: Option<String>,
     },
     /// List running sessions
@@ -67,6 +70,7 @@ enum Commands {
     /// Show details for a session
     Info {
         /// Session name (defaults to the most recently active session)
+        #[arg(add = ArgValueCompleter::new(complete_session_name))]
         name: Option<String>,
         /// Machine-readable JSON
         #[arg(long)]
@@ -75,6 +79,7 @@ enum Commands {
     /// Rename a live session
     Rename {
         /// Current session name
+        #[arg(add = ArgValueCompleter::new(complete_session_name))]
         old_name: String,
         /// New session name
         new_name: String,
@@ -84,6 +89,7 @@ enum Commands {
     /// Terminate a session and its shell
     Kill {
         /// Session name
+        #[arg(add = ArgValueCompleter::new(complete_session_name))]
         name: String,
     },
     /// Print shell completion script to stdout
@@ -94,6 +100,11 @@ enum Commands {
 }
 
 fn main() {
+    // Dynamic completions (session names, etc.) — must run before any stdout.
+    CompleteEnv::with_factory(Cli::command)
+        .bin("reshell")
+        .complete();
+
     if let Err(e) = run() {
         eprintln!("reshell: {e:#}");
         std::process::exit(1);
@@ -103,11 +114,9 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Generate completions without resolving session dirs or validating detach-key.
+    // Registration script that calls back into this binary for dynamic values.
     if let Some(Commands::Completion { shell }) = cli.command {
-        let mut cmd = Cli::command();
-        generate(shell, &mut cmd, "reshell", &mut std::io::stdout());
-        return Ok(());
+        return print_completion_registration(shell);
     }
 
     let base = match cli.dir {
@@ -150,6 +159,77 @@ fn run() -> Result<()> {
         }
         Commands::Completion { .. } => unreachable!("handled above"),
     }
+}
+
+/// Print the dynamic completion registration script for `shell`.
+fn print_completion_registration(shell: Shell) -> Result<()> {
+    let argv0 = std::env::args_os()
+        .next()
+        .unwrap_or_else(|| "reshell".into());
+    // SAFETY: only set during CLI init before other threads; CompleteEnv clears it.
+    unsafe {
+        std::env::set_var("COMPLETE", shell.to_string());
+    }
+    let current_dir = std::env::current_dir().ok();
+    let done = CompleteEnv::with_factory(Cli::command)
+        .bin("reshell")
+        .try_complete([argv0], current_dir.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !done {
+        anyhow::bail!("failed to generate {shell} completion script");
+    }
+    Ok(())
+}
+
+/// Tab-complete live session names for `attach` / `info` / `kill` / `rename`.
+fn complete_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    let base = completion_base_dir();
+    let Ok(sessions) = session::list_sessions(&base) else {
+        return Vec::new();
+    };
+    sessions
+        .into_iter()
+        .filter(|(meta, _)| meta.name.starts_with(current))
+        .map(|(meta, _)| CompletionCandidate::new(meta.name))
+        .collect()
+}
+
+fn completion_base_dir() -> PathBuf {
+    if let Some(dir) = dir_from_completion_args() {
+        return dir;
+    }
+    if let Ok(dir) = std::env::var("RESHELL_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    session_base_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+/// Parse `--dir` from the shell words passed to the dynamic completer.
+fn dir_from_completion_args() -> Option<PathBuf> {
+    let args: Vec<_> = std::env::args_os().collect();
+    let start = args
+        .iter()
+        .position(|a| a == "--")
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let words = &args[start..];
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].to_string_lossy();
+        if w == "--dir" {
+            return words.get(i + 1).map(PathBuf::from);
+        }
+        if let Some(rest) = w.strip_prefix("--dir=") {
+            return Some(PathBuf::from(rest));
+        }
+        i += 1;
+    }
+    None
 }
 
 fn cmd_new(
