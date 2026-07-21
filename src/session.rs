@@ -487,6 +487,76 @@ pub fn most_recent_session(base: &Path) -> Result<SessionMeta> {
     Ok(sessions.remove(0).0)
 }
 
+/// Environment variable set in the session shell so nested tools can detect it.
+pub const RESHELL_SESSION_ENV: &str = "RESHELL_SESSION";
+
+/// Live session this process is running inside, if any.
+///
+/// Prefers a daemon pid found among process ancestors (survives `rename`, which
+/// leaves a stale `RESHELL_SESSION` value). Falls back to `$RESHELL_SESSION`
+/// when that names a live session.
+pub fn current_session(base: &Path) -> Result<Option<SessionMeta>> {
+    let _ = cleanup_stale_sessions(base)?;
+    let sessions = list_sessions(base)?;
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+
+    let ancestors = process_ancestor_pids();
+    if !ancestors.is_empty() {
+        for (meta, paths) in &sessions {
+            if ancestors.contains(&meta.pid) {
+                let mut meta = meta.clone();
+                meta.attached = is_attached(paths);
+                return Ok(Some(meta));
+            }
+        }
+    }
+
+    if let Ok(name) = std::env::var(RESHELL_SESSION_ENV) {
+        if validate_session_name(&name).is_ok() {
+            if let Some((meta, paths)) = sessions.into_iter().find(|(m, _)| m.name == name) {
+                let mut meta = meta;
+                meta.attached = is_attached(&paths);
+                return Ok(Some(meta));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Parent pid chain for this process (`/proc/.../stat`), excluding pid 0/1.
+fn process_ancestor_pids() -> Vec<i32> {
+    let mut out = Vec::new();
+    let mut pid = std::process::id() as i32;
+    for _ in 0..64 {
+        let Some(ppid) = read_ppid(pid) else {
+            break;
+        };
+        if ppid <= 1 {
+            break;
+        }
+        if out.contains(&ppid) {
+            break;
+        }
+        out.push(ppid);
+        pid = ppid;
+    }
+    out
+}
+
+/// Parse `ppid` from Linux `/proc/<pid>/stat`.
+fn read_ppid(pid: i32) -> Option<i32> {
+    let data = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Format: `pid (comm) state ppid ...` — `comm` may contain spaces/parens.
+    let rparen = data.rfind(')')?;
+    let rest = data.get(rparen + 2..)?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse().ok()
+}
+
 pub fn cleanup_session_files(paths: &SessionPaths) -> Result<()> {
     let _ = fs::remove_file(&paths.socket);
     let _ = fs::remove_file(&paths.meta);
@@ -585,6 +655,68 @@ mod tests {
         assert_eq!(loaded.name, "demo");
         assert_eq!(loaded.pid, 1);
         assert_eq!(loaded.last_active_unix, 0);
+    }
+
+    #[test]
+    fn current_session_from_env() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+        let self_pid = std::process::id() as i32;
+        for (name, last) in [("other", 200u64), ("mine", 100u64)] {
+            write_meta(
+                &SessionPaths::for_name(base, name),
+                &SessionMeta {
+                    name: name.into(),
+                    pid: self_pid,
+                    shell: "/bin/bash".into(),
+                    created_unix: 1,
+                    attached: false,
+                    last_active_unix: last,
+                },
+            )
+            .unwrap();
+        }
+        // SAFETY: test-only; no other threads rely on this env key here.
+        unsafe {
+            std::env::set_var(RESHELL_SESSION_ENV, "mine");
+        }
+        let cur = current_session(base).unwrap().expect("current");
+        unsafe {
+            std::env::remove_var(RESHELL_SESSION_ENV);
+        }
+        assert_eq!(cur.name, "mine");
+    }
+
+    #[test]
+    fn current_session_from_ancestor_pid() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+        let self_pid = std::process::id() as i32;
+        let parent = read_ppid(self_pid).expect("ppid");
+        assert!(parent > 1);
+        write_meta(
+            &SessionPaths::for_name(base, "nested"),
+            &SessionMeta {
+                name: "nested".into(),
+                pid: parent,
+                shell: "/bin/bash".into(),
+                created_unix: 1,
+                attached: false,
+                last_active_unix: 1,
+            },
+        )
+        .unwrap();
+        // Stale env must not win over an ancestor match (rename case).
+        unsafe {
+            std::env::set_var(RESHELL_SESSION_ENV, "gone");
+        }
+        let cur = current_session(base).unwrap().expect("current");
+        unsafe {
+            std::env::remove_var(RESHELL_SESSION_ENV);
+        }
+        assert_eq!(cur.name, "nested");
     }
 
     #[test]

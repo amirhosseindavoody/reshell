@@ -78,6 +78,7 @@ reshell list --json
 
 # Session details (paths, pid, state, …)
 reshell info demo
+# or: reshell info     # current session when inside one; else most recent
 
 # Rename a live session
 reshell rename demo demo2
@@ -107,6 +108,10 @@ To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, 
 Completions call back into `reshell` at tab time, so `attach` / `info` / `kill` / `rename` suggest live session names (honoring `--dir` / `RESHELL_DIR`).
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
+
+Inside a session shell, `RESHELL_SESSION` is set to the session name. Bare
+`reshell info` uses the current session (even after `rename`); outside a session
+it falls back to the most recently active one.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 

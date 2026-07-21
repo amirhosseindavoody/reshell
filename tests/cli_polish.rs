@@ -65,6 +65,107 @@ fn info_shows_paths() {
 }
 
 #[test]
+fn session_sets_reshell_session_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "envcheck");
+
+    let sock = wait_sock(base, "envcheck");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    attach_winsize(&mut stream, 24, 80);
+    write_msg(
+        &mut stream,
+        1,
+        b"printf 'ENV=%s\\n' \"$RESHELL_SESSION\"\n",
+    );
+    let data = collect_data(&mut stream, Instant::now() + Duration::from_secs(2));
+    write_msg(&mut stream, 3, &[]);
+    let text = String::from_utf8_lossy(&data);
+    assert!(
+        text.contains("ENV=envcheck"),
+        "expected RESHELL_SESSION in shell env, got: {text:?}"
+    );
+
+    kill_session(base, "envcheck");
+}
+
+#[test]
+fn info_without_name_prefers_current_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "other");
+    new_detached(base, "current");
+
+    // Make `other` the most recently active session.
+    let sock = wait_sock(base, "other");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    attach_winsize(&mut stream, 24, 80);
+    write_msg(&mut stream, 3, &[]);
+    drop(stream);
+
+    let out = Command::new(reshell_bin())
+        .env("RESHELL_SESSION", "current")
+        .args(["--dir", base.to_str().unwrap(), "info"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let txt = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        txt.contains("name:        current"),
+        "expected current session from RESHELL_SESSION, got: {txt}"
+    );
+
+    kill_session(base, "other");
+    kill_session(base, "current");
+}
+
+#[test]
+fn info_inside_session_survives_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "before");
+
+    let sock = wait_sock(base, "before");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    attach_winsize(&mut stream, 24, 80);
+
+    let renamed = Command::new(reshell_bin())
+        .args([
+            "--dir",
+            base.to_str().unwrap(),
+            "rename",
+            "before",
+            "after",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+
+    // Shell still has RESHELL_SESSION=before; bare `info` should resolve via
+    // ancestor pid to the renamed session.
+    let bin = reshell_bin();
+    let cmd = format!(
+        "\"{}\" --dir \"{}\" info\n",
+        bin.display(),
+        base.display()
+    );
+    write_msg(&mut stream, 1, cmd.as_bytes());
+    let data = collect_data(&mut stream, Instant::now() + Duration::from_secs(3));
+    write_msg(&mut stream, 3, &[]);
+    let text = String::from_utf8_lossy(&data);
+    assert!(
+        text.contains("name:        after"),
+        "expected info of renamed session inside shell, got: {text:?}"
+    );
+
+    kill_session(base, "after");
+}
+
+#[test]
 fn rename_live_session_keeps_shell() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();

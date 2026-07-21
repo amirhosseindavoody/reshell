@@ -88,6 +88,8 @@ when nobody holds the advisory flock (e.g. after a crashed daemon), and removes
 orphan session dirs that lack `meta.json`.
 `list` shows relative times by default (`2h ago`); `list --json` is stable for scripts.
 `info` prints pid, shell, state, timestamps, and all session paths (`info --json` too).
+With no name, `info` prefers the session this process is inside (daemon pid among
+process ancestors, else `$RESHELL_SESSION`), then the most recently active session.
 `rename old new` renames a live session directory and updates `meta.name`. The
 daemon keeps a directory fd open so meta/lock/log writes survive the move; the
 Unix socket path moves with the directory.
@@ -112,7 +114,8 @@ the next attach after DEC restore + clear.
 4. `pipe` + `fork`:
    - **Parent:** close write end; block until child writes one readiness byte (or timeout / EOF).
    - **Child:** `setsid`, ignore `SIGHUP`/`SIGINT`/`SIGPIPE`, reopen stdio to `/dev/null`, run the daemon.
-5. Daemon `openpty`, forks the shell on the slave (`TIOCSCTTY`, dup2 0/1/2, `exec` shell).
+5. Daemon `openpty`, forks the shell on the slave (`TIOCSCTTY`, dup2 0/1/2,
+   sets `RESHELL_SESSION=<name>`, `exec` shell).
 6. Daemon binds `session.sock`, writes `meta.json` (pid = daemon), signals readiness.
 7. Parent prints the session name to stderr and **attaches** (default). Pass `--detach` / `-d`
    to create only and print the name on stdout (for scripts / CI).

@@ -76,7 +76,8 @@ enum Commands {
     },
     /// Show details for a session
     Info {
-        /// Session name (defaults to the most recently active session)
+        /// Session name (defaults to the current session when inside one,
+        /// otherwise the most recently active session)
         #[arg(add = ArgValueCompleter::new(complete_session_name))]
         name: Option<String>,
         /// Machine-readable JSON
@@ -330,7 +331,10 @@ fn cmd_list(base: &Path, json: bool) -> Result<()> {
 fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
     let name = match name {
         Some(n) => n,
-        None => session::most_recent_session(base)?.name,
+        None => match session::current_session(base)? {
+            Some(meta) => meta.name,
+            None => session::most_recent_session(base)?.name,
+        },
     };
     let (meta, paths) = session::session_info(base, &name)?;
     if json {
