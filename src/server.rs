@@ -17,6 +17,7 @@ use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
 use nix::unistd::{read as nix_read, write as nix_write};
 
 use crate::protocol::{self, Message, Winsize};
+use crate::scrollback::Scrollback;
 use crate::session::{
     self, append_daemon_log, cleanup_session_files, now_unix, open_session_dir_fd,
     paths_from_dir_fd, write_meta, AttachLock, SessionMeta, SessionPaths,
@@ -30,6 +31,9 @@ const OUTBOUND_HIGH_WATER: usize = 256 * 1024;
 
 /// Stop reading client input while PTY writes are backed up this far.
 const PTY_OUTBOUND_HIGH_WATER: usize = 256 * 1024;
+
+/// Chunk size when replaying scrollback as `Data` frames on attach.
+const SCROLLBACK_REPLAY_CHUNK: usize = 64 * 1024;
 
 /// After attach, keep the temporary (bumped) winsize at least this long so
 /// differential TUIs (ratatui/crossterm) can emit a full cell dump at the new
@@ -46,6 +50,8 @@ pub struct NewSessionOpts {
     pub base: PathBuf,
     /// Optional log path override (`--log` / `RESHELL_LOG`). Default: `$session/daemon.log`.
     pub log_path: Option<PathBuf>,
+    /// Bytes of detached PTY output to keep and replay on attach (`0` = off).
+    pub scrollback: usize,
 }
 
 struct ClientConn {
@@ -270,11 +276,16 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
 
             append_daemon_log(
                 &paths,
-                &format!("ready pid={} socket={}", meta.pid, paths.socket.display()),
+                &format!(
+                    "ready pid={} socket={} scrollback={}",
+                    meta.pid,
+                    paths.socket.display(),
+                    opts.scrollback
+                ),
             );
 
             let dir_fd = open_session_dir_fd(&paths)?;
-            server_loop(master, listener, shell_pid, dir_fd)?;
+            server_loop(master, listener, shell_pid, dir_fd, opts.scrollback)?;
             Ok(())
         }
         ForkResult::Child => {
@@ -383,11 +394,13 @@ fn server_loop(
     listener: UnixListener,
     shell_pid: Pid,
     dir_fd: OwnedFd,
+    scrollback_cap: usize,
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
     let mut attach_lock: Option<AttachLock> = None;
     let mut term = TermState::new();
+    let mut scrollback = Scrollback::new(scrollback_cap);
     let mut pending_redraw: Option<PendingAttachRedraw> = None;
     let mut pty_outbound: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
@@ -419,7 +432,7 @@ fn server_loop(
 
         let want_pty_read = match &client {
             Some(c) => c.outbound.len() < OUTBOUND_HIGH_WATER,
-            None => true, // drain + discard while detached
+            None => true, // drain while detached (into scrollback when enabled)
         };
         let want_pty_write = !pty_outbound.is_empty();
 
@@ -514,8 +527,9 @@ fn server_loop(
                     // Always parse modes — including while detached — so reattach
                     // can restore mouse / alt-screen on the new client TTY.
                     term.feed(&buf[..n]);
-                    if let Some(ref mut c) = client {
-                        if c.ready {
+                    let forward = matches!(&client, Some(c) if c.ready);
+                    if forward {
+                        if let Some(ref mut c) = client {
                             if let Some(ref mut pending) = pending_redraw {
                                 pending.saw_output = true;
                             }
@@ -524,9 +538,10 @@ fn server_loop(
                                 drop_client(&mut client, &mut attach_lock, &dir_fd);
                             }
                         }
-                        // else: wait for Attach (mode restore) before forwarding
+                    } else {
+                        // No ready client: keep bytes for optional attach replay.
+                        scrollback.push(&buf[..n]);
                     }
-                    // else discarded (still drained; modes above still updated)
                 }
                 Err(Errno::EAGAIN) => {}
                 Err(Errno::EIO) => break,
@@ -559,6 +574,7 @@ fn server_loop(
                             c,
                             master_fd,
                             &term,
+                            &mut scrollback,
                             &mut pending_redraw,
                             &mut pty_outbound,
                         ) {
@@ -628,6 +644,7 @@ fn handle_client_messages(
     client: &mut ClientConn,
     master_fd: RawFd,
     term: &TermState,
+    scrollback: &mut Scrollback,
     pending_redraw: &mut Option<PendingAttachRedraw>,
     pty_outbound: &mut Vec<u8>,
 ) -> Result<bool> {
@@ -642,6 +659,14 @@ fn handle_client_messages(
                 // paint isn't merged onto stale local cells.
                 restore.extend_from_slice(b"\x1b[H\x1b[2J");
                 client.enqueue(&Message::Data(restore))?;
+
+                // Replay bytes captured while detached (plain-shell history).
+                let history = scrollback.take();
+                if !history.is_empty() {
+                    for chunk in history.chunks(SCROLLBACK_REPLAY_CHUNK) {
+                        client.enqueue(&Message::Data(chunk.to_vec()))?;
+                    }
+                }
 
                 // Phase 1: temporary geometry so ratatui invalidates its
                 // previous buffer and emits a full cell dump to this client.

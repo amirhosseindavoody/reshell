@@ -204,6 +204,40 @@ fn attach_completion_lists_session_names() {
 }
 
 #[test]
+fn scrollback_flag_is_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    let bad = Command::new(reshell_bin())
+        .args([
+            "--dir",
+            base.to_str().unwrap(),
+            "--scrollback",
+            "not-a-size",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("scrollback"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    let ok = Command::new(reshell_bin())
+        .args([
+            "--dir",
+            base.to_str().unwrap(),
+            "--scrollback",
+            "1M",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(ok.status.success());
+}
+
+#[test]
 fn detach_key_flag_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();

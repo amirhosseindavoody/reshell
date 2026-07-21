@@ -1,5 +1,6 @@
 mod client;
 mod protocol;
+mod scrollback;
 mod server;
 mod session;
 mod termstate;
@@ -15,6 +16,7 @@ use clap_complete::{CompleteEnv, Shell};
 use serde::Serialize;
 
 use protocol::parse_detach_key;
+use scrollback::parse_scrollback_size;
 use session::{allocate_session_name, now_unix, session_base_dir};
 
 #[derive(Debug, Parser)]
@@ -36,6 +38,11 @@ struct Cli {
     /// Detach key (default: Ctrl+\ ). Examples: ^\, ^a, 0x1c. Also `RESHELL_DETACH_KEY`.
     #[arg(long, global = true, env = "RESHELL_DETACH_KEY", default_value = "^\\")]
     detach_key: String,
+
+    /// Detached PTY bytes to keep and replay on attach (0=off). Examples: 1M, 512K.
+    /// Applied when creating a session (`new` / bare attach with no sessions). Also `RESHELL_SCROLLBACK`.
+    #[arg(long, global = true, env = "RESHELL_SCROLLBACK", default_value = "0")]
+    scrollback: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -125,6 +132,7 @@ fn run() -> Result<()> {
     };
     let log = cli.log;
     let detach_key = parse_detach_key(&cli.detach_key)?;
+    let scrollback = parse_scrollback_size(&cli.scrollback)?;
 
     // Bare `reshell` is an alias for `reshell attach`.
     let command = cli.command.unwrap_or(Commands::Attach { name: None });
@@ -134,8 +142,8 @@ fn run() -> Result<()> {
             name,
             shell,
             detach,
-        } => cmd_new(&base, name, shell, detach, log, detach_key),
-        Commands::Attach { name } => cmd_attach(&base, name, log, detach_key),
+        } => cmd_new(&base, name, shell, detach, log, detach_key, scrollback),
+        Commands::Attach { name } => cmd_attach(&base, name, log, detach_key, scrollback),
         Commands::List { json } => cmd_list(&base, json),
         Commands::Info { name, json } => cmd_info(&base, name, json),
         Commands::Rename { old_name, new_name } => {
@@ -239,6 +247,7 @@ fn cmd_new(
     detach: bool,
     log: Option<PathBuf>,
     detach_key: u8,
+    scrollback: usize,
 ) -> Result<()> {
     let _ = session::cleanup_stale_sessions(base)?;
     let name = match name {
@@ -251,6 +260,7 @@ fn cmd_new(
         shell,
         base: base.to_path_buf(),
         log_path: log,
+        scrollback,
     })?;
     if detach {
         println!("{name}");
@@ -267,6 +277,7 @@ fn cmd_attach(
     name: Option<String>,
     log: Option<PathBuf>,
     detach_key: u8,
+    scrollback: usize,
 ) -> Result<()> {
     match name {
         Some(n) => client::attach(base, &n, detach_key),
@@ -274,7 +285,7 @@ fn cmd_attach(
             let sessions = session::list_sessions(base)?;
             if sessions.is_empty() {
                 // No live sessions — same as `reshell new`.
-                return cmd_new(base, None, None, false, log, detach_key);
+                return cmd_new(base, None, None, false, log, detach_key, scrollback);
             }
             let meta = session::most_recent_session(base)?;
             eprintln!("attaching to {}", meta.name);

@@ -64,6 +64,9 @@ reshell new demo
 # Create without attaching (prints the name)
 reshell new demo --detach
 
+# Keep ~1 MiB of output while detached and replay it on attach
+reshell --scrollback 1M new demo --detach
+
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
 # or: reshell attach       # most recently active (or new if none)
@@ -108,6 +111,12 @@ Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 
 Detach key defaults to **Ctrl+\**. Override with `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or a single ASCII char).
+
+Optional detached scrollback (set when creating a session): `--scrollback` /
+`RESHELL_SCROLLBACK` keeps a bounded ring of PTY output while detached and
+replays it on the next attach (default `0` = off; examples: `1M`, `512K`; max
+`16M`). This is raw byte history for shells — not a multiplexer scrollback UI;
+full-screen apps still redraw on attach.
 
 ## Why reshell?
 
@@ -188,3 +197,7 @@ Always use `pixi run` / `pixi run -- cargo …` so the conda Rust toolchain is u
 ## Design docs
 
 Internal architecture notes: [docs/internal/](docs/internal/).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

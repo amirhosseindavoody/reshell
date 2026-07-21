@@ -18,7 +18,8 @@ prefix key chord that steals shortcuts from nested TUIs.
 ## Non-goals (v1)
 
 - Window splitting, tabs, or status bars
-- Scrollback capture / session logging (no frame buffer; apps must redraw on attach)
+- VT screen-buffer emulation / multiplexer-style scrollback UI (optional
+  byte-ring replay of detached output is supported; apps still redraw on attach)
 - Multi-client shared attach (second attach is rejected)
 - macOS / Windows
 - Automatic `reshell ssh …` wrapper
@@ -49,11 +50,12 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `rename` / `clean` / `kill` / `completion`; dynamic session-name completion; detach-key + log flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `rename` / `clean` / `kill` / `completion`; dynamic session-name completion; detach-key + log + scrollback flags; default shell `/bin/zsh` |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent session |
-| [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O |
+| [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
 | [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)) |
+| [`src/scrollback.rs`](../../src/scrollback.rs) | Bounded ring of detached PTY bytes; size parsing (`1M`, `512K`) |
 | [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode tracking for restore-on-attach |
 | [`src/vscode_si.rs`](../../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject |
 
@@ -97,6 +99,10 @@ there; otherwise they go to `daemon.log`).
 
 Detach key defaults to Ctrl+\ (`^\`). Override with `--detach-key` / `RESHELL_DETACH_KEY`
 (`^a`, `0x1c`, or a single ASCII character).
+
+Optional detached scrollback: `--scrollback` / `RESHELL_SCROLLBACK` (default `0` =
+off; examples `512K`, `1M`; max 16M). Applied when creating a session; replayed on
+the next attach after DEC restore + clear.
 
 ## Session creation (`new`)
 
@@ -163,14 +169,19 @@ DCS-wrap OSC sequences).
 
 ### Reattach and full-screen apps
 
-reshell does not keep a scrollback or screen buffer. Instead the daemon:
+reshell does not keep a VT screen buffer. Optional `--scrollback` /
+`RESHELL_SCROLLBACK` (set at session create) keeps a bounded in-memory ring of
+raw PTY bytes while detached and replays them on the next attach — useful for
+plain-shell history, not a substitute for TUI redraw. The daemon always:
 
 1. Parses PTY output for DEC private modes (alt-screen, mouse tracking, bracketed
    paste, focus events, cursor visibility, …), including while detached.
 2. On `Attach`, sends those modes back to the new client as the first `Data`
    payload (so the local TTY enables mouse again, enters alt-screen, etc.), then
    clears the local screen.
-3. Forces a full child redraw that differential TUIs (notably ratatui/crossterm
+3. If scrollback is enabled and non-empty, replays captured detached bytes as
+   further `Data` frames (then clears the ring).
+4. Forces a full child redraw that differential TUIs (notably ratatui/crossterm
    apps such as [fresh](https://github.com/sinelaw/fresh)) will actually emit:
    - Apply a temporary winsize (rows±1) so the app invalidates its previous cell
      buffer and dumps a full frame to the newly attached client.
@@ -182,7 +193,7 @@ crossterm only writes cells that differ from its previous buffer, so a blank
 reattach TTY stays blank until the user moves the mouse over dirty regions.
 
 PTY bytes are not forwarded to a client until `Attach` has been processed, so
-mode restore runs before any redraw data.
+mode restore (and optional scrollback replay) runs before live redraw data.
 
 ### Detach vs kill
 
@@ -219,9 +230,10 @@ mid-frame, corrupt the stream, and freeze the attach client.
 When the outbound (client) buffer exceeds a high-water mark, the daemon stops
 reading the PTY until it drains (backpressure). When the PTY write buffer is
 backed up, the daemon pauses reading the client socket. When no client is
-attached, PTY output is still read and discarded (no scrollback in v1), but DEC
-modes are still updated. When the shell exits (`waitpid`), the daemon cleans up
-and exits.
+attached (or the client has not yet sent `Attach`), PTY output is still read:
+DEC modes are updated, and bytes are pushed into the optional scrollback ring
+when `--scrollback` / `RESHELL_SCROLLBACK` is non-zero (otherwise discarded).
+When the shell exits (`waitpid`), the daemon cleans up and exits.
 
 ## Packaging and toolchain
 

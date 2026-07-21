@@ -102,14 +102,16 @@ sessions, orphan dirs without meta, and stale attach locks.
 
 ## Bigger features (still not a multiplexer)
 
-### 11. Optional scrollback / session log
+### 11. Optional scrollback / session log — done
 
-**Today:** Explicit v1 non-goal — PTY output is discarded while detached; DEC
-modes are still tracked so reattach can restore and force redraw.
+**Was:** Explicit v1 non-goal — PTY output discarded while detached; DEC modes
+tracked so reattach can restore and force redraw.
 
-**Proposal:** Optional ring buffer or append-only log while detached; either
-replay a limited history on attach or dump to a file. Largest practical gap vs
-tmux without adding panes or a status UI.
+**Now:** `--scrollback` / `RESHELL_SCROLLBACK` (set at session create; default
+`0` = off) keeps a bounded in-memory ring of detached PTY bytes (max 16M;
+suffixes `K`/`M`). On attach, history is replayed as `Data` after DEC mode
+restore + clear, then the usual two-phase winsize. Not a VT screen buffer —
+TUIs still redraw. Append-only file logging remains a possible later add-on.
 
 ### 12. Broader VS Code / Cursor shell integration
 
@@ -134,7 +136,7 @@ so local session semantics stay clear.
 | Priority | Items                        | Why                                                   |
 | -------- | ---------------------------- | ----------------------------------------------------- |
 | First    | §§1–6 (hardening, CI, tests) | Correctness and maintainability without product drift |
-| Next     | §§7–10 done; §§11+ next  | Low surface area; matches dtach/abduco ergonomics     |
+| Next     | §§7–11 done; §§12+ next  | Low surface area; matches dtach/abduco ergonomics     |
 | Later    | §§12–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
 
 When implementing any item, update user-facing README and/or `design.md` /
