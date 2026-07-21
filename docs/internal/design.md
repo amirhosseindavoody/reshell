@@ -70,13 +70,22 @@ Per session name `$name`:
 $base/$name/
   meta.json       # name, daemon pid, shell path, created_unix, last_active_unix, attached
   session.sock    # Unix domain socket (mode 0600)
-  attached        # lock file present while a client is connected
+  attached        # flock-backed lock file held while a client is connected
+  daemon.log      # per-session daemon log (startup, attach/detach, errors)
 ```
 
 Session names are limited to `[A-Za-z0-9._-]`, max 64 characters.
+Auto-generated names look like `session-{unix_secs}-{4 hex digits}` so concurrent
+`new` calls in the same second do not collide.
 
 `list` skips directories whose daemon pid is dead and removes stale files.
+It also recovers a leftover `attached` file when nobody holds the advisory flock
+(e.g. after a crashed daemon).
 `kill` sends `SIGTERM` (then `SIGKILL`) to the daemon pid and deletes the session dir.
+Attach/kill failures include concrete reasons (dead pid, lock held, socket missing, …).
+
+Override the daemon log path with `--log` / `RESHELL_LOG` (fatal errors are written
+there; otherwise they go to `daemon.log`).
 
 ## Session creation (`new`)
 
@@ -105,7 +114,8 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
    (no subcommand) is an alias for `reshell attach`. If there are no live sessions,
    bare attach creates a new one (same as `reshell new`). When resolving an
    existing session, prints `attaching to <name>` on stderr before connecting.
-3. Refuse if meta missing, daemon dead, or `attached` lock already present.
+3. Refuse if meta missing, daemon dead, or an attach flock is already held
+   (a leftover `attached` file without a live flock is treated as stale and cleared).
 4. Connect to `session.sock`.
 5. Put local TTY in raw mode; restore on exit (`TermiosGuard`).
 6. Send `Attach` with current winsize; enter poll loop:
@@ -173,27 +183,34 @@ mode restore runs before any redraw data.
 | Shell exits | eventually EOF on socket | cleans up session files, exits | — |
 | `reshell kill` | n/a | terminated | terminated with PTY teardown |
 
-Only one client may be attached. A second connection is accepted then immediately
-closed by the daemon.
+Only one client may be attached. Exclusivity is enforced by an advisory `flock`
+on the `attached` file held by the daemon for the life of the connection: a second
+socket is accepted then immediately closed, and `reshell attach` refuses early
+when the flock is held. A leftover `attached` file with no flock holder is treated
+as stale and cleared.
 
 ## Daemon I/O loop
 
 The daemon `poll`s:
 
-- PTY master (readable → enqueue framed `Data` for the attached client, if any)
-- Listen socket (accept; at most one live client)
+- PTY master `POLLIN` (readable → enqueue framed `Data` for the attached client, if any)
+- PTY master `POLLOUT` when client→PTY bytes are pending (partial writes resume here;
+  no busy-wait on `EAGAIN`)
+- Listen socket (accept; at most one live client, with attach flock)
 - Client socket `POLLIN` / `POLLOUT` (decode frames into an inbound buffer; flush an outbound buffer)
 
-Client sockets are **non-blocking**. Complete frames are encoded into an outbound
-byte buffer and written with partial-write retry on `POLLOUT`. This matters for
-TUI apps (ratatui/crossterm): a full-screen redraw can exceed the Unix socket
-buffer; naive `write_all` on a non-blocking socket used to fail mid-frame,
-corrupt the stream, and freeze the attach client.
+Client sockets and the PTY master are **non-blocking**. Complete frames are encoded
+into an outbound byte buffer and written with partial-write retry on `POLLOUT`.
+This matters for TUI apps (ratatui/crossterm): a full-screen redraw can exceed the
+Unix socket buffer; naive `write_all` on a non-blocking socket used to fail
+mid-frame, corrupt the stream, and freeze the attach client.
 
-When the outbound buffer exceeds a high-water mark, the daemon stops reading the
-PTY until it drains (backpressure). When no client is attached, PTY output is
-still read and discarded (no scrollback in v1), but DEC modes are still updated.
-When the shell exits (`waitpid`), the daemon cleans up and exits.
+When the outbound (client) buffer exceeds a high-water mark, the daemon stops
+reading the PTY until it drains (backpressure). When the PTY write buffer is
+backed up, the daemon pauses reading the client socket. When no client is
+attached, PTY output is still read and discarded (no scrollback in v1), but DEC
+modes are still updated. When the shell exits (`waitpid`), the daemon cleans up
+and exits.
 
 ## Packaging and toolchain
 
@@ -212,12 +229,19 @@ conda Rust toolchain is used, not an older system rustup.
 ## Testing strategy
 
 - Unit tests: protocol roundtrip, session name validation, meta read/write,
-  DEC mode parse/restore (`termstate`).
+  DEC mode parse/restore (`termstate`), attach flock exclusivity / stale recovery,
+  kill SIGTERM→SIGKILL escalation.
 - Integration (`tests/session_smoke.rs`): `new` → speak protocol over the socket →
   detach → reconnect → confirm the same shell is still alive → `kill`.
 - Integration (`tests/attach_restore.rs`): child enables mouse/alt-screen → detach →
   reattach observes restored CSI modes; SIGWINCH reporter confirms temporary then
   final winsize (two-phase full paint for differential TUIs).
+- Integration (`tests/attach_race.rs`): concurrent attach (one survivor), stale
+  `attached` recovery, kill missing-session errors, auto-name uniqueness, daemon log.
+- Shared framing helpers live in `tests/common/` so integration tests stay DRY.
 
 Attach’s TTY path is exercised manually or via an external PTY driver; the smoke
 test intentionally talks the wire protocol so CI does not need a controlling TTY.
+
+CI (`.github/workflows/ci.yml`) runs `cargo test --locked` and `pixi run test` on
+Linux.

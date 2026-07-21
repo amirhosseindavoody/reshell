@@ -77,6 +77,8 @@ reshell kill demo
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
+Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
+
 ## Why reshell?
 
 reshell is a **session manager**: it keeps one interactive shell (and its children)

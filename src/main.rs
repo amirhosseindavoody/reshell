@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use session::{generate_session_name, session_base_dir};
+use session::{allocate_session_name, session_base_dir};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,6 +23,10 @@ struct Cli {
     /// Override session storage directory (default: $XDG_RUNTIME_DIR/reshell)
     #[arg(long, global = true, env = "RESHELL_DIR")]
     dir: Option<PathBuf>,
+
+    /// Daemon log path (default: `$session/daemon.log`). Also accepts `RESHELL_LOG`.
+    #[arg(long, global = true, env = "RESHELL_LOG")]
+    log: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -69,6 +73,7 @@ fn run() -> Result<()> {
         Some(d) => d,
         None => session_base_dir()?,
     };
+    let log = cli.log;
 
     // Bare `reshell` is an alias for `reshell attach`.
     let command = cli.command.unwrap_or(Commands::Attach { name: None });
@@ -78,8 +83,8 @@ fn run() -> Result<()> {
             name,
             shell,
             detach,
-        } => cmd_new(&base, name, shell, detach),
-        Commands::Attach { name } => cmd_attach(&base, name),
+        } => cmd_new(&base, name, shell, detach, log),
+        Commands::Attach { name } => cmd_attach(&base, name, log),
         Commands::List => {
             let sessions = session::list_sessions(&base)?;
             if sessions.is_empty() {
@@ -112,13 +117,23 @@ fn run() -> Result<()> {
     }
 }
 
-fn cmd_new(base: &Path, name: Option<String>, shell: Option<String>, detach: bool) -> Result<()> {
-    let name = name.unwrap_or_else(generate_session_name);
+fn cmd_new(
+    base: &Path,
+    name: Option<String>,
+    shell: Option<String>,
+    detach: bool,
+    log: Option<PathBuf>,
+) -> Result<()> {
+    let name = match name {
+        Some(n) => n,
+        None => allocate_session_name(base)?,
+    };
     let shell = shell.unwrap_or_else(default_shell);
     server::create_session(server::NewSessionOpts {
         name: name.clone(),
         shell,
         base: base.to_path_buf(),
+        log_path: log,
     })?;
     if detach {
         println!("{name}");
@@ -130,14 +145,14 @@ fn cmd_new(base: &Path, name: Option<String>, shell: Option<String>, detach: boo
     }
 }
 
-fn cmd_attach(base: &Path, name: Option<String>) -> Result<()> {
+fn cmd_attach(base: &Path, name: Option<String>, log: Option<PathBuf>) -> Result<()> {
     match name {
         Some(n) => client::attach(base, &n),
         None => {
             let sessions = session::list_sessions(base)?;
             if sessions.is_empty() {
                 // No live sessions — same as `reshell new`.
-                return cmd_new(base, None, None, false);
+                return cmd_new(base, None, None, false, log);
             }
             let meta = session::most_recent_session(base)?;
             eprintln!("attaching to {}", meta.name);

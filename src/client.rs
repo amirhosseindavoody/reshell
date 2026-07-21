@@ -34,18 +34,37 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
     session::validate_session_name(name)?;
     let paths = SessionPaths::for_name(base, name);
     if !paths.meta.exists() {
+        if paths.dir.exists() {
+            bail!(
+                "session '{name}' meta missing under {} (incomplete session dir)",
+                paths.dir.display()
+            );
+        }
         bail!("session '{name}' not found");
     }
-    let meta = session::read_meta(&paths)?;
+    let meta = session::read_meta(&paths).with_context(|| {
+        format!(
+            "read meta for session '{name}' at {}",
+            paths.meta.display()
+        )
+    })?;
     if !session::process_alive(meta.pid) {
         let _ = session::cleanup_session_files(&paths);
-        bail!("session '{name}' is not running");
+        bail!(
+            "session '{name}' is not running (daemon pid {} is dead; cleaned up leftovers)",
+            meta.pid
+        );
     }
+    // Clears leftover `attached` files when the flock holder is gone.
     if session::is_attached(&paths) {
         bail!("session '{name}' is already attached");
     }
     if !paths.socket.exists() {
-        bail!("session '{name}' socket missing");
+        bail!(
+            "session '{name}' socket missing at {} (daemon pid {} alive but not listening?)",
+            paths.socket.display(),
+            meta.pid
+        );
     }
 
     let stdin_fd = io::stdin().as_raw_fd();
@@ -53,10 +72,14 @@ pub fn attach(base: &std::path::Path, name: &str) -> Result<()> {
         bail!("stdin is not a tty; attach requires a terminal");
     }
 
-    let mut stream = UnixStream::connect(&paths.socket)
-        .with_context(|| format!("connect to {}", paths.socket.display()))?;
+    let mut stream = UnixStream::connect(&paths.socket).with_context(|| {
+        format!(
+            "connect to {} (session '{name}' pid {})",
+            paths.socket.display(),
+            meta.pid
+        )
+    })?;
     set_nonblocking(stream.as_raw_fd())?;
-
     let orig = tcgetattr(io::stdin().as_fd()).context("tcgetattr")?;
     let mut raw = orig.clone();
     make_raw(&mut raw);

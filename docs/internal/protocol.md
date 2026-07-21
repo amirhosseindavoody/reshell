@@ -52,7 +52,8 @@ Little-endian:
 
 ## Server conventions
 
-- At most one attached client. Extra accepts are closed immediately.
+- At most one attached client. Extra accepts are closed immediately; the daemon
+  holds an advisory `flock` on `attached` while connected.
 - After `Detach` or client EOF/error, clear the attach lock and keep the shell.
 - Track DEC private modes from all PTY output (even while detached / discarded).
 - Unrecognized types are a protocol error for the reader; clients ignore unexpected

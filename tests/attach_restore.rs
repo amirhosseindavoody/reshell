@@ -1,94 +1,17 @@
 //! Reattach must restore DEC modes and drive a two-phase winsize so
 //! differential TUIs emit a full cell dump (not a no-op same-size redraw).
-use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
-fn reshell_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_reshell"))
-}
-
-fn write_msg(w: &mut impl Write, kind: u8, payload: &[u8]) {
-    w.write_all(&[kind]).unwrap();
-    w.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
-    w.write_all(payload).unwrap();
-    w.flush().unwrap();
-}
-
-fn read_msg(r: &mut impl Read) -> Option<(u8, Vec<u8>)> {
-    let mut kind = [0u8; 1];
-    if r.read_exact(&mut kind).is_err() {
-        return None;
-    }
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).ok()?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut payload).ok()?;
-    }
-    Some((kind[0], payload))
-}
-
-fn attach_winsize(stream: &mut UnixStream, rows: u16, cols: u16) {
-    let mut ws = [0u8; 4];
-    ws[0..2].copy_from_slice(&rows.to_le_bytes());
-    ws[2..4].copy_from_slice(&cols.to_le_bytes());
-    write_msg(stream, 4, &ws);
-}
-
-fn collect_data(stream: &mut UnixStream, deadline: Instant) -> Vec<u8> {
-    let mut out = Vec::new();
-    while Instant::now() < deadline {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
-        match read_msg(stream) {
-            Some((1, data)) => out.extend_from_slice(&data),
-            Some(_) => {}
-            None => {}
-        }
-    }
-    out
-}
-
-fn wait_sock(base: &std::path::Path, name: &str) -> PathBuf {
-    let sock = base.join(name).join("session.sock");
-    for _ in 0..50 {
-        if sock.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(sock.exists(), "socket missing for {name}");
-    sock
-}
+mod common;
+use common::*;
 
 #[test]
 fn reattach_restores_mouse_and_alt_screen() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
 
-    let out = Command::new(reshell_bin())
-        .args([
-            "--dir",
-            base.to_str().unwrap(),
-            "new",
-            "restore",
-            "--detach",
-            "--shell",
-            "/bin/bash",
-        ])
-        .output()
-        .expect("run reshell new");
-    assert!(
-        out.status.success(),
-        "new failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
+    new_detached(base, "restore");
     let sock = wait_sock(base, "restore");
 
     // First attach: enable alt-screen + mouse like a TUI editor would.
@@ -125,9 +48,7 @@ fn reattach_restores_mouse_and_alt_screen() {
     );
 
     write_msg(&mut stream, 3, &[]);
-    let _ = Command::new(reshell_bin())
-        .args(["--dir", base.to_str().unwrap(), "kill", "restore"])
-        .output();
+    kill_session(base, "restore");
 }
 
 #[test]
@@ -135,24 +56,7 @@ fn reattach_two_phase_winsize_for_full_paint() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
 
-    let out = Command::new(reshell_bin())
-        .args([
-            "--dir",
-            base.to_str().unwrap(),
-            "new",
-            "winch",
-            "--detach",
-            "--shell",
-            "/bin/bash",
-        ])
-        .output()
-        .expect("run reshell new");
-    assert!(
-        out.status.success(),
-        "new failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
+    new_detached(base, "winch");
     let sock = wait_sock(base, "winch");
 
     // Start a SIGWINCH reporter that prints each size it observes.
@@ -211,7 +115,5 @@ fn reattach_two_phase_winsize_for_full_paint() {
     );
 
     write_msg(&mut stream, 3, &[]);
-    let _ = Command::new(reshell_bin())
-        .args(["--dir", base.to_str().unwrap(), "kill", "winch"])
-        .output();
+    kill_session(base, "winch");
 }

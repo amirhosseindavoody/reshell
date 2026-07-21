@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -17,7 +18,8 @@ use nix::unistd::{read as nix_read, write as nix_write};
 
 use crate::protocol::{self, Message, Winsize};
 use crate::session::{
-    self, cleanup_session_files, now_unix, set_attached, write_meta, SessionMeta, SessionPaths,
+    self, append_daemon_log, cleanup_session_files, now_unix, write_meta, AttachLock, SessionMeta,
+    SessionPaths,
 };
 use crate::termstate::TermState;
 use crate::vscode_si;
@@ -25,6 +27,9 @@ use crate::vscode_si;
 /// Stop reading the PTY into the client buffer beyond this size so the shell
 /// experiences backpressure instead of unbounded memory growth.
 const OUTBOUND_HIGH_WATER: usize = 256 * 1024;
+
+/// Stop reading client input while PTY writes are backed up this far.
+const PTY_OUTBOUND_HIGH_WATER: usize = 256 * 1024;
 
 /// After attach, keep the temporary (bumped) winsize at least this long so
 /// differential TUIs (ratatui/crossterm) can emit a full cell dump at the new
@@ -38,7 +43,9 @@ const ATTACH_REDRAW_MAX: Duration = Duration::from_millis(250);
 pub struct NewSessionOpts {
     pub name: String,
     pub shell: String,
-    pub base: std::path::PathBuf,
+    pub base: PathBuf,
+    /// Optional log path override (`--log` / `RESHELL_LOG`). Default: `$session/daemon.log`.
+    pub log_path: Option<PathBuf>,
 }
 
 struct ClientConn {
@@ -117,7 +124,7 @@ pub fn create_session(opts: NewSessionOpts) -> Result<()> {
     if paths.meta.exists() {
         if let Ok(meta) = session::read_meta(&paths) {
             if session::process_alive(meta.pid) {
-                bail!("session '{}' already exists", opts.name);
+                bail!("session '{}' already exists (pid {})", opts.name, meta.pid);
             }
         }
         cleanup_session_files(&paths)?;
@@ -147,9 +154,19 @@ pub fn create_session(opts: NewSessionOpts) -> Result<()> {
 
             reopen_stdio_null()?;
 
-            let result = run_daemon(opts, paths, write_fd);
+            let log_path = opts
+                .log_path
+                .clone()
+                .unwrap_or_else(|| paths.daemon_log.clone());
+            let result = run_daemon(opts, paths.clone(), write_fd);
             if let Err(e) = &result {
-                let _ = fs::write("/tmp/reshell-daemon-error.log", format!("{e:?}\n"));
+                let msg = format!("daemon error: {e:#}");
+                let _ = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .and_then(|mut f| writeln!(f, "{msg}"));
+                append_daemon_log(&paths, &msg);
             }
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
@@ -161,10 +178,20 @@ fn wait_for_ready(read_fd: RawFd, paths: &SessionPaths) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match nix_read(read_fd, &mut buf) {
-            Ok(0) => bail!("session daemon exited before becoming ready"),
+            Ok(0) => {
+                let hint = if paths.daemon_log.exists() {
+                    format!("; see {}", paths.daemon_log.display())
+                } else {
+                    String::new()
+                };
+                bail!("session daemon exited before becoming ready{hint}");
+            }
             Ok(_) => {
                 if !paths.socket.exists() {
-                    bail!("session daemon signaled ready but socket is missing");
+                    bail!(
+                        "session daemon signaled ready but socket is missing at {}",
+                        paths.socket.display()
+                    );
                 }
                 return Ok(());
             }
@@ -193,6 +220,20 @@ fn reopen_stdio_null() -> Result<()> {
 }
 
 fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> Result<()> {
+    let log_path = opts
+        .log_path
+        .clone()
+        .unwrap_or_else(|| paths.daemon_log.clone());
+    append_daemon_log(
+        &paths,
+        &format!(
+            "starting session '{}' shell={} log={}",
+            opts.name,
+            opts.shell,
+            log_path.display()
+        ),
+    );
+
     let OpenptyResult { master, slave } = pty::openpty(None, None).context("openpty")?;
 
     let shell_path = opts.shell.clone();
@@ -226,6 +267,11 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
 
             let _ = nix_write(ready_fd.as_fd(), &[1u8]);
             drop(ready_fd);
+
+            append_daemon_log(
+                &paths,
+                &format!("ready pid={} socket={}", meta.pid, paths.socket.display()),
+            );
 
             server_loop(master, listener, shell_pid, &paths)?;
             cleanup_session_files(&paths)?;
@@ -340,16 +386,16 @@ fn server_loop(
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
+    let mut attach_lock: Option<AttachLock> = None;
     let mut term = TermState::new();
     let mut pending_redraw: Option<PendingAttachRedraw> = None;
+    let mut pty_outbound: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
 
     loop {
         match waitpid(shell_pid, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
-                if client.take().is_some() {
-                    let _ = set_attached(paths, false);
-                }
+                drop_client(&mut client, &mut attach_lock, paths);
                 break;
             }
             Ok(_) => {}
@@ -369,18 +415,30 @@ fn server_loop(
             Some(c) => c.outbound.len() < OUTBOUND_HIGH_WATER,
             None => true, // drain + discard while detached
         };
+        let want_pty_write = !pty_outbound.is_empty();
 
         let mut fds = Vec::with_capacity(3);
         let mut pty_flags = PollFlags::empty();
         if want_pty_read {
             pty_flags |= PollFlags::POLLIN;
         }
+        if want_pty_write {
+            pty_flags |= PollFlags::POLLOUT;
+        }
         fds.push(PollFd::new(master.as_fd(), pty_flags));
         fds.push(PollFd::new(listener.as_fd(), PollFlags::POLLIN));
         if let Some(ref c) = client {
-            let mut interest = PollFlags::POLLIN;
+            let mut interest = PollFlags::empty();
+            // Apply backpressure: pause client reads while PTY writes are backed up.
+            if pty_outbound.len() < PTY_OUTBOUND_HIGH_WATER {
+                interest |= PollFlags::POLLIN;
+            }
             if !c.outbound.is_empty() {
                 interest |= PollFlags::POLLOUT;
+            }
+            // Always watch for hangup even when not reading.
+            if interest.is_empty() {
+                interest |= PollFlags::POLLIN;
             }
             fds.push(PollFd::new(c.stream.as_fd(), interest));
         }
@@ -406,19 +464,49 @@ fn server_loop(
             match listener.accept() {
                 Ok((stream, _)) => {
                     if client.is_some() {
+                        append_daemon_log(paths, "reject attach: session already has a client");
                         drop(stream);
                     } else {
-                        match ClientConn::new(stream) {
-                            Ok(c) => {
+                        match (ClientConn::new(stream), AttachLock::try_acquire(paths)) {
+                            (Ok(c), Ok(lock)) => {
                                 client = Some(c);
-                                let _ = set_attached(paths, true);
+                                attach_lock = Some(lock);
+                                append_daemon_log(paths, "client attached");
                             }
-                            Err(_) => {}
+                            (Ok(_), Err(e)) => {
+                                append_daemon_log(
+                                    paths,
+                                    &format!("reject attach: could not take lock ({e})"),
+                                );
+                            }
+                            (Err(e), Ok(lock)) => {
+                                drop(lock);
+                                append_daemon_log(
+                                    paths,
+                                    &format!("reject attach: client setup failed ({e})"),
+                                );
+                            }
+                            (Err(e), Err(_)) => {
+                                append_daemon_log(
+                                    paths,
+                                    &format!("reject attach: client setup failed ({e})"),
+                                );
+                            }
                         }
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e).context("accept"),
+            }
+        }
+
+        if master_revents.contains(PollFlags::POLLOUT) && !pty_outbound.is_empty() {
+            match flush_pty_outbound(master_fd, &mut pty_outbound) {
+                Ok(()) => {}
+                Err(e) => {
+                    append_daemon_log(paths, &format!("pty write error: {e:#}"));
+                    return Err(e);
+                }
             }
         }
 
@@ -436,7 +524,7 @@ fn server_loop(
                             }
                             if c.enqueue(&Message::Data(buf[..n].to_vec())).is_err() {
                                 pending_redraw = None;
-                                drop_client(&mut client, paths);
+                                drop_client(&mut client, &mut attach_lock, paths);
                             }
                         }
                         // else: wait for Attach (mode restore) before forwarding
@@ -457,33 +545,42 @@ fn server_loop(
         if let Some(ref mut c) = client {
             if client_revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
                 pending_redraw = None;
-                drop_client(&mut client, paths);
+                drop_client(&mut client, &mut attach_lock, paths);
             } else {
                 let mut dead = false;
                 if client_revents.contains(PollFlags::POLLOUT) || !c.outbound.is_empty() {
                     dead = c.flush_outbound()?;
                 }
+                let want_client_read = pty_outbound.len() < PTY_OUTBOUND_HIGH_WATER;
                 if !dead
-                    && client_revents
-                        .intersects(PollFlags::POLLIN | PollFlags::POLLHUP)
+                    && want_client_read
+                    && client_revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP)
                 {
                     dead = c.read_inbound()?;
                     if !dead {
-                        match handle_client_messages(c, master_fd, &term, &mut pending_redraw) {
+                        match handle_client_messages(
+                            c,
+                            master_fd,
+                            &term,
+                            &mut pending_redraw,
+                            &mut pty_outbound,
+                        ) {
                             Ok(true) => dead = true,
                             Ok(false) => {}
                             Err(_) => dead = true,
                         }
                     }
+                } else if !dead && client_revents.contains(PollFlags::POLLHUP) {
+                    dead = true;
                 }
                 if dead {
                     pending_redraw = None;
-                    drop_client(&mut client, paths);
+                    drop_client(&mut client, &mut attach_lock, paths);
                 } else if !c.outbound.is_empty() {
                     // Opportunistic flush after enqueue from PTY.
                     if c.flush_outbound()? {
                         pending_redraw = None;
-                        drop_client(&mut client, paths);
+                        drop_client(&mut client, &mut attach_lock, paths);
                     }
                 }
             }
@@ -495,9 +592,33 @@ fn server_loop(
     Ok(())
 }
 
-fn drop_client(client: &mut Option<ClientConn>, paths: &SessionPaths) {
+fn drop_client(
+    client: &mut Option<ClientConn>,
+    attach_lock: &mut Option<AttachLock>,
+    paths: &SessionPaths,
+) {
     *client = None;
-    let _ = set_attached(paths, false);
+    *attach_lock = None;
+    append_daemon_log(paths, "client detached");
+}
+
+/// Write as much of `pty_outbound` as the non-blocking PTY accepts.
+fn flush_pty_outbound(fd: RawFd, pty_outbound: &mut Vec<u8>) -> Result<()> {
+    while !pty_outbound.is_empty() {
+        match nix_write(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+            pty_outbound,
+        ) {
+            Ok(0) => bail!("short write to pty"),
+            Ok(n) => {
+                pty_outbound.drain(..n);
+            }
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => break,
+            Err(e) => return Err(e).context("write pty master"),
+        }
+    }
+    Ok(())
 }
 
 /// Returns Ok(true) if client should disconnect (Detach).
@@ -506,6 +627,7 @@ fn handle_client_messages(
     master_fd: RawFd,
     term: &TermState,
     pending_redraw: &mut Option<PendingAttachRedraw>,
+    pty_outbound: &mut Vec<u8>,
 ) -> Result<bool> {
     let messages = protocol::drain_messages(&mut client.inbound)?;
     for msg in messages {
@@ -540,25 +662,11 @@ fn handle_client_messages(
                 }
             }
             Message::Data(data) => {
-                write_all_fd(master_fd, &data)?;
+                pty_outbound.extend_from_slice(&data);
+                flush_pty_outbound(master_fd, pty_outbound)?;
             }
             Message::Detach => return Ok(true),
         }
     }
     Ok(false)
-}
-
-fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Result<()> {
-    while !data.is_empty() {
-        match nix_write(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }, data) {
-            Ok(0) => bail!("short write to pty"),
-            Ok(n) => data = &data[n..],
-            Err(Errno::EINTR) => continue,
-            Err(Errno::EAGAIN) => {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => return Err(e).context("write pty master"),
-        }
-    }
-    Ok(())
 }
