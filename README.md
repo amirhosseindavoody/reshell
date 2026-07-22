@@ -95,6 +95,7 @@ reshell clean
 # Kill a session
 reshell kill demo
 # or: reshell k demo
+# or: reshell kill --all   # terminate every live session
 ```
 
 Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.

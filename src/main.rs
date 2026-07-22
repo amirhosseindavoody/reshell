@@ -114,9 +114,15 @@ enum Commands {
     /// Terminate a session and its shell
     #[command(visible_alias = "k")]
     Kill {
-        /// Session name
-        #[arg(add = ArgValueCompleter::new(complete_session_name))]
-        name: String,
+        /// Session name (required unless `--all`)
+        #[arg(
+            add = ArgValueCompleter::new(complete_session_name),
+            required_unless_present = "all"
+        )]
+        name: Option<String>,
+        /// Kill all live sessions
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
     },
     /// Print shell completion script to stdout
     Completion {
@@ -201,9 +207,21 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Kill { name } => {
-            session::kill_session(&base, &name)?;
-            println!("killed {name}");
+        Commands::Kill { name, all } => {
+            if all {
+                let killed = session::kill_all_sessions(&base)?;
+                if killed.is_empty() {
+                    println!("(no sessions)");
+                } else {
+                    for name in &killed {
+                        println!("killed {name}");
+                    }
+                }
+            } else {
+                let name = name.expect("clap requires name unless --all");
+                session::kill_session(&base, &name)?;
+                println!("killed {name}");
+            }
             Ok(())
         }
         Commands::Completion { .. } => unreachable!("handled above"),

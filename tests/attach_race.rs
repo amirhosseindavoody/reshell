@@ -213,6 +213,57 @@ fn kill_removes_session_and_reports_missing() {
 }
 
 #[test]
+fn kill_all_terminates_every_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "one");
+    new_detached(base, "two");
+
+    let empty_base = tempfile::tempdir().unwrap();
+    let empty = Command::new(reshell_bin())
+        .args([
+            "--dir",
+            empty_base.path().to_str().unwrap(),
+            "kill",
+            "--all",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        empty.status.success(),
+        "kill --all with no sessions failed: {}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&empty.stdout).contains("(no sessions)"),
+        "expected empty message, got: {}",
+        String::from_utf8_lossy(&empty.stdout)
+    );
+
+    let kill = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "kill", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        kill.status.success(),
+        "kill --all failed: {}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    let out = String::from_utf8_lossy(&kill.stdout);
+    assert!(out.contains("killed one"), "stdout: {out}");
+    assert!(out.contains("killed two"), "stdout: {out}");
+    assert!(!base.join("one").exists());
+    assert!(!base.join("two").exists());
+
+    // Name and --all together should be rejected.
+    let both = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "kill", "--all", "nope"])
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+}
+
+#[test]
 fn daemon_log_written_under_session_dir() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();

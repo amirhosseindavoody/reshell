@@ -98,6 +98,7 @@ recently active session.
 daemon keeps a directory fd open so meta/lock/log writes survive the move; the
 Unix socket path moves with the directory.
 `kill` sends `SIGTERM` (then `SIGKILL`) to the daemon pid and deletes the session dir.
+`kill --all` terminates every live session under the session base dir.
 Attach/kill failures include concrete reasons (dead pid, lock held, socket missing, …).
 
 Override the daemon log path with `--log` / `RESHELL_LOG` (fatal errors are written
@@ -270,7 +271,8 @@ conda Rust toolchain is used, not an older system rustup.
   reattach observes restored CSI modes; SIGWINCH reporter confirms temporary then
   final winsize (two-phase full paint for differential TUIs).
 - Integration (`tests/attach_race.rs`): concurrent attach (one survivor), stale
-  `attached` recovery, kill missing-session errors, auto-name uniqueness, daemon log.
+  `attached` recovery, kill / `kill --all`, missing-session errors, auto-name
+  uniqueness, daemon log.
 - Shared framing helpers live in `tests/common/` so integration tests stay DRY.
 
 Attach’s TTY path is exercised manually or via an external PTY driver; the smoke

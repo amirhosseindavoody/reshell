@@ -620,6 +620,18 @@ pub fn kill_session(base: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Terminate every live session under `base`. Returns killed session names
+/// (sorted, same order as [`list_sessions`]).
+pub fn kill_all_sessions(base: &Path) -> Result<Vec<String>> {
+    let sessions = list_sessions(base)?;
+    let mut killed = Vec::with_capacity(sessions.len());
+    for (meta, _) in sessions {
+        kill_session(base, &meta.name)?;
+        killed.push(meta.name);
+    }
+    Ok(killed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
