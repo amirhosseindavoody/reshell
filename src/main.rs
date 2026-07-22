@@ -52,6 +52,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Create a new session and attach to it
+    #[command(visible_alias = "n")]
     New {
         /// Session name (generated if omitted)
         name: Option<String>,
@@ -64,18 +65,21 @@ enum Commands {
     },
     /// Attach to an existing session (most recently active if name omitted).
     /// With no sessions, creates a new one (same as `new`).
+    #[command(visible_alias = "a")]
     Attach {
         /// Session name (defaults to the most recently active session)
         #[arg(add = ArgValueCompleter::new(complete_session_name))]
         name: Option<String>,
     },
     /// List running sessions
+    #[command(visible_alias = "l")]
     List {
         /// Machine-readable JSON (stable fields for scripts)
         #[arg(long)]
         json: bool,
     },
     /// Show details for a session
+    #[command(visible_alias = "i")]
     Info {
         /// Session name (defaults to the current session when inside one,
         /// otherwise the most recently active session)
@@ -86,6 +90,7 @@ enum Commands {
         json: bool,
     },
     /// Show recent shell context (last command + trailing output)
+    #[command(visible_alias = "c")]
     Context {
         /// Session name (defaults to the current session when inside one,
         /// otherwise the most recently active session)
@@ -96,6 +101,7 @@ enum Commands {
         json: bool,
     },
     /// Rename a live session
+    #[command(visible_alias = "r")]
     Rename {
         /// Current session name
         #[arg(add = ArgValueCompleter::new(complete_session_name))]
@@ -106,6 +112,7 @@ enum Commands {
     /// Remove dead-session leftovers (also done automatically by `list`)
     Clean,
     /// Terminate a session and its shell
+    #[command(visible_alias = "k")]
     Kill {
         /// Session name
         #[arg(add = ArgValueCompleter::new(complete_session_name))]
