@@ -257,7 +257,9 @@ fn short_subcommand_aliases_work() {
         .unwrap();
     let help_txt = String::from_utf8_lossy(&help.stdout);
     assert!(
-        help_txt.contains("[alias: a]") && help_txt.contains("[alias: i]"),
+        help_txt.contains("[alias: a]")
+            && help_txt.contains("[alias: ls]")
+            && help_txt.contains("[alias: i]"),
         "expected visible short aliases in help: {help_txt}"
     );
 
@@ -269,7 +271,7 @@ fn short_subcommand_aliases_work() {
     assert!(String::from_utf8_lossy(&info.stdout).contains("name:        alias-me"));
 
     let list = Command::new(reshell_bin())
-        .args(["--dir", base.to_str().unwrap(), "l", "--json"])
+        .args(["--dir", base.to_str().unwrap(), "ls", "--json"])
         .output()
         .unwrap();
     assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));

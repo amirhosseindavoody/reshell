@@ -72,7 +72,7 @@ enum Commands {
         name: Option<String>,
     },
     /// List running sessions
-    #[command(visible_alias = "l")]
+    #[command(visible_alias = "ls")]
     List {
         /// Machine-readable JSON (stable fields for scripts)
         #[arg(long)]

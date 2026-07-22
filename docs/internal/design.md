@@ -50,7 +50,7 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`l`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab); detach-key + log + scrollback flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`ls`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab); detach-key + log + scrollback flags; default shell `/bin/zsh` |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O, context fetch |

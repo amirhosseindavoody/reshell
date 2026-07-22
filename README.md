@@ -69,13 +69,13 @@ reshell --scrollback 1M new demo --detach
 
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
-# or: reshell a demo       # short aliases: n/a/l/i/c/r/k
+# or: reshell a demo       # short aliases: n/a/ls/i/c/r/k
 # or: reshell attach       # most recently active (or new if none)
 # or: reshell --detach-key '^a' attach demo
 
 # List sessions (relative times; --json for scripts)
 reshell list
-reshell l --json
+reshell ls --json
 
 # Session details (paths, pid, state, …)
 reshell info demo
@@ -97,7 +97,7 @@ reshell kill demo
 # or: reshell k demo
 ```
 
-Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `l` list, `i` info, `c` context, `r` rename, `k` kill.
+Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.
 
 ### Shell completion
 
