@@ -14,6 +14,7 @@ use nix::sys::termios::{
 };
 use nix::unistd::{read as nix_read, write as nix_write};
 
+use crate::context::ContextSnapshot;
 use crate::protocol::{self, Message, Winsize};
 use crate::session::{self, SessionPaths};
 use crate::termstate::TermState;
@@ -28,6 +29,43 @@ extern "C" fn handle_winch(_: nix::libc::c_int) {
 
 extern "C" fn handle_hup(_: nix::libc::c_int) {
     HUP_FLAG.store(true, Ordering::Relaxed);
+}
+
+/// Fetch a read-only context snapshot without taking the attach lock.
+pub fn fetch_context(base: &std::path::Path, name: &str) -> Result<ContextSnapshot> {
+    session::validate_session_name(name)?;
+    let paths = SessionPaths::for_name(base, name);
+    if !paths.meta.exists() {
+        bail!("session '{name}' not found");
+    }
+    let meta = session::read_meta(&paths)?;
+    if !session::process_alive(meta.pid) {
+        let _ = session::cleanup_session_files(&paths);
+        bail!("session '{name}' is not running");
+    }
+    if !paths.socket.exists() {
+        bail!("session '{name}' socket missing at {}", paths.socket.display());
+    }
+
+    let mut stream = UnixStream::connect(&paths.socket).with_context(|| {
+        format!("connect to {} for context", paths.socket.display())
+    })?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    protocol::write_message(&mut stream, &Message::ContextReq)?;
+
+    loop {
+        match protocol::read_message(&mut stream)? {
+            Some(Message::ContextRes(payload)) => {
+                let snap: ContextSnapshot = serde_json::from_slice(&payload)
+                    .context("decode context snapshot")?;
+                return Ok(snap);
+            }
+            Some(Message::Data(_)) => continue,
+            Some(other) => bail!("unexpected message while fetching context: {other:?}"),
+            None => bail!("session '{name}' closed the socket before sending context"),
+        }
+    }
 }
 
 pub fn attach(base: &std::path::Path, name: &str, detach_key: u8) -> Result<()> {

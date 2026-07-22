@@ -246,6 +246,46 @@ fn clean_removes_orphan_dirs() {
 }
 
 #[test]
+fn short_subcommand_aliases_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "alias-me");
+
+    let help = Command::new(reshell_bin())
+        .args(["--help"])
+        .output()
+        .unwrap();
+    let help_txt = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_txt.contains("[alias: a]") && help_txt.contains("[alias: i]"),
+        "expected visible short aliases in help: {help_txt}"
+    );
+
+    let info = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "i", "alias-me"])
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", String::from_utf8_lossy(&info.stderr));
+    assert!(String::from_utf8_lossy(&info.stdout).contains("name:        alias-me"));
+
+    let list = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "l", "--json"])
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    assert!(String::from_utf8_lossy(&list.stdout).contains("\"name\": \"alias-me\""));
+
+    let ctx = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "c", "alias-me"])
+        .output()
+        .unwrap();
+    assert!(ctx.status.success(), "{}", String::from_utf8_lossy(&ctx.stderr));
+    assert!(String::from_utf8_lossy(&ctx.stdout).contains("session: alias-me"));
+
+    kill_session(base, "alias-me");
+}
+
+#[test]
 fn completion_prints_shell_script() {
     for shell in ["bash", "zsh", "fish"] {
         let out = Command::new(reshell_bin())

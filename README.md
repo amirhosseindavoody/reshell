@@ -6,7 +6,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 
 - Keep shells alive and running after SSH disconnects
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
-- Explicit sessions: `new` / `attach` / `list` / `kill`
+- Explicit sessions: `new` / `attach` / `list` / `info` / `context` / `kill`
 - Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
 - Reattach restores TUI terminal modes (mouse, alt-screen, …) and forces a redraw
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session
@@ -69,26 +69,35 @@ reshell --scrollback 1M new demo --detach
 
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
+# or: reshell a demo       # short aliases: n/a/l/i/c/r/k
 # or: reshell attach       # most recently active (or new if none)
 # or: reshell --detach-key '^a' attach demo
 
 # List sessions (relative times; --json for scripts)
 reshell list
-reshell list --json
+reshell l --json
 
 # Session details (paths, pid, state, …)
 reshell info demo
-# or: reshell info     # current session when inside one; else most recent
+# or: reshell i        # current session when inside one; else most recent
+
+# Recent shell context (last command + trailing output; read-only)
+reshell context demo
+# or: reshell c        # current session when inside one; else most recent
 
 # Rename a live session
 reshell rename demo demo2
+# or: reshell r demo demo2
 
 # Remove dead-session leftovers (also runs as part of `list`)
 reshell clean
 
 # Kill a session
 reshell kill demo
+# or: reshell k demo
 ```
+
+Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `l` list, `i` info, `c` context, `r` rename, `k` kill.
 
 ### Shell completion
 
@@ -110,8 +119,13 @@ Completions call back into `reshell` at tab time, so `attach` / `info` / `kill` 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
 Inside a session shell, `RESHELL_SESSION` is set to the session name. Bare
-`reshell info` uses the current session (even after `rename`); outside a session
-it falls back to the most recently active one.
+`reshell info` / `reshell context` use the current session (even after `rename`);
+outside a session they fall back to the most recently active one.
+
+`reshell context` prints the last known command (when OSC 633 shell-integration
+markers are present) and the last ~100 lines of primary-screen output. It does
+not attach or replay into the live PTY — useful to recall what a session is
+doing. Full-screen apps pause line capture while they own the alternate screen.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 

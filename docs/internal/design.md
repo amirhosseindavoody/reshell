@@ -50,12 +50,13 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `rename` / `clean` / `kill` / `completion`; dynamic session-name completion; detach-key + log + scrollback flags; default shell `/bin/zsh` |
-| [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent session |
-| [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay |
-| [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O |
-| [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)) |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`l`/`i`/`c`/`r`/`k`); dynamic session-name completion; detach-key + log + scrollback flags; default shell `/bin/zsh` |
+| [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session |
+| [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots |
+| [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O, context fetch |
+| [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)); context req/res |
 | [`src/scrollback.rs`](../../src/scrollback.rs) | Bounded ring of detached PTY bytes; size parsing (`1M`, `512K`) |
+| [`src/context.rs`](../../src/context.rs) | Rolling primary-screen lines + OSC 633 last-command for `reshell context` |
 | [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode tracking for restore-on-attach |
 | [`src/vscode_si.rs`](../../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject |
 
@@ -88,8 +89,11 @@ when nobody holds the advisory flock (e.g. after a crashed daemon), and removes
 orphan session dirs that lack `meta.json`.
 `list` shows relative times by default (`2h ago`); `list --json` is stable for scripts.
 `info` prints pid, shell, state, timestamps, and all session paths (`info --json` too).
-With no name, `info` prefers the session this process is inside (daemon pid among
-process ancestors, else `$RESHELL_SESSION`), then the most recently active session.
+`context` prints the last known command (OSC 633 when present) and ~100 lines of
+primary-screen output via a short-lived `ContextReq` (no attach lock, not replayed
+into the PTY). With no name, `info` / `context` prefer the session this process is
+inside (daemon pid among process ancestors, else `$RESHELL_SESSION`), then the most
+recently active session.
 `rename old new` renames a live session directory and updates `meta.name`. The
 daemon keeps a directory fd open so meta/lock/log writes survive the move; the
 Unix socket path moves with the directory.

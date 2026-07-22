@@ -23,6 +23,8 @@ Every message:
 | `2` | `Resize` | 4 bytes | client → server | Window size change |
 | `3` | `Detach` | empty | client → server | Client leaving; keep shell |
 | `4` | `Attach` | 4 bytes | client → server | First message after connect |
+| `5` | `ContextReq` | empty | client → server | Request a context snapshot (no attach lock) |
+| `6` | `ContextRes` | UTF-8 JSON | server → client | `ContextSnapshot` then socket close |
 
 ### Winsize payload (`Attach` / `Resize`)
 
@@ -56,13 +58,33 @@ Little-endian:
 
 - At most one attached client. Extra accepts are closed immediately; the daemon
   holds an advisory `flock` on `attached` while connected.
+- `ContextReq` is classified from the first framed message on accept and answered
+  with `ContextRes` **without** taking the attach lock (works while attached).
 - After `Detach` or client EOF/error, clear the attach lock and keep the shell.
 - Track DEC private modes from all PTY output (even while detached).
+- Keep a rolling primary-screen line history (~100 lines) plus last OSC 633
+  command markers for `reshell context` (independent of attach-replay scrollback).
 - When `--scrollback` / `RESHELL_SCROLLBACK` is set at session create, keep a
   bounded ring of PTY bytes while no ready client is attached and replay them
   after mode restore + clear on the next `Attach`.
 - Unrecognized types are a protocol error for the reader; clients ignore unexpected
-  control messages from the server (server currently only emits `Data`).
+  control messages from the server (server emits `Data` and `ContextRes`).
+
+### `ContextRes` JSON
+
+```json
+{
+  "name": "demo",
+  "last_command": "cargo test",
+  "last_exit_code": 0,
+  "lines": ["…", "…"],
+  "alt_screen": false
+}
+```
+
+`last_command` / `last_exit_code` are null when no OSC 633 `E`/`D` markers have
+been seen. `alt_screen` is true when a full-screen app currently owns the PTY;
+`lines` then reflect history captured before alt-screen entry.
 
 ## Example sequence
 

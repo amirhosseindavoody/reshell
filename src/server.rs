@@ -16,6 +16,7 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
 use nix::unistd::{read as nix_read, write as nix_write};
 
+use crate::context::{SessionContext, DEFAULT_CONTEXT_LINES};
 use crate::protocol::{self, Message, Winsize};
 use crate::scrollback::Scrollback;
 use crate::session::{
@@ -75,12 +76,12 @@ struct PendingAttachRedraw {
 }
 
 impl ClientConn {
-    fn new(stream: UnixStream) -> Result<Self> {
+    fn with_inbound(stream: UnixStream, inbound: Vec<u8>) -> Result<Self> {
         set_nonblocking(stream.as_raw_fd())?;
         Ok(Self {
             stream,
             outbound: Vec::new(),
-            inbound: Vec::new(),
+            inbound,
             ready: false,
         })
     }
@@ -285,7 +286,14 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
             );
 
             let dir_fd = open_session_dir_fd(&paths)?;
-            server_loop(master, listener, shell_pid, dir_fd, opts.scrollback)?;
+            server_loop(
+                master,
+                listener,
+                shell_pid,
+                dir_fd,
+                opts.scrollback,
+                opts.name.clone(),
+            )?;
             Ok(())
         }
         ForkResult::Child => {
@@ -397,12 +405,14 @@ fn server_loop(
     shell_pid: Pid,
     dir_fd: OwnedFd,
     scrollback_cap: usize,
+    session_name: String,
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
     let mut attach_lock: Option<AttachLock> = None;
     let mut term = TermState::new();
     let mut scrollback = Scrollback::new(scrollback_cap);
+    let mut context = SessionContext::new(DEFAULT_CONTEXT_LINES);
     let mut pending_redraw: Option<PendingAttachRedraw> = None;
     let mut pty_outbound: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
@@ -483,30 +493,64 @@ fn server_loop(
 
         if listen_revents.contains(PollFlags::POLLIN) {
             match listener.accept() {
-                Ok((stream, _)) => {
-                    if client.is_some() {
-                        log("reject attach: session already has a client");
-                        drop(stream);
-                    } else {
-                        match (ClientConn::new(stream), AttachLock::try_acquire(&dir_fd)) {
-                            (Ok(c), Ok(lock)) => {
-                                client = Some(c);
-                                attach_lock = Some(lock);
-                                log("client attached");
-                            }
-                            (Ok(_), Err(e)) => {
-                                log(&format!("reject attach: could not take lock ({e})"));
-                            }
-                            (Err(e), Ok(lock)) => {
-                                drop(lock);
-                                log(&format!("reject attach: client setup failed ({e})"));
-                            }
-                            (Err(e), Err(_)) => {
-                                log(&format!("reject attach: client setup failed ({e})"));
+                Ok((stream, _)) => match classify_incoming(stream) {
+                    Ok(Incoming::Context { stream }) => {
+                        let alt = term.alt_screen();
+                        let snap = context.snapshot(&session_name, alt);
+                        if let Err(e) = reply_context(stream, &snap) {
+                            log(&format!("context reply failed: {e:#}"));
+                        } else {
+                            log("served context snapshot");
+                        }
+                    }
+                    Ok(Incoming::AttachCandidate { stream, inbound }) => {
+                        if client.is_some() {
+                            log("reject attach: session already has a client");
+                        } else {
+                            match (
+                                ClientConn::with_inbound(stream, inbound),
+                                AttachLock::try_acquire(&dir_fd),
+                            ) {
+                                (Ok(mut c), Ok(lock)) => {
+                                    match handle_client_messages(
+                                        &mut c,
+                                        master_fd,
+                                        &term,
+                                        &mut scrollback,
+                                        &mut pending_redraw,
+                                        &mut pty_outbound,
+                                    ) {
+                                        Ok(true) => {
+                                            drop(lock);
+                                            log("client detached immediately");
+                                        }
+                                        Ok(false) => {
+                                            client = Some(c);
+                                            attach_lock = Some(lock);
+                                            log("client attached");
+                                        }
+                                        Err(e) => {
+                                            drop(lock);
+                                            log(&format!("reject attach: {e:#}"));
+                                        }
+                                    }
+                                }
+                                (Ok(_), Err(e)) => {
+                                    log(&format!("reject attach: could not take lock ({e})"));
+                                }
+                                (Err(e), Ok(lock)) => {
+                                    drop(lock);
+                                    log(&format!("reject attach: client setup failed ({e})"));
+                                }
+                                (Err(e), Err(_)) => {
+                                    log(&format!("reject attach: client setup failed ({e})"));
+                                }
                             }
                         }
                     }
-                }
+                    Ok(Incoming::Rejected) => {}
+                    Err(e) => log(&format!("accept classify failed: {e:#}")),
+                },
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e).context("accept"),
             }
@@ -528,7 +572,10 @@ fn server_loop(
                 Ok(n) => {
                     // Always parse modes — including while detached — so reattach
                     // can restore mouse / alt-screen on the new client TTY.
+                    let alt = term.alt_screen();
                     term.feed(&buf[..n]);
+                    // Capture shell history for `reshell context` (pause in alt-screen).
+                    context.feed(&buf[..n], alt);
                     let forward = matches!(&client, Some(c) if c.ready);
                     if forward {
                         if let Some(ref mut c) = client {
@@ -695,7 +742,79 @@ fn handle_client_messages(
                 flush_pty_outbound(master_fd, pty_outbound)?;
             }
             Message::Detach => return Ok(true),
+            Message::ContextReq | Message::ContextRes(_) => {
+                // Context is handled on the accept path as a short-lived
+                // connection; ignore if it appears on an attach client.
+            }
         }
     }
     Ok(false)
+}
+
+enum Incoming {
+    /// Short-lived context query (no attach lock).
+    Context { stream: UnixStream },
+    /// Potential interactive client; `inbound` may already contain `Attach`.
+    AttachCandidate {
+        stream: UnixStream,
+        inbound: Vec<u8>,
+    },
+    Rejected,
+}
+
+/// Read the first framed message to distinguish context queries from attach.
+fn classify_incoming(mut stream: UnixStream) -> Result<Incoming> {
+    set_nonblocking(stream.as_raw_fd())?;
+    let mut inbound = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        let messages = protocol::drain_messages(&mut inbound)?;
+        if !messages.is_empty() {
+            let mut iter = messages.into_iter();
+            let first = iter.next().expect("non-empty");
+            match first {
+                Message::ContextReq => {
+                    return Ok(Incoming::Context { stream });
+                }
+                other => {
+                    // Re-queue framed messages ahead of any undecoded bytes.
+                    let mut prefix = protocol::encode_message(&other)?;
+                    for msg in iter {
+                        prefix.extend(protocol::encode_message(&msg)?);
+                    }
+                    prefix.append(&mut inbound);
+                    return Ok(Incoming::AttachCandidate {
+                        stream,
+                        inbound: prefix,
+                    });
+                }
+            }
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok(Incoming::Rejected),
+            Ok(n) => inbound.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    // No complete frame yet — treat as attach candidate (client
+                    // may still be writing Attach).
+                    return Ok(Incoming::AttachCandidate { stream, inbound });
+                }
+                let fd = stream.as_fd();
+                let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+                let _ = poll(&mut fds, 20u16);
+            }
+            Err(_) => return Ok(Incoming::Rejected),
+        }
+    }
+}
+
+fn reply_context(mut stream: UnixStream, snap: &crate::context::ContextSnapshot) -> Result<()> {
+    // Blocking write is fine for a tiny JSON reply on a short-lived socket.
+    let _ = stream.set_nonblocking(false);
+    let payload = serde_json::to_vec(snap).context("encode context snapshot")?;
+    protocol::write_message(&mut stream, &Message::ContextRes(payload))?;
+    let _ = stream.flush();
+    Ok(())
 }
