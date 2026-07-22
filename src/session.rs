@@ -209,14 +209,25 @@ pub fn now_unix() -> u64 {
 pub fn write_meta(paths: &SessionPaths, meta: &SessionMeta) -> Result<()> {
     fs::create_dir_all(&paths.dir)
         .with_context(|| format!("create session dir {}", paths.dir.display()))?;
-    let tmp = paths.meta.with_extension("json.tmp");
+    // Unique temp name so concurrent writers (e.g. detach updating `attached`
+    // while `rename` rewrites `name`) cannot race on a shared `meta.json.tmp`.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = paths.dir.join(format!(
+        ".meta.json.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let json = serde_json::to_vec_pretty(meta).context("serialize session meta")?;
     {
-        let mut f = File::create(&tmp).context("create temp meta file")?;
+        let mut f = File::create(&tmp)
+            .with_context(|| format!("create temp meta file {}", tmp.display()))?;
         f.write_all(&json).context("write meta")?;
         f.write_all(b"\n").ok();
     }
-    fs::rename(&tmp, &paths.meta).context("rename meta file")?;
+    if let Err(e) = fs::rename(&tmp, &paths.meta) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).context("rename meta file");
+    }
     Ok(())
 }
 
@@ -671,6 +682,44 @@ mod tests {
         assert_eq!(loaded.name, "demo");
         assert_eq!(loaded.pid, 1);
         assert_eq!(loaded.last_active_unix, 0);
+    }
+
+    #[test]
+    fn concurrent_write_meta_does_not_enoent() {
+        let dir = tempdir().unwrap();
+        let paths = SessionPaths::for_name(dir.path(), "race");
+        let base = SessionMeta {
+            name: "race".into(),
+            pid: 1,
+            shell: "/bin/bash".into(),
+            created_unix: 1,
+            attached: false,
+            last_active_unix: 0,
+        };
+        write_meta(&paths, &base).unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let paths = paths.clone();
+            handles.push(std::thread::spawn(move || {
+                for j in 0..40 {
+                    let meta = SessionMeta {
+                        name: "race".into(),
+                        pid: 1,
+                        shell: "/bin/bash".into(),
+                        created_unix: 1,
+                        attached: i % 2 == 0,
+                        last_active_unix: (i * 100 + j) as u64,
+                    };
+                    write_meta(&paths, &meta).expect("concurrent write_meta");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread");
+        }
+        let loaded = read_meta(&paths).unwrap();
+        assert_eq!(loaded.name, "race");
     }
 
     #[test]
