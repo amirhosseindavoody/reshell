@@ -50,15 +50,15 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`l`/`i`/`c`/`r`/`k`); dynamic session-name completion; detach-key + log + scrollback flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`l`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab); detach-key + log + scrollback flags; default shell `/bin/zsh` |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O, context fetch |
 | [`src/protocol.rs`](../../src/protocol.rs) | Length-prefixed framing (see [protocol.md](protocol.md)); context req/res |
 | [`src/scrollback.rs`](../../src/scrollback.rs) | Bounded ring of detached PTY bytes; size parsing (`1M`, `512K`) |
 | [`src/context.rs`](../../src/context.rs) | Rolling primary-screen lines + OSC 633 last-command for `reshell context` |
-| [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode tracking for restore-on-attach |
-| [`src/vscode_si.rs`](../../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject |
+| [`src/termstate.rs`](../../src/termstate.rs) | DEC private mode + OSC window-title tracking for restore-on-attach |
+| [`src/vscode_si.rs`](../../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject (bash/zsh/fish) |
 
 ## Session storage
 
@@ -164,9 +164,10 @@ reshell fixes that when `TERM_PROGRAM` is `vscode` (or Cursor is detected):
 1. **On attach**, the client writes `OSC 633;D` to the local TTY to finish the
    outer `reshell` command so sticky scroll can move on.
 2. **On session create**, the daemon injects VS Code’s shell-integration script
-   into bash (`--init-file`) or zsh (`ZDOTDIR` + `VSCODE_INJECTION=1`) when it can
-   locate the script (`code`/`cursor --locate-shell-integration-path`, or a
-   `.vscode-server` install). The session shell then emits `A/B/E/C/D` for each
+   into bash (`--init-file`), zsh (`ZDOTDIR` + `VSCODE_INJECTION=1`), or fish
+   (`--init-command 'source …'`) when it can locate the script
+   (`code`/`cursor --locate-shell-integration-path`, or a `.vscode-server` /
+   `.cursor-server` install). The session shell then emits `A/B/E/C/D` for each
    command; those bytes pass through the PTY pipe unchanged.
 3. Sessions created outside VS Code still work if the user’s rc manually sources
    shell integration when `TERM_PROGRAM=vscode`.
@@ -182,10 +183,12 @@ raw PTY bytes while detached and replays them on the next attach — useful for
 plain-shell history, not a substitute for TUI redraw. The daemon always:
 
 1. Parses PTY output for DEC private modes (alt-screen, mouse tracking, bracketed
-   paste, focus events, cursor visibility, …), including while detached.
-2. On `Attach`, sends those modes back to the new client as the first `Data`
-   payload (so the local TTY enables mouse again, enters alt-screen, etc.), then
-   clears the local screen.
+   paste, focus events, cursor visibility, …) and the last OSC 0/2 window title,
+   including while detached.
+2. On `Attach`, sends those modes (and the remembered title) back to the new
+   client as the first `Data` payload (so the local TTY enables mouse again,
+   enters alt-screen, restores the tab/window title, etc.), then clears the
+   local screen.
 3. If scrollback is enabled and non-empty, replays captured detached bytes as
    further `Data` frames (then clears the ring).
 4. Forces a full child redraw that differential TUIs (notably ratatui/crossterm

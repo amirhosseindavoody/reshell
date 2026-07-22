@@ -124,13 +124,14 @@ does not take the attach lock or replay into the live PTY. Line capture pauses
 while the alternate screen is active. Name omitted → current session when inside
 one, else most recently active.
 
-### 13. Broader VS Code / Cursor shell integration
+### 13. Broader VS Code / Cursor shell integration — done
 
-**Today:** OSC 633 sticky-scroll handling plus bash/zsh inject when detectable;
+**Was:** OSC 633 sticky-scroll handling plus bash/zsh inject when detectable;
 other shells get passthrough only.
 
-**Proposal:** Extend shell-integration inject for fish (and other shells where
-VS Code/Cursor SI is well-defined), without breaking raw PTY passthrough.
+**Now:** Fish is injected the same way VS Code/Cursor do (`--init-command` to
+`source` `shellIntegration.fish` after config). Bash/zsh unchanged. Other shells
+still get raw PTY passthrough.
 
 ### 14. `reshell ssh …` wrapper (post-v1)
 
@@ -147,8 +148,8 @@ so local session semantics stay clear.
 | Priority | Items                        | Why                                                   |
 | -------- | ---------------------------- | ----------------------------------------------------- |
 | First    | §§1–6 (hardening, CI, tests) | Correctness and maintainability without product drift |
-| Next     | §§7–12 done; §§13+ next  | Low surface area; matches dtach/abduco ergonomics     |
-| Later    | §§13–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
+| Next     | §§7–13 done; §§14+ next  | Low surface area; matches dtach/abduco ergonomics     |
+| Later    | §§14–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
 
 When implementing any item, update user-facing README and/or `design.md` /
 `protocol.md` in the same change if behavior or interfaces change (see workspace

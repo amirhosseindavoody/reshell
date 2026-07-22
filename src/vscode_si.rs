@@ -98,6 +98,18 @@ pub fn prepare_shell_launch(shell_path: &str, session_dir: &Path) -> Result<Shel
                 argv: vec![argv0, interactive],
             })
         }
+        (ShellKind::Fish, Some(script)) => {
+            // VS Code/Cursor inject fish via `--init-command` so SI runs after
+            // config.fish (vendor_conf.d alone can be overwritten by prompts).
+            std::env::set_var("VSCODE_INJECTION", "1");
+            let flag = CString::new("--init-command").unwrap();
+            let cmd = format!("source {}", fish_quote_path(&script));
+            let cmd_c = CString::new(cmd).context("fish init-command contains NUL")?;
+            Ok(ShellLaunch {
+                program,
+                argv: vec![argv0, flag, cmd_c],
+            })
+        }
         _ => Ok(ShellLaunch {
             program,
             argv: vec![argv0],
@@ -109,6 +121,7 @@ pub fn prepare_shell_launch(shell_path: &str, session_dir: &Path) -> Result<Shel
 enum ShellKind {
     Bash,
     Zsh,
+    Fish,
     Other,
 }
 
@@ -117,15 +130,24 @@ fn shell_kind(basename: &str) -> ShellKind {
         ShellKind::Bash
     } else if basename == "zsh" || basename.starts_with("zsh-") {
         ShellKind::Zsh
+    } else if basename == "fish" || basename.starts_with("fish-") {
+        ShellKind::Fish
     } else {
         ShellKind::Other
     }
+}
+
+/// Quote a path for fish so spaces / quotes in the path stay literal.
+fn fish_quote_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    format!("'{}'", s.replace('\'', "\\'"))
 }
 
 fn locate_shell_integration_script(kind: ShellKind) -> Option<PathBuf> {
     let arg = match kind {
         ShellKind::Bash => "bash",
         ShellKind::Zsh => "zsh",
+        ShellKind::Fish => "fish",
         ShellKind::Other => return None,
     };
 
@@ -148,40 +170,27 @@ fn locate_shell_integration_script(kind: ShellKind) -> Option<PathBuf> {
 
     // Fall back to common install layouts when the CLI is not on PATH.
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let mut candidates = Vec::new();
-    match kind {
-        ShellKind::Bash => {
-            candidates.push(home.join(
-                ".vscode-server/bin/*/out/vs/workbench/contrib/terminal/common/scripts/shellIntegration-bash.sh",
-            ));
-        }
-        ShellKind::Zsh => {
-            candidates.push(home.join(
-                ".vscode-server/bin/*/out/vs/workbench/contrib/terminal/common/scripts/shellIntegration-rc.zsh",
-            ));
-        }
-        ShellKind::Other => {}
-    }
-    // Glob manually for vscode-server hashes.
-    let server_bin = home.join(".vscode-server/bin");
-    if let Ok(entries) = fs::read_dir(&server_bin) {
-        for entry in entries.flatten() {
-            let scripts = entry
-                .path()
-                .join("out/vs/workbench/contrib/terminal/common/scripts");
-            let name = match kind {
-                ShellKind::Bash => "shellIntegration-bash.sh",
-                ShellKind::Zsh => "shellIntegration-rc.zsh",
-                ShellKind::Other => continue,
-            };
-            let p = scripts.join(name);
-            if p.is_file() {
-                return Some(p);
+    let script_name = match kind {
+        ShellKind::Bash => "shellIntegration-bash.sh",
+        ShellKind::Zsh => "shellIntegration-rc.zsh",
+        ShellKind::Fish => "shellIntegration.fish",
+        ShellKind::Other => return None,
+    };
+    for server_root in [".vscode-server/bin", ".cursor-server/bin"] {
+        let server_bin = home.join(server_root);
+        if let Ok(entries) = fs::read_dir(&server_bin) {
+            for entry in entries.flatten() {
+                let p = entry
+                    .path()
+                    .join("out/vs/workbench/contrib/terminal/common/scripts")
+                    .join(script_name);
+                if p.is_file() {
+                    return Some(p);
+                }
             }
         }
     }
 
-    let _ = candidates;
     None
 }
 
@@ -243,9 +252,19 @@ mod tests {
     }
 
     #[test]
-    fn shell_kind_detects_bash_zsh() {
+    fn shell_kind_detects_bash_zsh_fish() {
         assert_eq!(shell_kind("bash"), ShellKind::Bash);
         assert_eq!(shell_kind("zsh"), ShellKind::Zsh);
-        assert_eq!(shell_kind("fish"), ShellKind::Other);
+        assert_eq!(shell_kind("fish"), ShellKind::Fish);
+        assert_eq!(shell_kind("fish-3.7"), ShellKind::Fish);
+        assert_eq!(shell_kind("dash"), ShellKind::Other);
+    }
+
+    #[test]
+    fn fish_quote_escapes_single_quotes() {
+        assert_eq!(
+            fish_quote_path(Path::new("/tmp/it's fish.fish")),
+            "'/tmp/it\\'s fish.fish'"
+        );
     }
 }

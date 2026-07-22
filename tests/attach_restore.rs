@@ -52,6 +52,42 @@ fn reattach_restores_mouse_and_alt_screen() {
 }
 
 #[test]
+fn reattach_restores_window_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+
+    new_detached(base, "title");
+    let sock = wait_sock(base, "title");
+
+    {
+        let mut stream = UnixStream::connect(&sock).expect("connect");
+        attach_winsize(&mut stream, 24, 80);
+        std::thread::sleep(Duration::from_millis(50));
+        write_msg(
+            &mut stream,
+            1,
+            b"printf '\\033]0;reshell-title-demo\\007'\n",
+        );
+        let _ = collect_data(&mut stream, Instant::now() + Duration::from_secs(2));
+        write_msg(&mut stream, 3, &[]);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let mut stream = UnixStream::connect(&sock).expect("reconnect");
+    attach_winsize(&mut stream, 24, 80);
+    let data = collect_data(&mut stream, Instant::now() + Duration::from_secs(3));
+    assert!(
+        data.windows(23)
+            .any(|w| w == b"\x1b]0;reshell-title-demo\x07"),
+        "expected OSC title restore in {:?}",
+        String::from_utf8_lossy(&data)
+    );
+
+    write_msg(&mut stream, 3, &[]);
+    kill_session(base, "title");
+}
+
+#[test]
 fn reattach_two_phase_winsize_for_full_paint() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
