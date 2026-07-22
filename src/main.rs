@@ -72,7 +72,7 @@ enum Commands {
         name: Option<String>,
     },
     /// List running sessions
-    #[command(visible_alias = "l")]
+    #[command(visible_alias = "ls")]
     List {
         /// Machine-readable JSON (stable fields for scripts)
         #[arg(long)]
@@ -114,9 +114,15 @@ enum Commands {
     /// Terminate a session and its shell
     #[command(visible_alias = "k")]
     Kill {
-        /// Session name
-        #[arg(add = ArgValueCompleter::new(complete_session_name))]
-        name: String,
+        /// Session name (required unless `--all`)
+        #[arg(
+            add = ArgValueCompleter::new(complete_session_name),
+            required_unless_present = "all"
+        )]
+        name: Option<String>,
+        /// Kill all live sessions
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
     },
     /// Print shell completion script to stdout
     Completion {
@@ -140,9 +146,11 @@ fn main() {
 }
 
 /// Clap command used only for dynamic completion: hide option flags so they
-/// are not offered on Tab (still documented via the real CLI's `--help`).
+/// are not offered on Tab (still documented via the real CLI's `--help`), and
+/// present subcommands as long names with short aliases in the description
+/// (e.g. value `new`, help `(n)` → shells show `new (n)`).
 fn cli_for_completion() -> clap::Command {
-    hide_option_flags(Cli::command())
+    rewrite_subcommands_for_completion(hide_option_flags(Cli::command()))
 }
 
 fn hide_option_flags(cmd: clap::Command) -> clap::Command {
@@ -156,6 +164,55 @@ fn hide_option_flags(cmd: clap::Command) -> clap::Command {
     .disable_help_flag(true)
     .disable_version_flag(true)
     .mut_subcommands(hide_option_flags)
+}
+
+/// Prefer long subcommand names in Tab completion, with short aliases shown in
+/// the candidate help (zsh/fish descriptions). Rebuilds each subcommand so
+/// visible aliases become hidden — otherwise clap_complete's id-dedup keeps
+/// whichever of `new`/`n` sorts first alphabetically (often just `n`).
+fn rewrite_subcommands_for_completion(cmd: clap::Command) -> clap::Command {
+    cmd.mut_subcommands(rewrite_subcommand_for_completion)
+}
+
+fn rewrite_subcommand_for_completion(sc: clap::Command) -> clap::Command {
+    let visible: Vec<String> = sc.get_visible_aliases().map(|s| s.to_string()).collect();
+    if visible.is_empty() {
+        return sc.mut_subcommands(rewrite_subcommand_for_completion);
+    }
+
+    let name = sc.get_name().to_string();
+    let alias_note = visible.join(", ");
+    let about = match sc.get_about().map(|a| a.to_string()) {
+        Some(a) if !a.is_empty() => format!("({alias_note}) {a}"),
+        _ => format!("({alias_note})"),
+    };
+    let all_aliases: Vec<String> = sc.get_all_aliases().map(|s| s.to_string()).collect();
+
+    // clap::builder::Str accepts &'static str; completion runs in a short-lived
+    // COMPLETE= process, so leaking a few small strings is fine.
+    let name: &'static str = Box::leak(name.into_boxed_str());
+    let all_aliases: Vec<&'static str> = all_aliases
+        .into_iter()
+        .map(|s| &*Box::leak(s.into_boxed_str()))
+        .collect();
+
+    let mut out = clap::Command::new(name)
+        .about(about)
+        .aliases(all_aliases)
+        .display_order(sc.get_display_order());
+    if let Some(long) = sc.get_long_about() {
+        out = out.long_about(long.clone());
+    }
+    if sc.is_hide_set() {
+        out = out.hide(true);
+    }
+    for arg in sc.get_arguments() {
+        out = out.arg(arg.clone());
+    }
+    for sub in sc.get_subcommands() {
+        out = out.subcommand(rewrite_subcommand_for_completion(sub.clone()));
+    }
+    hide_option_flags(out)
 }
 
 fn run() -> Result<()> {
@@ -201,9 +258,21 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Commands::Kill { name } => {
-            session::kill_session(&base, &name)?;
-            println!("killed {name}");
+        Commands::Kill { name, all } => {
+            if all {
+                let killed = session::kill_all_sessions(&base)?;
+                if killed.is_empty() {
+                    println!("(no sessions)");
+                } else {
+                    for name in &killed {
+                        println!("killed {name}");
+                    }
+                }
+            } else {
+                let name = name.expect("clap requires name unless --all");
+                session::kill_session(&base, &name)?;
+                println!("killed {name}");
+            }
             Ok(())
         }
         Commands::Completion { .. } => unreachable!("handled above"),
@@ -362,8 +431,8 @@ fn cmd_list(base: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20} {:>8} {:<10} {:<16} SHELL",
-        "NAME", "PID", "STATE", "CREATED"
+        "{:<20} {:>8} {:<10} {:<16} {:<16} SHELL",
+        "NAME", "PID", "STATE", "CREATED", "LAST ACTIVE"
     );
     for (meta, _) in sessions {
         let state = if meta.attached {
@@ -372,9 +441,10 @@ fn cmd_list(base: &Path, json: bool) -> Result<()> {
             "detached"
         };
         let created = format_time_human(meta.created_unix);
+        let last_active = format_time_human(session::session_activity(&meta));
         println!(
-            "{:<20} {:>8} {:<10} {:<16} {}",
-            meta.name, meta.pid, state, created, meta.shell
+            "{:<20} {:>8} {:<10} {:<16} {:<16} {}",
+            meta.name, meta.pid, state, created, last_active, meta.shell
         );
     }
     Ok(())

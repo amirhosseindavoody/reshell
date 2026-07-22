@@ -50,7 +50,7 @@ Single crate; binary name `reshell`.
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`l`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab); detach-key + log + scrollback flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`ls`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab; subcommand Tab shows long name + `(alias)` description); detach-key + log + scrollback flags; default shell `/bin/zsh` |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O, context fetch |
@@ -87,7 +87,8 @@ Auto-generated names look like `session-{unix_secs}-{4 hex digits}` so concurren
 available explicitly as `reshell clean`). It recovers a leftover `attached` file
 when nobody holds the advisory flock (e.g. after a crashed daemon), and removes
 orphan session dirs that lack `meta.json`.
-`list` shows relative times by default (`2h ago`); `list --json` is stable for scripts.
+`list` shows relative created and last-active times by default (`2h ago`);
+`list --json` is stable for scripts (includes `created_unix` / `last_active_unix`).
 `info` prints pid, shell, state, timestamps, and all session paths (`info --json` too).
 `context` prints the last known command (OSC 633 when present) and ~100 lines of
 primary-screen output via a short-lived `ContextReq` (no attach lock, not replayed
@@ -98,6 +99,7 @@ recently active session.
 daemon keeps a directory fd open so meta/lock/log writes survive the move; the
 Unix socket path moves with the directory.
 `kill` sends `SIGTERM` (then `SIGKILL`) to the daemon pid and deletes the session dir.
+`kill --all` terminates every live session under the session base dir.
 Attach/kill failures include concrete reasons (dead pid, lock held, socket missing, …).
 
 Override the daemon log path with `--log` / `RESHELL_LOG` (fatal errors are written
@@ -270,7 +272,8 @@ conda Rust toolchain is used, not an older system rustup.
   reattach observes restored CSI modes; SIGWINCH reporter confirms temporary then
   final winsize (two-phase full paint for differential TUIs).
 - Integration (`tests/attach_race.rs`): concurrent attach (one survivor), stale
-  `attached` recovery, kill missing-session errors, auto-name uniqueness, daemon log.
+  `attached` recovery, kill / `kill --all`, missing-session errors, auto-name
+  uniqueness, daemon log.
 - Shared framing helpers live in `tests/common/` so integration tests stay DRY.
 
 Attach’s TTY path is exercised manually or via an external PTY driver; the smoke

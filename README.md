@@ -69,13 +69,13 @@ reshell --scrollback 1M new demo --detach
 
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
-# or: reshell a demo       # short aliases: n/a/l/i/c/r/k
+# or: reshell a demo       # short aliases: n/a/ls/i/c/r/k
 # or: reshell attach       # most recently active (or new if none)
 # or: reshell --detach-key '^a' attach demo
 
-# List sessions (relative times; --json for scripts)
+# List sessions (created + last-active relative times; --json for scripts)
 reshell list
-reshell l --json
+reshell ls --json
 
 # Session details (paths, pid, state, …)
 reshell info demo
@@ -95,9 +95,10 @@ reshell clean
 # Kill a session
 reshell kill demo
 # or: reshell k demo
+# or: reshell kill --all   # terminate every live session
 ```
 
-Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `l` list, `i` info, `c` context, `r` rename, `k` kill.
+Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.
 
 ### Shell completion
 
@@ -116,8 +117,10 @@ To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, 
 
 Completions call back into `reshell` at tab time, so `attach` suggests
 **detachable** session names only, while `info` / `context` / `kill` / `rename`
-suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). Option flags
-(`--dir`, `--scrollback`, …) are not offered on Tab — use `--help` for those.
+suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). After `reshell`,
+Tab lists long subcommand names (and short aliases in the description where the
+shell shows them — e.g. `new (n)`). Option flags (`--dir`, `--scrollback`, …)
+are not offered on Tab — use `--help` for those.
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 

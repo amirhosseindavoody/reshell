@@ -19,6 +19,10 @@ fn list_json_and_human_times() {
     let txt = String::from_utf8_lossy(&human.stdout);
     assert!(txt.contains("listed"));
     assert!(
+        txt.contains("LAST ACTIVE"),
+        "expected LAST ACTIVE column in list: {txt}"
+    );
+    assert!(
         txt.contains("ago") || txt.contains("s ago") || txt.contains("m ago"),
         "expected relative time in list: {txt}"
     );
@@ -32,6 +36,7 @@ fn list_json_and_human_times() {
     assert!(txt.contains("\"name\": \"listed\""), "{txt}");
     assert!(txt.contains("\"attached\": false"), "{txt}");
     assert!(txt.contains("\"pid\":"), "{txt}");
+    assert!(txt.contains("\"last_active_unix\":"), "{txt}");
 
     kill_session(base, "listed");
 }
@@ -143,6 +148,8 @@ fn info_inside_session_survives_rename() {
         "expected RESHELL_SESSION=before before rename, got: {:?}",
         String::from_utf8_lossy(&pre)
     );
+    // Let the daemon finish AttachLock drop / meta write before rename races it.
+    std::thread::sleep(Duration::from_millis(100));
 
     let renamed = Command::new(reshell_bin())
         .args([
@@ -257,7 +264,9 @@ fn short_subcommand_aliases_work() {
         .unwrap();
     let help_txt = String::from_utf8_lossy(&help.stdout);
     assert!(
-        help_txt.contains("[alias: a]") && help_txt.contains("[alias: i]"),
+        help_txt.contains("[alias: a]")
+            && help_txt.contains("[alias: ls]")
+            && help_txt.contains("[alias: i]"),
         "expected visible short aliases in help: {help_txt}"
     );
 
@@ -269,7 +278,7 @@ fn short_subcommand_aliases_work() {
     assert!(String::from_utf8_lossy(&info.stdout).contains("name:        alias-me"));
 
     let list = Command::new(reshell_bin())
-        .args(["--dir", base.to_str().unwrap(), "l", "--json"])
+        .args(["--dir", base.to_str().unwrap(), "ls", "--json"])
         .output()
         .unwrap();
     assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
@@ -432,10 +441,35 @@ fn completion_omits_option_flags() {
         .unwrap();
     assert!(root.status.success(), "{}", String::from_utf8_lossy(&root.stderr));
     let txt = String::from_utf8_lossy(&root.stdout);
-    assert!(txt.contains("attach") || txt.contains("a"), "missing subcommands: {txt:?}");
+    assert!(txt.contains("attach"), "missing long subcommands: {txt:?}");
+    assert!(txt.contains("new"), "missing new: {txt:?}");
+    assert!(txt.contains("list"), "missing list: {txt:?}");
+    // Short aliases must not replace the long names in the candidate list.
+    assert!(
+        !txt.lines().any(|l| l == "n" || l == "a" || l == "k"),
+        "short aliases should not be primary candidates: {txt:?}"
+    );
     assert!(!txt.contains("--dir"), "flags should not complete: {txt:?}");
     assert!(!txt.contains("--scrollback"), "flags should not complete: {txt:?}");
     assert!(!txt.contains("--help"), "flags should not complete: {txt:?}");
+
+    // zsh/fish show the short alias in the description: `new` + `(n) …`
+    let zsh = Command::new(&bin)
+        .env("COMPLETE", "zsh")
+        .env("_CLAP_COMPLETE_INDEX", "1")
+        .args(["--", "reshell", ""])
+        .output()
+        .unwrap();
+    assert!(zsh.status.success(), "{}", String::from_utf8_lossy(&zsh.stderr));
+    let zsh_txt = String::from_utf8_lossy(&zsh.stdout);
+    assert!(
+        zsh_txt.contains("new:(n)") || zsh_txt.contains("new:(n) "),
+        "expected long name with (alias) description: {zsh_txt:?}"
+    );
+    assert!(
+        zsh_txt.contains("list:(ls)") || zsh_txt.contains("list:(ls) "),
+        "expected list:(ls) description: {zsh_txt:?}"
+    );
 
     // Help still documents the flags.
     let help = Command::new(&bin).args(["--help"]).output().unwrap();
