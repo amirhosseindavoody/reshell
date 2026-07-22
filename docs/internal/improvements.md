@@ -115,7 +115,16 @@ suffixes `K`/`M`). On attach, history is replayed as `Data` after DEC mode
 restore + clear, then the usual two-phase winsize. Not a VT screen buffer —
 TUIs still redraw. Append-only file logging remains a possible later add-on.
 
-### 12. Broader VS Code / Cursor shell integration
+### 12. `reshell context` — done
+
+**Now:** `reshell context [name]` asks the daemon for a read-only snapshot: last
+OSC 633 command (when shell integration markers are present), exit code, and the
+last ~100 lines of primary-screen output. Uses `ContextReq` / `ContextRes` and
+does not take the attach lock or replay into the live PTY. Line capture pauses
+while the alternate screen is active. Name omitted → current session when inside
+one, else most recently active.
+
+### 13. Broader VS Code / Cursor shell integration
 
 **Today:** OSC 633 sticky-scroll handling plus bash/zsh inject when detectable;
 other shells get passthrough only.
@@ -123,7 +132,7 @@ other shells get passthrough only.
 **Proposal:** Extend shell-integration inject for fish (and other shells where
 VS Code/Cursor SI is well-defined), without breaking raw PTY passthrough.
 
-### 13. `reshell ssh …` wrapper (post-v1)
+### 14. `reshell ssh …` wrapper (post-v1)
 
 **Today:** Explicit non-goal — no transparent SSH wrap.
 
@@ -138,8 +147,8 @@ so local session semantics stay clear.
 | Priority | Items                        | Why                                                   |
 | -------- | ---------------------------- | ----------------------------------------------------- |
 | First    | §§1–6 (hardening, CI, tests) | Correctness and maintainability without product drift |
-| Next     | §§7–11 done; §§12+ next  | Low surface area; matches dtach/abduco ergonomics     |
-| Later    | §§12–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
+| Next     | §§7–12 done; §§13+ next  | Low surface area; matches dtach/abduco ergonomics     |
+| Later    | §§13–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
 
 When implementing any item, update user-facing README and/or `design.md` /
 `protocol.md` in the same change if behavior or interfaces change (see workspace
