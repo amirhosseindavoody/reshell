@@ -117,8 +117,10 @@ To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, 
 
 Completions call back into `reshell` at tab time, so `attach` suggests
 **detachable** session names only, while `info` / `context` / `kill` / `rename`
-suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). Option flags
-(`--dir`, `--scrollback`, …) are not offered on Tab — use `--help` for those.
+suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). After `reshell`,
+Tab lists long subcommand names (and short aliases in the description where the
+shell shows them — e.g. `new (n)`). Option flags (`--dir`, `--scrollback`, …)
+are not offered on Tab — use `--help` for those.
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
