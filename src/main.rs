@@ -68,7 +68,7 @@ enum Commands {
     #[command(visible_alias = "a")]
     Attach {
         /// Session name (defaults to the most recently active session)
-        #[arg(add = ArgValueCompleter::new(complete_session_name))]
+        #[arg(add = ArgValueCompleter::new(complete_attachable_session_name))]
         name: Option<String>,
     },
     /// List running sessions
@@ -127,7 +127,9 @@ enum Commands {
 
 fn main() {
     // Dynamic completions (session names, etc.) — must run before any stdout.
-    CompleteEnv::with_factory(Cli::command)
+    // Use a command tree with flags marked hidden so tab completion suggests
+    // subcommands / session names only; flags stay in `--help`.
+    CompleteEnv::with_factory(cli_for_completion)
         .bin("reshell")
         .complete();
 
@@ -135,6 +137,25 @@ fn main() {
         eprintln!("reshell: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Clap command used only for dynamic completion: hide option flags so they
+/// are not offered on Tab (still documented via the real CLI's `--help`).
+fn cli_for_completion() -> clap::Command {
+    hide_option_flags(Cli::command())
+}
+
+fn hide_option_flags(cmd: clap::Command) -> clap::Command {
+    cmd.mut_args(|arg| {
+        if arg.is_positional() {
+            arg
+        } else {
+            arg.hide(true)
+        }
+    })
+    .disable_help_flag(true)
+    .disable_version_flag(true)
+    .mut_subcommands(hide_option_flags)
 }
 
 fn run() -> Result<()> {
@@ -199,7 +220,7 @@ fn print_completion_registration(shell: Shell) -> Result<()> {
         std::env::set_var("COMPLETE", shell.to_string());
     }
     let current_dir = std::env::current_dir().ok();
-    let done = CompleteEnv::with_factory(Cli::command)
+    let done = CompleteEnv::with_factory(cli_for_completion)
         .bin("reshell")
         .try_complete([argv0], current_dir.as_deref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -209,8 +230,17 @@ fn print_completion_registration(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-/// Tab-complete live session names for `attach` / `info` / `context` / `kill` / `rename`.
+/// Tab-complete live session names for `info` / `context` / `kill` / `rename`.
 fn complete_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
+    complete_sessions(current, /*attachable_only=*/ false)
+}
+
+/// Tab-complete sessions that can be attached (live and not already attached).
+fn complete_attachable_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
+    complete_sessions(current, /*attachable_only=*/ true)
+}
+
+fn complete_sessions(current: &OsStr, attachable_only: bool) -> Vec<CompletionCandidate> {
     let Some(current) = current.to_str() else {
         return Vec::new();
     };
@@ -220,7 +250,10 @@ fn complete_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
     };
     sessions
         .into_iter()
-        .filter(|(meta, _)| meta.name.starts_with(current))
+        .filter(|(meta, paths)| {
+            meta.name.starts_with(current)
+                && (!attachable_only || !session::is_attached(paths))
+        })
         .map(|(meta, _)| CompletionCandidate::new(meta.name))
         .collect()
 }

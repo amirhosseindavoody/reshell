@@ -2,13 +2,17 @@
 //!
 //! Parses DEC private mode set/reset (and a few related CSI sequences) from PTY
 //! output so that on attach we can re-enable mouse, alt-screen, etc. on the new
-//! client TTY. This is not a full VT emulator — screen contents are not stored;
-//! the child is expected to redraw after a forced `SIGWINCH`.
+//! client TTY. Also tracks the last OSC 0/2 window title so reattach can restore
+//! it. This is not a full VT emulator — screen contents are not stored; the
+//! child is expected to redraw after a forced `SIGWINCH`.
 
 use std::collections::BTreeMap;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
+
+/// Cap OSC body accumulation so a runaway sequence cannot grow forever.
+const OSC_BODY_MAX: usize = 4096;
 
 /// Modes we always try to leave clean on the local TTY when the client exits.
 const CLIENT_CLEANUP_MODES: &[u16] = &[
@@ -20,10 +24,12 @@ const CLIENT_CLEANUP_MODES: &[u16] = &[
 pub struct TermState {
     /// Explicitly observed DEC private modes (`CSI ? Pn h/l`).
     modes: BTreeMap<u16, bool>,
+    /// Last window title from OSC 0 or OSC 2 (icon-only OSC 1 is ignored).
+    title: Option<String>,
     parser: Parser,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum Parser {
     #[default]
     Ground,
@@ -34,7 +40,9 @@ enum Parser {
         params: Params,
         intermediate: u8,
     },
-    /// OSC / DCS / PM / APC: skip until BEL or ST (`ESC \`).
+    /// OSC (`ESC ]`): accumulate body until BEL or ST (`ESC \`).
+    Osc { body: Vec<u8>, esc: bool },
+    /// DCS / PM / APC: skip until BEL or ST (`ESC \`).
     StringSeq { esc: bool },
 }
 
@@ -109,7 +117,13 @@ impl TermState {
                         intermediate: 0,
                     };
                 }
-                b']' | b'P' | b'_' | b'^' => {
+                b']' => {
+                    self.parser = Parser::Osc {
+                        body: Vec::new(),
+                        esc: false,
+                    };
+                }
+                b'P' | b'_' | b'^' => {
                     self.parser = Parser::StringSeq { esc: false };
                 }
                 _ => {
@@ -144,6 +158,40 @@ impl TermState {
                         // Cancelled / malformed.
                         self.parser = Parser::Ground;
                     }
+                }
+            }
+            Parser::Osc { .. } => {
+                // Take ownership so we can finish the OSC without fighting the
+                // borrow of `self.parser`.
+                let Parser::Osc { mut body, esc } =
+                    std::mem::replace(&mut self.parser, Parser::Ground)
+                else {
+                    unreachable!();
+                };
+                let mut finished: Option<Vec<u8>> = None;
+                if esc {
+                    if b == b'\\' {
+                        finished = Some(body);
+                    } else if b == ESC {
+                        self.parser = Parser::Osc { body, esc: true };
+                    } else {
+                        if body.len() < OSC_BODY_MAX {
+                            body.push(b);
+                        }
+                        self.parser = Parser::Osc { body, esc: false };
+                    }
+                } else if b == BEL {
+                    finished = Some(body);
+                } else if b == ESC {
+                    self.parser = Parser::Osc { body, esc: true };
+                } else {
+                    if body.len() < OSC_BODY_MAX {
+                        body.push(b);
+                    }
+                    self.parser = Parser::Osc { body, esc };
+                }
+                if let Some(osc) = finished {
+                    self.handle_osc(&osc);
                 }
             }
             Parser::StringSeq { ref mut esc } => {
@@ -190,12 +238,19 @@ impl TermState {
         }
     }
 
-    /// CSI sequences to replay onto a freshly attached client TTY.
-    pub fn restore_sequence(&self) -> Vec<u8> {
-        if self.modes.is_empty() {
-            return Vec::new();
+    /// OSC 0 and OSC 2 set the window/tab title; OSC 1 (icon) is ignored.
+    fn handle_osc(&mut self, body: &[u8]) {
+        let Some(semi) = body.iter().position(|&b| b == b';') else {
+            return;
+        };
+        let code = &body[..semi];
+        if code == b"0" || code == b"2" {
+            self.title = Some(String::from_utf8_lossy(&body[semi + 1..]).into_owned());
         }
+    }
 
+    /// CSI / OSC sequences to replay onto a freshly attached client TTY.
+    pub fn restore_sequence(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         // Prefer a known-good order: alt-screen first, then cursor, mouse, paste/focus, rest.
         const PRIORITY: &[u16] = &[
@@ -214,6 +269,11 @@ impl TermState {
             if !emitted.contains(&mode) {
                 push_dec_mode(&mut out, mode, on);
             }
+        }
+        if let Some(ref title) = self.title {
+            out.extend_from_slice(b"\x1b]0;");
+            out.extend_from_slice(title.as_bytes());
+            out.push(BEL);
         }
         out
     }
@@ -285,11 +345,35 @@ mod tests {
     }
 
     #[test]
-    fn ignores_osc_and_plain_text() {
+    fn tracks_window_title_from_osc() {
         let mut s = TermState::new();
-        s.feed(b"hello\x1b]0;title\x07world\x1b[?2004h");
+        s.feed(b"hello\x1b]0;my-session\x07world\x1b[?2004h");
         assert_eq!(s.mode(2004), Some(true));
-        assert_eq!(s.mode(1000), None);
+        assert_eq!(s.title.as_deref(), Some("my-session"));
+        let restore = s.restore_sequence();
+        assert!(
+            restore.windows(15).any(|w| w == b"\x1b]0;my-session\x07"),
+            "expected title in restore: {:?}",
+            String::from_utf8_lossy(&restore)
+        );
+    }
+
+    #[test]
+    fn osc_2_title_and_st_terminator() {
+        let mut s = TermState::new();
+        s.feed(b"\x1b]2;tab-title\x1b\\");
+        assert_eq!(s.title.as_deref(), Some("tab-title"));
+        // OSC 1 (icon name) should not overwrite the window title.
+        s.feed(b"\x1b]1;icon-only\x07");
+        assert_eq!(s.title.as_deref(), Some("tab-title"));
+    }
+
+    #[test]
+    fn title_alone_still_restores() {
+        let mut s = TermState::new();
+        s.feed(b"\x1b]0;only-title\x07");
+        let restore = s.restore_sequence();
+        assert_eq!(restore, b"\x1b]0;only-title\x07");
     }
 
     #[test]

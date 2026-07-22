@@ -8,8 +8,8 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
 - Explicit sessions: `new` / `attach` / `list` / `info` / `context` / `kill`
 - Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
-- Reattach restores TUI terminal modes (mouse, alt-screen, …) and forces a redraw
-- VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session
+- Reattach restores TUI terminal modes (mouse, alt-screen, …), the window/tab title, and forces a redraw
+- VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session (bash, zsh, fish)
 - Targeted at SSH sessions into Linux servers
 - Defaults to **zsh** (`/bin/zsh`); override with `--shell` for bash, fish, etc.
 
@@ -114,7 +114,10 @@ reshell completion fish | source
 
 To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
 
-Completions call back into `reshell` at tab time, so `attach` / `info` / `kill` / `rename` suggest live session names (honoring `--dir` / `RESHELL_DIR`).
+Completions call back into `reshell` at tab time, so `attach` suggests
+**detachable** session names only, while `info` / `context` / `kill` / `rename`
+suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). Option flags
+(`--dir`, `--scrollback`, …) are not offered on Tab — use `--help` for those.
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 

@@ -363,6 +363,92 @@ fn attach_completion_lists_session_names() {
 }
 
 #[test]
+fn attach_completion_skips_already_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "free");
+    new_detached(base, "busy");
+
+    // Keep a live attach client on `busy` so it is not attachable.
+    let sock = wait_sock(base, "busy");
+    let mut busy = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    attach_winsize(&mut busy, 24, 80);
+    std::thread::sleep(Duration::from_millis(80));
+
+    let bin = reshell_bin();
+    let out = Command::new(&bin)
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "4")
+        .args([
+            "--",
+            "reshell",
+            "--dir",
+            base.to_str().unwrap(),
+            "attach",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let txt = String::from_utf8_lossy(&out.stdout);
+    assert!(txt.contains("free"), "attachable session missing: {txt:?}");
+    assert!(
+        !txt.contains("busy"),
+        "already-attached session should not complete: {txt:?}"
+    );
+
+    // kill/info still complete attached sessions.
+    let kill_out = Command::new(&bin)
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "4")
+        .args([
+            "--",
+            "reshell",
+            "--dir",
+            base.to_str().unwrap(),
+            "kill",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(kill_out.status.success());
+    let kill_txt = String::from_utf8_lossy(&kill_out.stdout);
+    assert!(kill_txt.contains("busy"), "kill should list attached: {kill_txt:?}");
+    assert!(kill_txt.contains("free"), "kill should list detached: {kill_txt:?}");
+
+    drop(busy);
+    kill_session(base, "free");
+    kill_session(base, "busy");
+}
+
+#[test]
+fn completion_omits_option_flags() {
+    let bin = reshell_bin();
+    let root = Command::new(&bin)
+        .env("COMPLETE", "bash")
+        .env("_CLAP_COMPLETE_INDEX", "1")
+        .args(["--", "reshell", ""])
+        .output()
+        .unwrap();
+    assert!(root.status.success(), "{}", String::from_utf8_lossy(&root.stderr));
+    let txt = String::from_utf8_lossy(&root.stdout);
+    assert!(txt.contains("attach") || txt.contains("a"), "missing subcommands: {txt:?}");
+    assert!(!txt.contains("--dir"), "flags should not complete: {txt:?}");
+    assert!(!txt.contains("--scrollback"), "flags should not complete: {txt:?}");
+    assert!(!txt.contains("--help"), "flags should not complete: {txt:?}");
+
+    // Help still documents the flags.
+    let help = Command::new(&bin).args(["--help"]).output().unwrap();
+    assert!(help.status.success());
+    let help_txt = String::from_utf8_lossy(&help.stdout);
+    assert!(help_txt.contains("--dir"), "help missing --dir: {help_txt}");
+    assert!(
+        help_txt.contains("--scrollback"),
+        "help missing --scrollback: {help_txt}"
+    );
+}
+
+#[test]
 fn scrollback_flag_is_validated() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();

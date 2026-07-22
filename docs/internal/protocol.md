@@ -39,7 +39,7 @@ Little-endian:
 
 | Message | Server action |
 |---------|---------------|
-| `Attach` | Replay tracked DEC private modes to the client as `Data`, clear the local screen, optionally replay detached scrollback as further `Data`, apply a temporary winsize so differential TUIs full-paint, then restore the real winsize shortly after. PTY forwarding starts only after this message. |
+| `Attach` | Replay tracked DEC private modes and the last OSC 0/2 window title to the client as `Data`, clear the local screen, optionally replay detached scrollback as further `Data`, apply a temporary winsize so differential TUIs full-paint, then restore the real winsize shortly after. PTY forwarding starts only after this message. |
 | `Resize` | Apply size with `TIOCSWINSZ` only (normal live resize). |
 
 ## Client conventions
@@ -61,7 +61,8 @@ Little-endian:
 - `ContextReq` is classified from the first framed message on accept and answered
   with `ContextRes` **without** taking the attach lock (works while attached).
 - After `Detach` or client EOF/error, clear the attach lock and keep the shell.
-- Track DEC private modes from all PTY output (even while detached).
+- Track DEC private modes and the last OSC 0/2 window title from all PTY output
+  (even while detached).
 - Keep a rolling primary-screen line history (~100 lines) plus last OSC 633
   command markers for `reshell context` (independent of attach-replay scrollback).
 - When `--scrollback` / `RESHELL_SCROLLBACK` is set at session create, keep a
