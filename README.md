@@ -73,7 +73,7 @@ reshell attach demo
 # or: reshell attach       # most recently active (or new if none)
 # or: reshell --detach-key '^a' attach demo
 
-# List sessions (relative times; --json for scripts)
+# List sessions (created + last-active relative times; --json for scripts)
 reshell list
 reshell ls --json
 

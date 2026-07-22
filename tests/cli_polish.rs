@@ -19,6 +19,10 @@ fn list_json_and_human_times() {
     let txt = String::from_utf8_lossy(&human.stdout);
     assert!(txt.contains("listed"));
     assert!(
+        txt.contains("LAST ACTIVE"),
+        "expected LAST ACTIVE column in list: {txt}"
+    );
+    assert!(
         txt.contains("ago") || txt.contains("s ago") || txt.contains("m ago"),
         "expected relative time in list: {txt}"
     );
@@ -32,6 +36,7 @@ fn list_json_and_human_times() {
     assert!(txt.contains("\"name\": \"listed\""), "{txt}");
     assert!(txt.contains("\"attached\": false"), "{txt}");
     assert!(txt.contains("\"pid\":"), "{txt}");
+    assert!(txt.contains("\"last_active_unix\":"), "{txt}");
 
     kill_session(base, "listed");
 }

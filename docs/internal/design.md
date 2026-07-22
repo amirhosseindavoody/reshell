@@ -87,7 +87,8 @@ Auto-generated names look like `session-{unix_secs}-{4 hex digits}` so concurren
 available explicitly as `reshell clean`). It recovers a leftover `attached` file
 when nobody holds the advisory flock (e.g. after a crashed daemon), and removes
 orphan session dirs that lack `meta.json`.
-`list` shows relative times by default (`2h ago`); `list --json` is stable for scripts.
+`list` shows relative created and last-active times by default (`2h ago`);
+`list --json` is stable for scripts (includes `created_unix` / `last_active_unix`).
 `info` prints pid, shell, state, timestamps, and all session paths (`info --json` too).
 `context` prints the last known command (OSC 633 when present) and ~100 lines of
 primary-screen output via a short-lived `ContextReq` (no attach lock, not replayed

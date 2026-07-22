@@ -380,8 +380,8 @@ fn cmd_list(base: &Path, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20} {:>8} {:<10} {:<16} SHELL",
-        "NAME", "PID", "STATE", "CREATED"
+        "{:<20} {:>8} {:<10} {:<16} {:<16} SHELL",
+        "NAME", "PID", "STATE", "CREATED", "LAST ACTIVE"
     );
     for (meta, _) in sessions {
         let state = if meta.attached {
@@ -390,9 +390,10 @@ fn cmd_list(base: &Path, json: bool) -> Result<()> {
             "detached"
         };
         let created = format_time_human(meta.created_unix);
+        let last_active = format_time_human(session::session_activity(&meta));
         println!(
-            "{:<20} {:>8} {:<10} {:<16} {}",
-            meta.name, meta.pid, state, created, meta.shell
+            "{:<20} {:>8} {:<10} {:<16} {:<16} {}",
+            meta.name, meta.pid, state, created, last_active, meta.shell
         );
     }
     Ok(())
