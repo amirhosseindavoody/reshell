@@ -1,4 +1,5 @@
 mod client;
+mod context;
 mod protocol;
 mod scrollback;
 mod server;
@@ -84,6 +85,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Show recent shell context (last command + trailing output)
+    Context {
+        /// Session name (defaults to the current session when inside one,
+        /// otherwise the most recently active session)
+        #[arg(add = ArgValueCompleter::new(complete_session_name))]
+        name: Option<String>,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Rename a live session
     Rename {
         /// Current session name
@@ -147,6 +158,7 @@ fn run() -> Result<()> {
         Commands::Attach { name } => cmd_attach(&base, name, log, detach_key, scrollback),
         Commands::List { json } => cmd_list(&base, json),
         Commands::Info { name, json } => cmd_info(&base, name, json),
+        Commands::Context { name, json } => cmd_context(&base, name, json),
         Commands::Rename { old_name, new_name } => {
             session::rename_session(&base, &old_name, &new_name)?;
             println!("renamed {old_name} → {new_name}");
@@ -190,7 +202,7 @@ fn print_completion_registration(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-/// Tab-complete live session names for `attach` / `info` / `kill` / `rename`.
+/// Tab-complete live session names for `attach` / `info` / `context` / `kill` / `rename`.
 fn complete_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(current) = current.to_str() else {
         return Vec::new();
@@ -328,14 +340,18 @@ fn cmd_list(base: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
-    let name = match name {
-        Some(n) => n,
+fn resolve_session_name(base: &Path, name: Option<String>) -> Result<String> {
+    match name {
+        Some(n) => Ok(n),
         None => match session::current_session(base)? {
-            Some(meta) => meta.name,
-            None => session::most_recent_session(base)?.name,
+            Some(meta) => Ok(meta.name),
+            None => Ok(session::most_recent_session(base)?.name),
         },
-    };
+    }
+}
+
+fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
+    let name = resolve_session_name(base, name)?;
     let (meta, paths) = session::session_info(base, &name)?;
     if json {
         println!(
@@ -373,6 +389,31 @@ fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
     println!("meta:        {}", paths.meta.display());
     println!("attach_lock: {}", paths.attach_lock.display());
     println!("daemon_log:  {}", paths.daemon_log.display());
+    Ok(())
+}
+
+fn cmd_context(base: &Path, name: Option<String>, json: bool) -> Result<()> {
+    let name = resolve_session_name(base, name)?;
+    let snap = client::fetch_context(base, &name)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snap)?);
+        return Ok(());
+    }
+    println!("session: {}", snap.name);
+    match &snap.last_command {
+        Some(cmd) => match snap.last_exit_code {
+            Some(code) => println!("last_command: {cmd}  (exit {code})"),
+            None => println!("last_command: {cmd}"),
+        },
+        None => println!("last_command: (unknown)"),
+    }
+    if snap.alt_screen {
+        println!("note: session is in a full-screen app; showing shell history from before it");
+    }
+    println!("--- output (last {} lines) ---", snap.lines.len());
+    for line in &snap.lines {
+        println!("{line}");
+    }
     Ok(())
 }
 

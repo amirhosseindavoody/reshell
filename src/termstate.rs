@@ -229,9 +229,15 @@ impl TermState {
         out
     }
 
-    #[cfg(test)]
     fn mode(&self, m: u16) -> Option<bool> {
         self.modes.get(&m).copied()
+    }
+
+    /// True when the child has enabled the alternate screen buffer.
+    pub fn alt_screen(&self) -> bool {
+        matches!(self.mode(1049), Some(true))
+            || matches!(self.mode(1047), Some(true))
+            || matches!(self.mode(47), Some(true))
     }
 }
 

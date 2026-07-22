@@ -80,6 +80,10 @@ reshell list --json
 reshell info demo
 # or: reshell info     # current session when inside one; else most recent
 
+# Recent shell context (last command + trailing output; read-only)
+reshell context demo
+# or: reshell context  # current session when inside one; else most recent
+
 # Rename a live session
 reshell rename demo demo2
 
@@ -110,8 +114,13 @@ Completions call back into `reshell` at tab time, so `attach` / `info` / `kill` 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
 Inside a session shell, `RESHELL_SESSION` is set to the session name. Bare
-`reshell info` uses the current session (even after `rename`); outside a session
-it falls back to the most recently active one.
+`reshell info` / `reshell context` use the current session (even after `rename`);
+outside a session they fall back to the most recently active one.
+
+`reshell context` prints the last known command (when OSC 633 shell-integration
+markers are present) and the last ~100 lines of primary-screen output. It does
+not attach or replay into the live PTY — useful to recall what a session is
+doing. Full-screen apps pause line capture while they own the alternate screen.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 
