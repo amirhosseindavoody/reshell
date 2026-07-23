@@ -143,13 +143,14 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
    - No name + no live sessions + non-TTY → create with an auto name (same as
      `reshell new`).
    - No name + TTY → interactive picker (first row: **Create new session**, then
-     a column header and detached sessions by recent activity showing name /
-     state / created / last-active / shell, then already-attached sessions shown
-     dimmed and not selectable). Long names truncate with `…` so columns stay
-     aligned. Cursor defaults to the first detachable session when one exists.
-     ↑/↓ (or `j`/`k`), Enter to choose, `q` / Esc to cancel. Choosing create-new
-     prompts for a name (same editable default as above); Esc from the prompt
-     returns to the list.
+     a column header and sessions by recent activity showing name / state /
+     created / last-active / shell — detached first, then attached). The session
+     this process is inside is marked with `*` (bold). Other attached sessions
+     are dimmed. Long names truncate with `…` so columns stay aligned. Cursor
+     defaults to the first detachable session when one exists. Keys: ↑/↓ move,
+     Enter or `s` attach/switch, `k` kill (y/N confirm), `q` / Esc cancel.
+     Choosing create-new prompts for a name (editable `session-{unix}-{hex}`
+     default); Esc from the prompt returns to the list.
    - No name + non-TTY (scripts) → most recently active live session
      (`last_active_unix`, else `created_unix`).
    Bare `reshell` (no subcommand) is an alias for `reshell attach`. When attaching
