@@ -142,10 +142,11 @@ active session (or created one if none existed).
 table of sessions (name / state / created / last-active / shell; detached by
 recent activity, then attached; long names truncate with `…`). The session this
 process is inside is marked with `*`. Enter / `s` attach (switch), `k` kills
-with confirmation, `q`/Esc cancel. Choosing create-new (or bare `reshell` with
-no sessions) prompts for a session name pre-filled with an allocated `session-…`
-default. Non-TTY (scripts) keeps the most-recent fallback; empty non-TTY still
-auto-creates.
+with confirmation, `q`/Esc cancel. An in-session switch asks the outer attach
+client to detach the current session (freeing its lock) and attach to the
+target. Choosing create-new (or bare `reshell` with no sessions) prompts for a
+session name pre-filled with an allocated `session-…` default. Non-TTY (scripts)
+keeps the most-recent fallback; empty non-TTY still auto-creates.
 
 ### 15. `reshell ssh …` wrapper (post-v1)
 

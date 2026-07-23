@@ -21,7 +21,7 @@ use crate::protocol::{self, Message, Winsize};
 use crate::scrollback::Scrollback;
 use crate::session::{
     self, append_daemon_log, cleanup_session_files, now_unix, open_session_dir_fd,
-    paths_from_dir_fd, write_meta, AttachLock, SessionMeta, SessionPaths,
+    paths_from_dir_fd, write_client_pid, write_meta, AttachLock, SessionMeta, SessionPaths,
 };
 use crate::termstate::TermState;
 use crate::vscode_si;
@@ -512,6 +512,7 @@ fn server_loop(
                             let _ = stream.shutdown(std::net::Shutdown::Both);
                             drop(stream);
                         } else {
+                            let peer = peer_pid(&stream);
                             match (
                                 ClientConn::with_inbound(stream, inbound),
                                 AttachLock::try_acquire(&dir_fd),
@@ -530,6 +531,17 @@ fn server_loop(
                                             log("client detached immediately");
                                         }
                                         Ok(false) => {
+                                            if let Some(pid) = peer {
+                                                if let Ok(paths) =
+                                                    paths_from_dir_fd(dir_fd.as_raw_fd())
+                                                {
+                                                    if let Err(e) = write_client_pid(&paths, pid) {
+                                                        log(&format!(
+                                                            "write client.pid failed: {e:#}"
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             client = Some(c);
                                             attach_lock = Some(lock);
                                             log("client attached");
@@ -668,9 +680,28 @@ fn drop_client(
     dir_fd: &OwnedFd,
 ) {
     *client = None;
-    *attach_lock = None;
+    *attach_lock = None; // Drop clears attach lock + client.pid
     if let Ok(paths) = paths_from_dir_fd(dir_fd.as_raw_fd()) {
         append_daemon_log(&paths, "client detached");
+    }
+}
+
+fn peer_pid(stream: &UnixStream) -> Option<i32> {
+    unsafe {
+        let mut ucred: nix::libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<nix::libc::ucred>() as nix::libc::socklen_t;
+        let rc = nix::libc::getsockopt(
+            stream.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_PEERCRED,
+            &mut ucred as *mut _ as *mut nix::libc::c_void,
+            &mut len,
+        );
+        if rc == 0 && ucred.pid > 0 {
+            Some(ucred.pid)
+        } else {
+            None
+        }
     }
 }
 
