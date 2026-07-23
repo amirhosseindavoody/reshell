@@ -34,14 +34,27 @@ fn second_attach_is_rejected_while_first_holds() {
 
     // Second connection should be accepted then immediately closed.
     let mut second = UnixStream::connect(&sock).expect("second connect");
+    attach_winsize(&mut second, 24, 80);
     second
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
     let mut buf = [0u8; 8];
-    match second.read(&mut buf) {
-        Ok(0) => {} // peer closed — expected
-        Ok(n) => panic!("second attach should be closed, got {n} bytes"),
-        Err(e) => panic!("unexpected error on second attach: {e}"),
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match second.read(&mut buf) {
+            Ok(0) => break, // peer closed — expected
+            Ok(n) => panic!("second attach should be closed, got {n} bytes"),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    panic!("second attach still open after timeout (expected close)");
+                }
+                // Daemon may still be classifying / rejecting; retry.
+            }
+            Err(e) => panic!("unexpected error on second attach: {e}"),
+        }
     }
 
     // CLI attach should also refuse while the lock is held.
