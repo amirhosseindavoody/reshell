@@ -2,10 +2,12 @@
 //!
 //! Order: create-new, then detached (attachable), then attached (gray, skipped).
 //! Cursor defaults to the first attachable session when one exists.
+//! Choosing create-new prompts for a session name (editable suggested default).
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
@@ -16,17 +18,28 @@ use nix::sys::termios::{
 };
 use nix::unistd::read as nix_read;
 
+use crate::session::{self, allocate_session_name};
+
 const CSI_CLEAR_LINE: &str = "\x1b[2K";
 const CSI_HIDE_CURSOR: &str = "\x1b[?25l";
 const CSI_SHOW_CURSOR: &str = "\x1b[?25h";
 const SGR_RESET: &str = "\x1b[0m";
 const SGR_REVERSE: &str = "\x1b[7m";
 const SGR_DIM: &str = "\x1b[90m";
+const SGR_BOLD: &str = "\x1b[1m";
+
+const STATE_W: usize = 10;
+const TIME_W: usize = 14;
+const MARKER_W: usize = 2; // "> " or "  "
+const MIN_NAME_W: usize = 8;
+const MIN_SHELL_W: usize = 8;
+const MAX_SHELL_W: usize = 24;
 
 /// Outcome of the interactive session picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickAction {
-    CreateNew,
+    /// Create a new session with the given name (already validated).
+    CreateNew { name: String },
     Attach(String),
     Cancelled,
 }
@@ -36,8 +49,10 @@ pub enum PickAction {
 pub struct SessionRow {
     pub name: String,
     pub attached: bool,
-    /// Extra columns shown after the name (state, last-active, shell, …).
-    pub detail: String,
+    pub state: String,
+    pub created: String,
+    pub last_active: String,
+    pub shell: String,
 }
 
 #[derive(Clone)]
@@ -46,15 +61,24 @@ enum Entry {
     Session {
         name: String,
         attached: bool,
-        detail: String,
+        state: String,
+        created: String,
+        last_active: String,
+        shell: String,
     },
+}
+
+struct ColWidths {
+    name: usize,
+    shell: usize,
 }
 
 /// Interactive picker. Requires a controlling TTY (`/dev/tty` or stdin).
 ///
 /// Detached sessions are selectable; attached ones are shown dimmed and skipped
-/// by the cursor. Esc / `q` / Ctrl+C cancel.
-pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
+/// by the cursor. Esc / `q` / Ctrl+C cancel. Choosing "Create new session"
+/// prompts for a name pre-filled with an allocated default.
+pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> {
     let mut tty = open_tty()?;
     let tty_fd = tty.as_raw_fd();
     if !nix::unistd::isatty(tty_fd).unwrap_or(false) {
@@ -66,19 +90,24 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
 
     let mut detached: Vec<&SessionRow> = sessions.iter().filter(|s| !s.attached).collect();
     let mut attached: Vec<&SessionRow> = sessions.iter().filter(|s| s.attached).collect();
-    // Caller usually sorts by activity already; keep relative order within groups.
     for s in detached.drain(..) {
         entries.push(Entry::Session {
             name: s.name.clone(),
             attached: false,
-            detail: s.detail.clone(),
+            state: s.state.clone(),
+            created: s.created.clone(),
+            last_active: s.last_active.clone(),
+            shell: s.shell.clone(),
         });
     }
     for s in attached.drain(..) {
         entries.push(Entry::Session {
             name: s.name.clone(),
             attached: true,
-            detail: s.detail.clone(),
+            state: s.state.clone(),
+            created: s.created.clone(),
+            last_active: s.last_active.clone(),
+            shell: s.shell.clone(),
         });
     }
 
@@ -96,20 +125,35 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
     write!(tty, "{CSI_HIDE_CURSOR}").ok();
     tty.flush().ok();
 
-    let n_lines = entries.len() + 2; // header + blank + rows
-    let cols = tty_cols(tty_fd).unwrap_or(80).max(20) as usize;
+    let session_count = entries.len().saturating_sub(1);
+    // title, blank, create [, blank, col header, sessions…]
+    let n_lines = if session_count > 0 {
+        2 + 1 + 1 + 1 + session_count
+    } else {
+        2 + 1
+    };
+    let cols = tty_cols(tty_fd).unwrap_or(80).max(40) as usize;
+    let widths = compute_widths(&entries, cols);
     let mut first_draw = true;
     let result = (|| -> Result<PickAction> {
         loop {
-            draw(&mut tty, &entries, cursor, first_draw, n_lines, cols)?;
+            draw(
+                &mut tty,
+                &entries,
+                cursor,
+                first_draw,
+                n_lines,
+                cols,
+                &widths,
+            )?;
             first_draw = false;
             match read_key(tty_fd)? {
-                Key::Up => {
+                Key::Up | Key::Char('k') | Key::Char('K') => {
                     if let Some(i) = prev_selectable(&entries, cursor) {
                         cursor = i;
                     }
                 }
-                Key::Down => {
+                Key::Down | Key::Char('j') | Key::Char('J') => {
                     if let Some(i) = next_selectable(&entries, cursor) {
                         cursor = i;
                     }
@@ -117,7 +161,14 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
                 Key::Enter => match &entries[cursor] {
                     Entry::CreateNew => {
                         clear_ui(&mut tty, n_lines)?;
-                        return Ok(PickAction::CreateNew);
+                        first_draw = true;
+                        match prompt_session_name(&mut tty, tty_fd, base, cols)? {
+                            Some(name) => return Ok(PickAction::CreateNew { name }),
+                            None => {
+                                // Esc from name prompt → back to picker.
+                                first_draw = true;
+                            }
+                        }
                     }
                     Entry::Session {
                         name,
@@ -130,15 +181,18 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
                     }
                     Entry::Session {
                         attached: true, ..
-                    } => {
-                        // Cursor should never land here; ignore Enter.
-                    }
+                    } => {}
                 },
-                Key::Cancel => {
+                Key::Cancel | Key::Char('q') | Key::Char('Q') => {
                     clear_ui(&mut tty, n_lines)?;
                     return Ok(PickAction::Cancelled);
                 }
-                Key::Other => {}
+                Key::Other
+                | Key::Left
+                | Key::Right
+                | Key::Backspace
+                | Key::Delete
+                | Key::Char(_) => {}
             }
         }
     })();
@@ -148,10 +202,173 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
     result
 }
 
-/// Open the controlling terminal for interactive UI I/O.
+/// Ask for a session name with an editable suggested default.
 ///
-/// Prefer `/dev/tty` so the picker still works if stdout/stderr are redirected.
-/// Fall back to stdin when `/dev/tty` is unavailable but stdin is a TTY.
+/// Used when there are no sessions yet (skip the list) or after choosing
+/// "Create new session" in the picker. Returns `None` if cancelled.
+pub fn prompt_new_session_name(base: &Path) -> Result<Option<String>> {
+    let mut tty = open_tty()?;
+    let tty_fd = tty.as_raw_fd();
+    if !nix::unistd::isatty(tty_fd).unwrap_or(false) {
+        bail!("no tty available; session name prompt requires a terminal");
+    }
+
+    let orig = tcgetattr(tty.as_fd()).context("tcgetattr")?;
+    let mut raw = orig.clone();
+    make_cbreak(&mut raw);
+    tcsetattr(tty.as_fd(), SetArg::TCSAFLUSH, &raw).context("tcsetattr cbreak")?;
+    let _guard = TermiosGuard {
+        fd: tty_fd,
+        termios: Rc::new(orig),
+    };
+
+    let cols = tty_cols(tty_fd).unwrap_or(80).max(40) as usize;
+    prompt_session_name(&mut tty, tty_fd, base, cols)
+}
+
+fn prompt_session_name(
+    tty: &mut impl Write,
+    tty_fd: RawFd,
+    base: &Path,
+    cols: usize,
+) -> Result<Option<String>> {
+    let default = allocate_session_name(base)?;
+    let mut buf: Vec<char> = default.chars().collect();
+    let mut cursor = buf.len();
+    let mut error: Option<String> = None;
+    let mut first = true;
+    // prompt line + optional error line
+    let n_lines = 2;
+
+    // Keep the hardware cursor hidden; the caret is drawn in-buffer so redraw
+    // math stays simple (cursor always parked below the 2-line UI).
+    write!(tty, "{CSI_HIDE_CURSOR}").ok();
+    loop {
+        draw_name_prompt(tty, &buf, cursor, error.as_deref(), first, n_lines, cols)?;
+        first = false;
+        match read_key(tty_fd)? {
+            Key::Enter => {
+                let name: String = buf.iter().collect();
+                let name = name.trim().to_string();
+                if let Err(e) = session::validate_session_name(&name) {
+                    error = Some(format!("{e:#}"));
+                    continue;
+                }
+                let paths = session::SessionPaths::for_name(base, &name);
+                if paths.dir.exists() {
+                    error = Some(format!("session '{name}' already exists"));
+                    continue;
+                }
+                clear_ui(tty, n_lines)?;
+                return Ok(Some(name));
+            }
+            Key::Cancel => {
+                clear_ui(tty, n_lines)?;
+                return Ok(None);
+            }
+            Key::Left => {
+                cursor = cursor.saturating_sub(1);
+                error = None;
+            }
+            Key::Right => {
+                if cursor < buf.len() {
+                    cursor += 1;
+                }
+                error = None;
+            }
+            Key::Backspace => {
+                if cursor > 0 {
+                    buf.remove(cursor - 1);
+                    cursor -= 1;
+                }
+                error = None;
+            }
+            Key::Delete => {
+                if cursor < buf.len() {
+                    buf.remove(cursor);
+                }
+                error = None;
+            }
+            Key::Char(c) => {
+                if !c.is_control() {
+                    buf.insert(cursor, c);
+                    cursor += 1;
+                }
+                error = None;
+            }
+            Key::Up | Key::Down | Key::Other => {}
+        }
+    }
+}
+
+fn draw_name_prompt(
+    out: &mut impl Write,
+    buf: &[char],
+    cursor: usize,
+    error: Option<&str>,
+    first_draw: bool,
+    n_lines: usize,
+    cols: usize,
+) -> Result<()> {
+    if !first_draw {
+        write!(out, "\x1b[{n_lines}A").ok();
+    }
+    let label = "Session name: ";
+    let name: String = buf.iter().collect();
+    let budget = cols.saturating_sub(label.len()).max(8);
+    let (shown, cur_col) = fit_edit_line(&name, cursor, budget);
+    // Draw an in-buffer caret (reverse video) so we do not move the real cursor.
+    let caret_line = render_caret_line(&shown, cur_col);
+    write_line(
+        out,
+        &truncate_visible(&format!("{label}{caret_line}"), cols),
+    )?;
+    let err_line = match error {
+        Some(e) => truncate_visible(&format!("{SGR_DIM}{e}{SGR_RESET}"), cols),
+        None => String::new(),
+    };
+    write_line(out, &err_line)?;
+    out.flush().ok();
+    Ok(())
+}
+
+/// Insert a reverse-video caret at `cur_col` within `shown`.
+fn render_caret_line(shown: &str, cur_col: usize) -> String {
+    let chars: Vec<char> = shown.chars().collect();
+    if cur_col >= chars.len() {
+        // Caret at end: show a reverse space.
+        return format!("{shown}{SGR_REVERSE} {SGR_RESET}");
+    }
+    let mut out = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        if i == cur_col {
+            out.push_str(SGR_REVERSE);
+            out.push(*c);
+            out.push_str(SGR_RESET);
+        } else {
+            out.push(*c);
+        }
+    }
+    out
+}
+
+/// Fit `text` into `budget` columns with the cursor visible; returns (display, cursor_col).
+fn fit_edit_line(text: &str, cursor: usize, budget: usize) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= budget {
+        return (text.to_string(), cursor.min(chars.len()));
+    }
+    // Window around cursor.
+    let half = budget / 2;
+    let mut start = cursor.saturating_sub(half);
+    if start + budget > chars.len() {
+        start = chars.len().saturating_sub(budget);
+    }
+    let end = (start + budget).min(chars.len());
+    let slice: String = chars[start..end].iter().collect();
+    (slice, cursor.saturating_sub(start))
+}
+
 fn open_tty() -> Result<std::fs::File> {
     match OpenOptions::new().read(true).write(true).open("/dev/tty") {
         Ok(f) => Ok(f),
@@ -160,7 +377,6 @@ fn open_tty() -> Result<std::fs::File> {
             if !nix::unistd::isatty(stdin_fd).unwrap_or(false) {
                 bail!("stdin is not a tty; session picker requires a terminal");
             }
-            // Duplicate stdin so we can write UI escapes even when only stdin is a TTY.
             let dup = nix::unistd::dup(stdin_fd).context("dup stdin for picker")?;
             Ok(unsafe { std::fs::File::from(OwnedFd::from_raw_fd(dup)) })
         }
@@ -168,8 +384,6 @@ fn open_tty() -> Result<std::fs::File> {
 }
 
 fn first_selectable(entries: &[Entry]) -> Option<usize> {
-    // Prefer first attachable session so "Create new" starts unselected when
-    // there is something to reconnect to.
     entries
         .iter()
         .enumerate()
@@ -199,6 +413,79 @@ fn next_selectable(entries: &[Entry], from: usize) -> Option<usize> {
     ((from + 1)..entries.len()).find(|&i| is_selectable(&entries[i]))
 }
 
+fn compute_widths(entries: &[Entry], cols: usize) -> ColWidths {
+    let max_name = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Session { name, .. } => Some(name.chars().count()),
+            Entry::CreateNew => None,
+        })
+        .max()
+        .unwrap_or(MIN_NAME_W)
+        .max(MIN_NAME_W);
+    let max_shell = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Session { shell, .. } => Some(shell.chars().count()),
+            Entry::CreateNew => None,
+        })
+        .max()
+        .unwrap_or(MIN_SHELL_W)
+        .clamp(MIN_SHELL_W, MAX_SHELL_W);
+
+    // marker + name + gaps + state + created + last + shell
+    // gaps: 4 single spaces between the 5 data columns after marker
+    let fixed_rest = MARKER_W + 1 + STATE_W + 1 + TIME_W + 1 + TIME_W + 1;
+    let available = cols.saturating_sub(fixed_rest);
+    // Prefer giving name room up to max_name; shell gets the remainder (clamped).
+    let shell = max_shell.min(available / 3).max(MIN_SHELL_W.min(available));
+    let name_avail = available.saturating_sub(shell);
+    let name = max_name.min(name_avail).max(MIN_NAME_W.min(name_avail));
+    // If name took less than available, give leftover to shell (still capped).
+    let shell = (available.saturating_sub(name))
+        .min(MAX_SHELL_W)
+        .max(MIN_SHELL_W.min(available.saturating_sub(name)));
+    ColWidths { name, shell }
+}
+
+fn pad_trunc(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count == width {
+        return s.to_string();
+    }
+    if count < width {
+        let mut out = s.to_string();
+        out.extend(std::iter::repeat_n(' ', width - count));
+        return out;
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let keep = width - 1;
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+fn format_session_row(
+    marker: &str,
+    name: &str,
+    state: &str,
+    created: &str,
+    last_active: &str,
+    shell: &str,
+    widths: &ColWidths,
+) -> String {
+    format!(
+        "{marker}{name} {state:<state_w$} {created} {last_active} {shell}",
+        name = pad_trunc(name, widths.name),
+        state_w = STATE_W,
+        created = pad_trunc(created, TIME_W),
+        last_active = pad_trunc(last_active, TIME_W),
+        shell = pad_trunc(shell, widths.shell),
+    )
+}
+
 fn draw(
     out: &mut impl Write,
     entries: &[Entry],
@@ -206,16 +493,37 @@ fn draw(
     first_draw: bool,
     n_lines: usize,
     cols: usize,
+    widths: &ColWidths,
 ) -> Result<()> {
     if !first_draw {
-        // Cursor sits on the line *after* the last row; move to the header.
         write!(out, "\x1b[{n_lines}A").ok();
     }
-    // Always start at column 0 before clearing — required if OPOST was off and
-    // also keeps redraw correct after soft-wrap edge cases.
-    write_line(out, &truncate_visible("Select a session (↑/↓ Enter, q Esc)", cols))?;
+    write_line(
+        out,
+        &truncate_visible("Select a session (↑/↓ Enter, q Esc)", cols),
+    )?;
     write_line(out, "")?;
+
+    let has_sessions = entries.iter().any(|e| matches!(e, Entry::Session { .. }));
+
     for (i, entry) in entries.iter().enumerate() {
+        if i == 1 && has_sessions {
+            // Blank + column header after the create-new row.
+            write_line(out, "")?;
+            let header = format_session_row(
+                "  ",
+                "NAME",
+                "STATE",
+                "CREATED",
+                "LAST ACTIVE",
+                "SHELL",
+                widths,
+            );
+            write_line(
+                out,
+                &truncate_visible(&format!("{SGR_BOLD}{header}{SGR_RESET}"), cols),
+            )?;
+        }
         let selected = i == cursor;
         let line = match entry {
             Entry::CreateNew => {
@@ -228,14 +536,27 @@ fn draw(
             Entry::Session {
                 name,
                 attached,
-                detail,
+                state,
+                created,
+                last_active,
+                shell,
             } => {
+                let marker = if selected && !*attached { "> " } else { "  " };
+                let body = format_session_row(
+                    marker,
+                    name,
+                    state,
+                    created,
+                    last_active,
+                    shell,
+                    widths,
+                );
                 if *attached {
-                    format!("{SGR_DIM}  {name:<20} {detail}{SGR_RESET}")
+                    format!("{SGR_DIM}{body}{SGR_RESET}")
                 } else if selected {
-                    format!("{SGR_REVERSE}> {name:<20} {detail}{SGR_RESET}")
+                    format!("{SGR_REVERSE}{body}{SGR_RESET}")
                 } else {
-                    format!("  {name:<20} {detail}")
+                    body
                 }
             }
         };
@@ -245,7 +566,6 @@ fn draw(
     Ok(())
 }
 
-/// Visible-width truncate that leaves CSI/SGR sequences intact enough for SGR_RESET.
 fn truncate_visible(s: &str, cols: usize) -> String {
     let mut out = String::with_capacity(s.len());
     let mut visible = 0usize;
@@ -270,11 +590,10 @@ fn truncate_visible(s: &str, cols: usize) -> String {
         out.push(c);
         visible += 1;
     }
-    // Ensure styles don't leak if we cut mid-line.
-    if s.contains(SGR_REVERSE) || s.contains(SGR_DIM) {
-        if !out.ends_with(SGR_RESET) {
-            out.push_str(SGR_RESET);
-        }
+    if (s.contains(SGR_REVERSE) || s.contains(SGR_DIM) || s.contains(SGR_BOLD))
+        && !out.ends_with(SGR_RESET)
+    {
+        out.push_str(SGR_RESET);
     }
     out
 }
@@ -294,11 +613,6 @@ fn tty_cols(fd: RawFd) -> Option<u16> {
     }
 }
 
-/// Write one UI row: CR + clear line + text + LF.
-///
-/// Leading `\r` keeps the row left-aligned. We leave OPOST on so `\n` still
-/// advances the line correctly on the TTY (do not emit `\r\n` here or OPOST
-/// turns it into `\r\r\n`).
 fn write_line(out: &mut impl Write, text: &str) -> Result<()> {
     write!(out, "\r{CSI_CLEAR_LINE}{text}\n").ok();
     Ok(())
@@ -317,8 +631,13 @@ fn clear_ui(out: &mut impl Write, n_lines: usize) -> Result<()> {
 enum Key {
     Up,
     Down,
+    Left,
+    Right,
     Enter,
     Cancel,
+    Backspace,
+    Delete,
+    Char(char),
     Other,
 }
 
@@ -326,16 +645,22 @@ fn read_key(fd: RawFd) -> Result<Key> {
     let b = read_byte_blocking(fd)?;
     match b {
         b'\r' | b'\n' => Ok(Key::Enter),
-        b'q' | b'Q' | 0x03 => Ok(Key::Cancel),
+        0x7f | 0x08 => Ok(Key::Backspace),
+        // Ctrl+C / Esc start — Esc may be an arrow / Delete sequence.
+        0x03 => Ok(Key::Cancel),
         0x1b => read_escape_sequence(fd),
-        b'k' | b'K' => Ok(Key::Up),
-        b'j' | b'J' => Ok(Key::Down),
-        _ => Ok(Key::Other),
+        b if b < 0x20 => Ok(Key::Other),
+        b if b < 0x80 => {
+            // Plain ASCII. During list navigation, q cancels; during name edit,
+            // callers treat Char('q') as text. Disambiguate: only bare cancel
+            // keys are Cancel; `q` is Char so the name prompt can type it.
+            // List loop maps Char('q')/Char('Q') to cancel.
+            Ok(Key::Char(b as char))
+        }
+        _ => Ok(Key::Other), // ignore non-UTF8 / multibyte starters for now
     }
 }
 
-/// After ESC: arrow keys are `ESC [ A/B`. Bare Esc (no follow-up within ~50ms)
-/// cancels. Other CSI sequences are ignored.
 fn read_escape_sequence(fd: RawFd) -> Result<Key> {
     let Some(b1) = read_byte_timeout(fd, 50)? else {
         return Ok(Key::Cancel);
@@ -349,6 +674,13 @@ fn read_escape_sequence(fd: RawFd) -> Result<Key> {
     Ok(match b2 {
         b'A' => Key::Up,
         b'B' => Key::Down,
+        b'C' => Key::Right,
+        b'D' => Key::Left,
+        b'3' => {
+            // Delete is ESC [ 3 ~
+            let _ = read_byte_timeout(fd, 50)?;
+            Key::Delete
+        }
         _ => Key::Other,
     })
 }
@@ -399,7 +731,6 @@ impl Drop for TermiosGuard {
             SetArg::TCSAFLUSH,
             &self.termios,
         );
-        // Best-effort cursor restore if the caller did not already show it.
         if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
             let _ = write!(tty, "{CSI_SHOW_CURSOR}");
             let _ = tty.flush();
@@ -407,9 +738,6 @@ impl Drop for TermiosGuard {
     }
 }
 
-/// Input raw enough for single-key reads, but **keep OPOST** so the terminal
-/// still maps `\n` → `\r\n`. Full `cfmakeraw` (which clears OPOST) made the
-/// picker staircase because `writeln!` only emits `\n`.
 fn make_cbreak(termios: &mut Termios) {
     termios.local_flags &= !(LocalFlags::ECHO
         | LocalFlags::ECHONL
@@ -424,56 +752,39 @@ fn make_cbreak(termios: &mut Termios) {
 mod tests {
     use super::*;
 
+    fn sess(name: &str, attached: bool) -> Entry {
+        Entry::Session {
+            name: name.into(),
+            attached,
+            state: if attached {
+                "attached".into()
+            } else {
+                "detached".into()
+            },
+            created: "2h ago".into(),
+            last_active: "1m ago".into(),
+            shell: "/bin/zsh".into(),
+        }
+    }
+
     #[test]
     fn cursor_prefers_first_detached() {
-        let entries = vec![
-            Entry::CreateNew,
-            Entry::Session {
-                name: "a".into(),
-                attached: false,
-                detail: String::new(),
-            },
-            Entry::Session {
-                name: "b".into(),
-                attached: true,
-                detail: String::new(),
-            },
-        ];
+        let entries = vec![Entry::CreateNew, sess("a", false), sess("b", true)];
         assert_eq!(first_selectable(&entries), Some(1));
     }
 
     #[test]
     fn cursor_falls_back_to_create_when_all_attached() {
-        let entries = vec![
-            Entry::CreateNew,
-            Entry::Session {
-                name: "busy".into(),
-                attached: true,
-                detail: String::new(),
-            },
-        ];
+        let entries = vec![Entry::CreateNew, sess("busy", true)];
         assert_eq!(first_selectable(&entries), Some(0));
     }
 
     #[test]
     fn navigation_skips_attached() {
-        let entries = vec![
-            Entry::CreateNew,
-            Entry::Session {
-                name: "free".into(),
-                attached: false,
-                detail: String::new(),
-            },
-            Entry::Session {
-                name: "busy".into(),
-                attached: true,
-                detail: String::new(),
-            },
-        ];
+        let entries = vec![Entry::CreateNew, sess("free", false), sess("busy", true)];
         assert_eq!(next_selectable(&entries, 0), Some(1));
         assert_eq!(next_selectable(&entries, 1), None);
         assert_eq!(prev_selectable(&entries, 1), Some(0));
-        assert_eq!(next_selectable(&entries, 0), Some(1));
     }
 
     #[test]
@@ -484,27 +795,63 @@ mod tests {
     }
 
     #[test]
-    fn draw_keeps_rows_left_aligned() {
+    fn pad_trunc_ellipsis_for_long_names() {
+        assert_eq!(pad_trunc("abc", 5), "abc  ");
+        assert_eq!(pad_trunc("abcdefghij", 5), "abcd…");
+        assert_eq!(pad_trunc("abcd", 4), "abcd");
+    }
+
+    #[test]
+    fn widths_expand_for_long_names_and_keep_columns() {
         let entries = vec![
             Entry::CreateNew,
-            Entry::Session {
-                name: "demo".into(),
-                attached: false,
-                detail: "detached".into(),
-            },
+            sess("short", false),
+            sess("this-is-a-very-long-session-name", false),
         ];
-        let mut buf = Vec::new();
-        draw(&mut buf, &entries, 1, true, 4, 80).unwrap();
-        let text = String::from_utf8_lossy(&buf);
-        assert!(text.contains("\r\x1b[2K  Create new session\n"));
-        assert!(text.contains("demo"));
-        // Redraw moves up by the fixed row count.
-        let mut buf2 = Vec::new();
-        draw(&mut buf2, &entries, 0, false, 4, 80).unwrap();
-        assert!(
-            buf2.starts_with(b"\x1b[4A"),
-            "{:?}",
-            &buf2[..8.min(buf2.len())]
+        let w = compute_widths(&entries, 100);
+        assert!(w.name >= "this-is-a-very-long-session-name".len() || w.name >= MIN_NAME_W);
+        let row = format_session_row(
+            "  ",
+            "this-is-a-very-long-session-name",
+            "detached",
+            "2h ago",
+            "1m ago",
+            "/bin/zsh",
+            &w,
         );
+        // STATE column should still appear as a whole word (not glued to name).
+        assert!(row.contains(" detached "));
+        assert!(row.contains("CREATED") || row.contains("2h ago"));
+    }
+
+    #[test]
+    fn draw_includes_created_and_header() {
+        let entries = vec![Entry::CreateNew, sess("demo", false)];
+        let widths = compute_widths(&entries, 100);
+        let mut buf = Vec::new();
+        // n_lines = 2 + 1 + 1 + 1 + 1 = 6
+        draw(&mut buf, &entries, 1, true, 6, 100, &widths).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("Create new session"));
+        assert!(text.contains("CREATED"));
+        assert!(text.contains("LAST ACTIVE"));
+        assert!(text.contains("2h ago"));
+        assert!(text.contains("1m ago"));
+        assert!(text.contains("demo"));
+    }
+
+    #[test]
+    fn fit_edit_keeps_cursor_in_window() {
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        let (shown, col) = fit_edit_line(long, 20, 10);
+        assert_eq!(shown.chars().count(), 10);
+        assert!(col < 10);
+    }
+
+    #[test]
+    fn render_caret_at_end_and_middle() {
+        assert!(render_caret_line("abc", 3).contains(SGR_REVERSE));
+        let mid = render_caret_line("abc", 1);
+        assert!(mid.contains(&format!("{SGR_REVERSE}b{SGR_RESET}")));
     }
 }

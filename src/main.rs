@@ -66,8 +66,9 @@ enum Commands {
         detach: bool,
     },
     /// Attach to an existing session.
-    /// With no name: interactive picker (create new / attach). Non-TTY falls
-    /// back to the most recently active session; with no sessions, creates one.
+    /// With no name: interactive picker (create new with name prompt / attach).
+    /// Non-TTY falls back to the most recently active session; with no sessions,
+    /// creates one (TTY: prompts for name).
     #[command(visible_alias = "a")]
     Attach {
         /// Session name (omit for the interactive picker)
@@ -408,13 +409,32 @@ fn cmd_attach(
         Some(n) => client::attach(base, &n, detach_key),
         None => {
             let mut sessions = session::list_sessions(base)?;
-            if sessions.is_empty() {
-                // No live sessions — same as `reshell new`.
-                return cmd_new(base, None, None, false, log, detach_key, scrollback);
-            }
 
             let stdin_fd = std::io::stdin().as_raw_fd();
             let is_tty = nix::unistd::isatty(stdin_fd).unwrap_or(false);
+
+            if sessions.is_empty() {
+                if is_tty {
+                    // Prompt for a name (editable suggested default), then create.
+                    match picker::prompt_new_session_name(base)? {
+                        Some(n) => {
+                            return cmd_new(
+                                base,
+                                Some(n),
+                                None,
+                                false,
+                                log,
+                                detach_key,
+                                scrollback,
+                            );
+                        }
+                        None => anyhow::bail!("cancelled"),
+                    }
+                }
+                // Non-TTY: same as `reshell new` (auto name).
+                return cmd_new(base, None, None, false, log, detach_key, scrollback);
+            }
+
             if !is_tty {
                 // Scripts / pipes: keep the historical most-recent default.
                 let meta = session::most_recent_session(base)?;
@@ -423,14 +443,12 @@ fn cmd_attach(
             }
 
             // Detached (attachable) first by activity, then attached (gray).
-            sessions.sort_by(|a, b| {
-                match (a.0.attached, b.0.attached) {
-                    (false, true) => std::cmp::Ordering::Less,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    _ => session::session_activity(&b.0)
-                        .cmp(&session::session_activity(&a.0))
-                        .then_with(|| a.0.name.cmp(&b.0.name)),
-                }
+            sessions.sort_by(|a, b| match (a.0.attached, b.0.attached) {
+                (false, true) => std::cmp::Ordering::Less,
+                (true, false) => std::cmp::Ordering::Greater,
+                _ => session::session_activity(&b.0)
+                    .cmp(&session::session_activity(&a.0))
+                    .then_with(|| a.0.name.cmp(&b.0.name)),
             });
 
             let rows: Vec<picker::SessionRow> = sessions
@@ -441,18 +459,20 @@ fn cmd_attach(
                     } else {
                         "detached"
                     };
-                    let last = format_time_human(session::session_activity(meta));
                     picker::SessionRow {
                         name: meta.name.clone(),
                         attached: meta.attached,
-                        detail: format!("{state:<10} {last:<16} {}", meta.shell),
+                        state: state.into(),
+                        created: format_time_human(meta.created_unix),
+                        last_active: format_time_human(session::session_activity(meta)),
+                        shell: meta.shell.clone(),
                     }
                 })
                 .collect();
 
-            match picker::pick_session(&rows)? {
-                picker::PickAction::CreateNew => {
-                    cmd_new(base, None, None, false, log, detach_key, scrollback)
+            match picker::pick_session(base, &rows)? {
+                picker::PickAction::CreateNew { name } => {
+                    cmd_new(base, Some(name), None, false, log, detach_key, scrollback)
                 }
                 picker::PickAction::Attach(n) => {
                     eprintln!("attaching to {n}");
