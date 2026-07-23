@@ -57,11 +57,9 @@ fn list_state(base: &std::path::Path, name: &str) -> String {
 
 fn wait_states(base: &std::path::Path, from: &str, to: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut from_free = false;
-    let mut to_held = false;
     while Instant::now() < deadline {
-        from_free = list_state(base, from).contains("detached");
-        to_held = list_state(base, to).contains("attached");
+        let from_free = list_state(base, from).contains("detached");
+        let to_held = list_state(base, to).contains("attached");
         if from_free && to_held {
             return;
         }
