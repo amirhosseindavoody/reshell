@@ -142,7 +142,7 @@ reshell/
 ├── pixi.toml / pixi.lock
 ├── recipe/recipe.yaml
 ├── src/
-│   ├── main.rs          # clap CLI + attach_or_switch
+│   ├── main.rs          # clap CLI + join_session (leave-before-join)
 │   ├── picker.rs        # raw-TTY session picker + name prompt
 │   ├── session.rs       # base dir, meta, list/info/rename/clean/kill, switch_to
 │   ├── server.rs        # daemonize, openpty, accept, multiplex I/O
@@ -266,13 +266,26 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
 
 `last_active_unix` is updated whenever a client attaches or detaches.
 
-### 7.3 In-session switch
+### 7.3 In-session leave-and-join (by construction)
 
-When the picker (or `attach <name>`) runs **inside** a session, switch asks the
-outer attach client (`SIGUSR1` + `switch_to`) to detach the current session
-(freeing its attach lock) and attach to the target instead of nesting a second
-client. The daemon records the attach client's pid in `client.pid` via
-`SO_PEERCRED` while connected.
+**Invariant:** any command that would attach this process to a session while it
+is already inside another live session must **leave the current session first**.
+The inner CLI never calls `client::attach` in that case (no nested attach clients).
+
+Paths that honor the invariant:
+
+| Inner command | Behavior |
+|---------------|----------|
+| `attach <other>` / picker attach / switch | Leave current → join target |
+| `new <name>` (without `--detach`) / picker create | Create detached target → leave current → join new |
+| `attach <current>` | No-op (`already in session`) |
+| `new … --detach` | Create only (does not join, so no leave) |
+
+Mechanism: the daemon records the outer attach client's pid in `client.pid`
+(`SO_PEERCRED`). The inner command writes `switch_to` and sends `SIGUSR1` to that
+pid; the outer client detaches (frees the attach lock), then attaches to the
+target on the same TTY. The inner command waits until the current session is
+detached and the target is attached before exiting successfully.
 
 ### 7.4 Detach vs kill
 
@@ -438,8 +451,9 @@ Linux.
 
 - **Attach exclusivity** — Advisory `flock` on `attached` for the life of the
   connection; stale files without a holder are cleared.
-- **In-session switch** — Outer attach client handles `SIGUSR1` + `switch_to`
-  and reattaches on the same TTY (no nested clients).
+- **In-session leave-and-join** — `attach` / `new` / picker always leave the
+  current session before joining another; outer client handles `SIGUSR1` +
+  `switch_to` on the same TTY (no nested clients).
 - **Scrollback** — Opt-in byte ring at session create; replay after DEC restore.
 - **Interactive picker** — Bare `reshell` / `attach` on a TTY; non-TTY keeps
   most-recent / auto-create fallbacks.

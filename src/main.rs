@@ -394,7 +394,9 @@ fn cmd_new(
     } else {
         // Name goes to stderr so it does not collide with the TTY session.
         eprintln!("{name}");
-        client::attach(base, &name, detach_key)
+        // If this process is already inside a session, leave it and join the
+        // new one via the outer attach client — never nest a second client.
+        join_session(base, &name, detach_key)
     }
 }
 
@@ -406,7 +408,7 @@ fn cmd_attach(
     scrollback: usize,
 ) -> Result<()> {
     match name {
-        Some(n) => attach_or_switch(base, &n, detach_key),
+        Some(n) => join_session(base, &n, detach_key),
         None => {
             let mut sessions = session::list_sessions(base)?;
 
@@ -438,8 +440,7 @@ fn cmd_attach(
             if !is_tty {
                 // Scripts / pipes: keep the historical most-recent default.
                 let meta = session::most_recent_session(base)?;
-                eprintln!("attaching to {}", meta.name);
-                return client::attach(base, &meta.name, detach_key);
+                return join_session(base, &meta.name, detach_key);
             }
 
             // Detached (attachable) first by activity, then attached (gray).
@@ -475,26 +476,11 @@ fn cmd_attach(
                 .collect();
 
             match picker::pick_session(base, &rows)? {
+                // `cmd_new` / `join_session` leave the current session when inside one.
                 picker::PickAction::CreateNew { name } => {
-                    if let Some(cur) = session::current_session(base)? {
-                        // Create detached, then ask the outer attach client to
-                        // leave `cur` and attach to the new session.
-                        cmd_new(
-                            base,
-                            Some(name.clone()),
-                            None,
-                            true,
-                            log,
-                            detach_key,
-                            scrollback,
-                        )?;
-                        eprintln!("switching from {} to {name}", cur.name);
-                        session::request_attach_switch(base, &cur.name, &name)
-                    } else {
-                        cmd_new(base, Some(name), None, false, log, detach_key, scrollback)
-                    }
+                    cmd_new(base, Some(name), None, false, log, detach_key, scrollback)
                 }
-                picker::PickAction::Attach(n) => attach_or_switch(base, &n, detach_key),
+                picker::PickAction::Attach(n) => join_session(base, &n, detach_key),
                 picker::PickAction::Cancelled => {
                     anyhow::bail!("cancelled");
                 }
@@ -503,14 +489,19 @@ fn cmd_attach(
     }
 }
 
-/// Attach to `target`, or if this process is inside another session, ask the
-/// outer attach client to detach (free) that session and switch to `target`.
-fn attach_or_switch(base: &Path, target: &str, detach_key: u8) -> Result<()> {
+/// Join `target`, never nesting on top of a session this process is already in.
+///
+/// Invariant: if `current_session` is some other live session, ask its outer
+/// attach client to detach that session and attach to `target` instead of
+/// calling `client::attach` from this process. Same-session is a no-op.
+fn join_session(base: &Path, target: &str, detach_key: u8) -> Result<()> {
     if let Some(cur) = session::current_session(base)? {
-        if cur.name != target {
-            eprintln!("switching from {} to {target}", cur.name);
-            return session::request_attach_switch(base, &cur.name, target);
+        if cur.name == target {
+            eprintln!("already in session '{target}'");
+            return Ok(());
         }
+        eprintln!("switching from {} to {target}", cur.name);
+        return session::request_attach_switch(base, &cur.name, target);
     }
     eprintln!("attaching to {target}");
     client::attach(base, target, detach_key)

@@ -2,7 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
@@ -630,10 +631,12 @@ pub fn take_switch_to(paths: &SessionPaths) -> Option<String> {
     Some(name)
 }
 
-/// Request that the outer attach client for `from` switch to `to`.
+/// Ask the outer attach client for `from` to detach that session and attach to `to`.
 ///
-/// Writes `switch_to` and sends `SIGUSR1` to the recorded client pid so the
-/// original session is detached (freed) before the client attaches to `to`.
+/// By construction this never nests a second attach client: the recorded outer
+/// client (`client.pid`) receives `SIGUSR1`, detaches `from` (freeing its attach
+/// lock), then attaches to `to` on the same TTY. This function waits until `from`
+/// is detached and `to` is attached (or times out).
 pub fn request_attach_switch(base: &Path, from: &str, to: &str) -> Result<()> {
     validate_session_name(from)?;
     validate_session_name(to)?;
@@ -650,22 +653,48 @@ pub fn request_attach_switch(base: &Path, from: &str, to: &str) -> Result<()> {
     }
     let Some(pid) = read_client_pid(&from_paths) else {
         bail!(
-            "cannot switch from '{from}': no attach client pid \
+            "cannot leave session '{from}': no attach client pid \
              (outer attach is too old or not recorded)"
         );
     };
     if !process_alive(pid) {
         let _ = clear_client_pid(&from_paths);
-        bail!("cannot switch from '{from}': attach client pid {pid} is dead");
+        bail!("cannot leave session '{from}': attach client pid {pid} is dead");
     }
     write_switch_to(&from_paths, to)?;
-    match signal::kill(Pid::from_raw(pid), Signal::SIGUSR1) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(from_paths.switch_to_file());
-            Err(e).context(format!("signal attach client pid {pid}"))
-        }
+    if let Err(e) = signal::kill(Pid::from_raw(pid), Signal::SIGUSR1) {
+        let _ = fs::remove_file(from_paths.switch_to_file());
+        return Err(e).context(format!("signal attach client pid {pid}"));
     }
+
+    // Wait for the handoff: current session must detach before the target attaches.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut from_free = false;
+    while Instant::now() < deadline {
+        if !is_attached(&from_paths) {
+            from_free = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if !from_free {
+        let _ = fs::remove_file(from_paths.switch_to_file());
+        bail!("timed out waiting for session '{from}' to detach");
+    }
+
+    while Instant::now() < deadline {
+        if is_attached(&to_paths) {
+            return Ok(());
+        }
+        if !process_alive(pid) {
+            bail!(
+                "attach client exited while switching from '{from}' to '{to}' \
+                 (target may not be attached)"
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    bail!("timed out waiting for session '{to}' to attach after leaving '{from}'");
 }
 
 /// Append a line to the session daemon log (best effort).
