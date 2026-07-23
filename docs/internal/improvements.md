@@ -138,11 +138,13 @@ still get raw PTY passthrough.
 **Was:** Bare `reshell` / `attach` with no name attached to the most recently
 active session (or created one if none existed).
 
-**Now:** On a TTY, shows a small picker: **Create new session** first, then
-detached sessions (by recent activity), then already-attached sessions dimmed
-and skipped by the cursor. Cursor defaults to the first detachable session.
-Non-TTY (scripts) keeps the most-recent fallback; empty still creates a new
-session.
+**Now:** On a TTY, shows a small picker: **Create new session** first, then a
+table of detached sessions (name / state / created / last-active / shell, by
+recent activity; long names truncate with `…`), then already-attached sessions
+dimmed and skipped by the cursor. Cursor defaults to the first detachable
+session. Choosing create-new (or bare `reshell` with no sessions) prompts for a
+session name pre-filled with an allocated `session-…` default. Non-TTY (scripts)
+keeps the most-recent fallback; empty non-TTY still auto-creates.
 
 ### 15. `reshell ssh …` wrapper (post-v1)
 

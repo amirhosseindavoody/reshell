@@ -7,7 +7,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Keep shells alive and running after SSH disconnects
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
 - Explicit sessions: `new` / `attach` / `list` / `info` / `context` / `kill`
-- Bare `reshell` opens a small session picker (create new, then attachable sessions; already-attached shown dimmed)
+- Bare `reshell` opens a small session picker (create new with name prompt, then attachable sessions; already-attached shown dimmed)
 - Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
 - Reattach restores TUI terminal modes (mouse, alt-screen, …), the window/tab title, and forces a redraw
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session (bash, zsh, fish)
@@ -53,7 +53,7 @@ pixi global install --git https://github.com/amirhosseindavoody/reshell.git --br
 ## Usage
 
 ```bash
-# Interactive session picker (create new / attach); creates one if none exist
+# Interactive session picker (create new with name prompt / attach)
 reshell
 # same as: reshell attach
 
@@ -102,10 +102,13 @@ reshell kill demo
 Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.
 
 Bare `reshell` / `reshell attach` (no name) opens a small picker when stdin is a
-TTY: **Create new session**, then detached sessions (newest activity first), then
-already-attached sessions shown dimmed (not selectable). ↑/↓ or `j`/`k`, Enter to
-choose, `q` / Esc to cancel. With no sessions it creates one immediately. Without
-a TTY (scripts) it still falls back to the most recently active session.
+TTY: **Create new session**, then a table of detached sessions (newest activity
+first: name, state, created, last-active, shell), then already-attached sessions
+shown dimmed (not selectable). Long names are truncated with an ellipsis so
+columns stay aligned. ↑/↓ or `j`/`k`, Enter to choose, `q` / Esc to cancel.
+Choosing create-new (or bare `reshell` with no sessions) prompts for a session
+name pre-filled with a generated `session-…` default you can edit. Without a TTY
+(scripts) it still falls back to the most recently active session.
 
 ### Shell completion
 

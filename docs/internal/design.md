@@ -51,7 +51,7 @@ Single crate; binary name `reshell`.
 | File | Responsibility |
 |------|----------------|
 | [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`ls`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab; subcommand Tab shows long name + `(alias)` description); detach-key + log + scrollback flags; default shell `/bin/zsh` |
-| [`src/picker.rs`](../../src/picker.rs) | Small raw-TTY session picker for bare `reshell` / `attach` with no name |
+| [`src/picker.rs`](../../src/picker.rs) | Small raw-TTY session picker + name prompt for bare `reshell` / `attach` with no name |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O, context fetch |
@@ -138,11 +138,18 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
 1. Require a local TTY on stdin (for named attach and for the interactive picker).
 2. Resolve the session name:
    - Explicit argument → that session.
-   - No name + no live sessions → create a new one (same as `reshell new`).
+   - No name + no live sessions + TTY → prompt for a session name (editable
+     suggested `session-{unix}-{hex}` default), then create and attach.
+   - No name + no live sessions + non-TTY → create with an auto name (same as
+     `reshell new`).
    - No name + TTY → interactive picker (first row: **Create new session**, then
-     detached sessions by recent activity, then already-attached sessions shown
-     dimmed and not selectable). Cursor defaults to the first detachable session
-     when one exists. ↑/↓ (or `j`/`k`), Enter to choose, `q` / Esc to cancel.
+     a column header and detached sessions by recent activity showing name /
+     state / created / last-active / shell, then already-attached sessions shown
+     dimmed and not selectable). Long names truncate with `…` so columns stay
+     aligned. Cursor defaults to the first detachable session when one exists.
+     ↑/↓ (or `j`/`k`), Enter to choose, `q` / Esc to cancel. Choosing create-new
+     prompts for a name (same editable default as above); Esc from the prompt
+     returns to the list.
    - No name + non-TTY (scripts) → most recently active live session
      (`last_active_unix`, else `created_unix`).
    Bare `reshell` (no subcommand) is an alias for `reshell attach`. When attaching
