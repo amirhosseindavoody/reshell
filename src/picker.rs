@@ -3,15 +3,16 @@
 //! Order: create-new, then detached (attachable), then attached (gray, skipped).
 //! Cursor defaults to the first attachable session when one exists.
 
+use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::termios::{
-    tcgetattr, tcsetattr, LocalFlags, OutputFlags, SetArg, SpecialCharacterIndices, Termios,
+    tcgetattr, tcsetattr, LocalFlags, SetArg, SpecialCharacterIndices, Termios,
 };
 use nix::unistd::read as nix_read;
 
@@ -42,17 +43,22 @@ pub struct SessionRow {
 #[derive(Clone)]
 enum Entry {
     CreateNew,
-    Session { name: String, attached: bool, detail: String },
+    Session {
+        name: String,
+        attached: bool,
+        detail: String,
+    },
 }
 
-/// Interactive picker. Requires a TTY on stdin.
+/// Interactive picker. Requires a controlling TTY (`/dev/tty` or stdin).
 ///
 /// Detached sessions are selectable; attached ones are shown dimmed and skipped
 /// by the cursor. Esc / `q` / Ctrl+C cancel.
 pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
-    let stdin_fd = io::stdin().as_raw_fd();
-    if !nix::unistd::isatty(stdin_fd).unwrap_or(false) {
-        bail!("stdin is not a tty; session picker requires a terminal");
+    let mut tty = open_tty()?;
+    let tty_fd = tty.as_raw_fd();
+    if !nix::unistd::isatty(tty_fd).unwrap_or(false) {
+        bail!("no tty available; session picker requires a terminal");
     }
 
     let mut entries: Vec<Entry> = Vec::with_capacity(sessions.len() + 1);
@@ -78,27 +84,26 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
 
     let mut cursor = first_selectable(&entries).unwrap_or(0);
 
-    let orig = tcgetattr(io::stdin().as_fd()).context("tcgetattr")?;
+    let orig = tcgetattr(tty.as_fd()).context("tcgetattr")?;
     let mut raw = orig.clone();
-    make_raw(&mut raw);
-    tcsetattr(io::stdin().as_fd(), SetArg::TCSAFLUSH, &raw).context("tcsetattr raw")?;
+    make_cbreak(&mut raw);
+    tcsetattr(tty.as_fd(), SetArg::TCSAFLUSH, &raw).context("tcsetattr cbreak")?;
     let _guard = TermiosGuard {
-        fd: stdin_fd,
+        fd: tty_fd,
         termios: Rc::new(orig),
     };
 
-    // Draw on stderr so stdout stays clean for scripts that still have a TTY.
-    let mut out = io::stderr();
-    write!(out, "{CSI_HIDE_CURSOR}").ok();
-    out.flush().ok();
+    write!(tty, "{CSI_HIDE_CURSOR}").ok();
+    tty.flush().ok();
 
     let n_lines = entries.len() + 2; // header + blank + rows
+    let cols = tty_cols(tty_fd).unwrap_or(80).max(20) as usize;
     let mut first_draw = true;
     let result = (|| -> Result<PickAction> {
         loop {
-            draw(&mut out, &entries, cursor, first_draw, n_lines)?;
+            draw(&mut tty, &entries, cursor, first_draw, n_lines, cols)?;
             first_draw = false;
-            match read_key()? {
+            match read_key(tty_fd)? {
                 Key::Up => {
                     if let Some(i) = prev_selectable(&entries, cursor) {
                         cursor = i;
@@ -111,7 +116,7 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
                 }
                 Key::Enter => match &entries[cursor] {
                     Entry::CreateNew => {
-                        clear_ui(&mut out, n_lines)?;
+                        clear_ui(&mut tty, n_lines)?;
                         return Ok(PickAction::CreateNew);
                     }
                     Entry::Session {
@@ -120,15 +125,17 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
                         ..
                     } => {
                         let name = name.clone();
-                        clear_ui(&mut out, n_lines)?;
+                        clear_ui(&mut tty, n_lines)?;
                         return Ok(PickAction::Attach(name));
                     }
-                    Entry::Session { attached: true, .. } => {
+                    Entry::Session {
+                        attached: true, ..
+                    } => {
                         // Cursor should never land here; ignore Enter.
                     }
                 },
                 Key::Cancel => {
-                    clear_ui(&mut out, n_lines)?;
+                    clear_ui(&mut tty, n_lines)?;
                     return Ok(PickAction::Cancelled);
                 }
                 Key::Other => {}
@@ -136,9 +143,28 @@ pub fn pick_session(sessions: &[SessionRow]) -> Result<PickAction> {
         }
     })();
 
-    write!(out, "{CSI_SHOW_CURSOR}").ok();
-    out.flush().ok();
+    write!(tty, "{CSI_SHOW_CURSOR}").ok();
+    tty.flush().ok();
     result
+}
+
+/// Open the controlling terminal for interactive UI I/O.
+///
+/// Prefer `/dev/tty` so the picker still works if stdout/stderr are redirected.
+/// Fall back to stdin when `/dev/tty` is unavailable but stdin is a TTY.
+fn open_tty() -> Result<std::fs::File> {
+    match OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(f) => Ok(f),
+        Err(_) => {
+            let stdin_fd = io::stdin().as_raw_fd();
+            if !nix::unistd::isatty(stdin_fd).unwrap_or(false) {
+                bail!("stdin is not a tty; session picker requires a terminal");
+            }
+            // Duplicate stdin so we can write UI escapes even when only stdin is a TTY.
+            let dup = nix::unistd::dup(stdin_fd).context("dup stdin for picker")?;
+            Ok(unsafe { std::fs::File::from(OwnedFd::from_raw_fd(dup)) })
+        }
+    }
 }
 
 fn first_selectable(entries: &[Entry]) -> Option<usize> {
@@ -179,22 +205,24 @@ fn draw(
     cursor: usize,
     first_draw: bool,
     n_lines: usize,
+    cols: usize,
 ) -> Result<()> {
     if !first_draw {
-        // Move to the top of the previous draw.
+        // Cursor sits on the line *after* the last row; move to the header.
         write!(out, "\x1b[{n_lines}A").ok();
     }
-    writeln!(out, "{CSI_CLEAR_LINE}Select a session (↑/↓ Enter, q Esc)").ok();
-    writeln!(out, "{CSI_CLEAR_LINE}").ok();
+    // Always start at column 0 before clearing — required if OPOST was off and
+    // also keeps redraw correct after soft-wrap edge cases.
+    write_line(out, &truncate_visible("Select a session (↑/↓ Enter, q Esc)", cols))?;
+    write_line(out, "")?;
     for (i, entry) in entries.iter().enumerate() {
-        write!(out, "{CSI_CLEAR_LINE}").ok();
         let selected = i == cursor;
-        match entry {
+        let line = match entry {
             Entry::CreateNew => {
                 if selected {
-                    write!(out, "{SGR_REVERSE}> Create new session{SGR_RESET}").ok();
+                    format!("{SGR_REVERSE}> Create new session{SGR_RESET}")
                 } else {
-                    write!(out, "  Create new session").ok();
+                    "  Create new session".to_string()
                 }
             }
             Entry::Session {
@@ -203,32 +231,83 @@ fn draw(
                 detail,
             } => {
                 if *attached {
-                    write!(
-                        out,
-                        "{SGR_DIM}  {name:<20} {detail}{SGR_RESET}"
-                    )
-                    .ok();
+                    format!("{SGR_DIM}  {name:<20} {detail}{SGR_RESET}")
                 } else if selected {
-                    write!(
-                        out,
-                        "{SGR_REVERSE}> {name:<20} {detail}{SGR_RESET}"
-                    )
-                    .ok();
+                    format!("{SGR_REVERSE}> {name:<20} {detail}{SGR_RESET}")
                 } else {
-                    write!(out, "  {name:<20} {detail}").ok();
+                    format!("  {name:<20} {detail}")
                 }
             }
-        }
-        writeln!(out).ok();
+        };
+        write_line(out, &truncate_visible(&line, cols))?;
     }
     out.flush().ok();
+    Ok(())
+}
+
+/// Visible-width truncate that leaves CSI/SGR sequences intact enough for SGR_RESET.
+fn truncate_visible(s: &str, cols: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut visible = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap());
+                for c2 in chars.by_ref() {
+                    out.push(c2);
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if visible >= cols {
+            break;
+        }
+        out.push(c);
+        visible += 1;
+    }
+    // Ensure styles don't leak if we cut mid-line.
+    if s.contains(SGR_REVERSE) || s.contains(SGR_DIM) {
+        if !out.ends_with(SGR_RESET) {
+            out.push_str(SGR_RESET);
+        }
+    }
+    out
+}
+
+fn tty_cols(fd: RawFd) -> Option<u16> {
+    let mut ws = nix::pty::Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let ret = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, &mut ws) };
+    if ret == 0 && ws.ws_col > 0 {
+        Some(ws.ws_col)
+    } else {
+        None
+    }
+}
+
+/// Write one UI row: CR + clear line + text + LF.
+///
+/// Leading `\r` keeps the row left-aligned. We leave OPOST on so `\n` still
+/// advances the line correctly on the TTY (do not emit `\r\n` here or OPOST
+/// turns it into `\r\r\n`).
+fn write_line(out: &mut impl Write, text: &str) -> Result<()> {
+    write!(out, "\r{CSI_CLEAR_LINE}{text}\n").ok();
     Ok(())
 }
 
 fn clear_ui(out: &mut impl Write, n_lines: usize) -> Result<()> {
     write!(out, "\x1b[{n_lines}A").ok();
     for _ in 0..n_lines {
-        writeln!(out, "{CSI_CLEAR_LINE}").ok();
+        write_line(out, "")?;
     }
     write!(out, "\x1b[{n_lines}A").ok();
     out.flush().ok();
@@ -243,8 +322,7 @@ enum Key {
     Other,
 }
 
-fn read_key() -> Result<Key> {
-    let fd = io::stdin().as_raw_fd();
+fn read_key(fd: RawFd) -> Result<Key> {
     let b = read_byte_blocking(fd)?;
     match b {
         b'\r' | b'\n' => Ok(Key::Enter),
@@ -258,7 +336,7 @@ fn read_key() -> Result<Key> {
 
 /// After ESC: arrow keys are `ESC [ A/B`. Bare Esc (no follow-up within ~50ms)
 /// cancels. Other CSI sequences are ignored.
-fn read_escape_sequence(fd: i32) -> Result<Key> {
+fn read_escape_sequence(fd: RawFd) -> Result<Key> {
     let Some(b1) = read_byte_timeout(fd, 50)? else {
         return Ok(Key::Cancel);
     };
@@ -275,11 +353,11 @@ fn read_escape_sequence(fd: i32) -> Result<Key> {
     })
 }
 
-fn read_byte_blocking(fd: i32) -> Result<u8> {
+fn read_byte_blocking(fd: RawFd) -> Result<u8> {
     let mut buf = [0u8; 1];
     loop {
         match nix_read(fd, &mut buf) {
-            Ok(0) => bail!("stdin closed"),
+            Ok(0) => bail!("tty closed"),
             Ok(_) => return Ok(buf[0]),
             Err(Errno::EINTR) => continue,
             Err(e) => return Err(e).context("read key"),
@@ -287,7 +365,7 @@ fn read_byte_blocking(fd: i32) -> Result<u8> {
     }
 }
 
-fn read_byte_timeout(fd: i32, timeout_ms: u16) -> Result<Option<u8>> {
+fn read_byte_timeout(fd: RawFd, timeout_ms: u16) -> Result<Option<u8>> {
     let mut pfd = [PollFd::new(
         unsafe { BorrowedFd::borrow_raw(fd) },
         PollFlags::POLLIN,
@@ -297,7 +375,7 @@ fn read_byte_timeout(fd: i32, timeout_ms: u16) -> Result<Option<u8>> {
             Ok(0) => return Ok(None),
             Ok(_) => break,
             Err(Errno::EINTR) => continue,
-            Err(e) => return Err(e).context("poll stdin"),
+            Err(e) => return Err(e).context("poll tty"),
         }
     }
     let mut buf = [0u8; 1];
@@ -310,7 +388,7 @@ fn read_byte_timeout(fd: i32, timeout_ms: u16) -> Result<Option<u8>> {
 }
 
 struct TermiosGuard {
-    fd: i32,
+    fd: RawFd,
     termios: Rc<Termios>,
 }
 
@@ -321,22 +399,23 @@ impl Drop for TermiosGuard {
             SetArg::TCSAFLUSH,
             &self.termios,
         );
-        let _ = write!(io::stderr(), "{CSI_SHOW_CURSOR}");
-        let _ = io::stderr().flush();
+        // Best-effort cursor restore if the caller did not already show it.
+        if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = write!(tty, "{CSI_SHOW_CURSOR}");
+            let _ = tty.flush();
+        }
     }
 }
 
-fn make_raw(termios: &mut Termios) {
-    termios.input_flags = nix::sys::termios::InputFlags::empty();
-    termios.output_flags &= !(OutputFlags::OPOST);
+/// Input raw enough for single-key reads, but **keep OPOST** so the terminal
+/// still maps `\n` → `\r\n`. Full `cfmakeraw` (which clears OPOST) made the
+/// picker staircase because `writeln!` only emits `\n`.
+fn make_cbreak(termios: &mut Termios) {
     termios.local_flags &= !(LocalFlags::ECHO
         | LocalFlags::ECHONL
         | LocalFlags::ICANON
         | LocalFlags::ISIG
         | LocalFlags::IEXTEN);
-    termios.control_flags &= !(nix::sys::termios::ControlFlags::CSIZE
-        | nix::sys::termios::ControlFlags::PARENB);
-    termios.control_flags |= nix::sys::termios::ControlFlags::CS8;
     termios.control_chars[SpecialCharacterIndices::VMIN as usize] = 1;
     termios.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
 }
@@ -394,7 +473,38 @@ mod tests {
         assert_eq!(next_selectable(&entries, 0), Some(1));
         assert_eq!(next_selectable(&entries, 1), None);
         assert_eq!(prev_selectable(&entries, 1), Some(0));
-        // From create-new, cannot land on attached via next.
         assert_eq!(next_selectable(&entries, 0), Some(1));
+    }
+
+    #[test]
+    fn write_line_uses_cr_clear_and_lf() {
+        let mut buf = Vec::new();
+        write_line(&mut buf, "hello").unwrap();
+        assert_eq!(buf, b"\r\x1b[2Khello\n");
+    }
+
+    #[test]
+    fn draw_keeps_rows_left_aligned() {
+        let entries = vec![
+            Entry::CreateNew,
+            Entry::Session {
+                name: "demo".into(),
+                attached: false,
+                detail: "detached".into(),
+            },
+        ];
+        let mut buf = Vec::new();
+        draw(&mut buf, &entries, 1, true, 4, 80).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("\r\x1b[2K  Create new session\n"));
+        assert!(text.contains("demo"));
+        // Redraw moves up by the fixed row count.
+        let mut buf2 = Vec::new();
+        draw(&mut buf2, &entries, 0, false, 4, 80).unwrap();
+        assert!(
+            buf2.starts_with(b"\x1b[4A"),
+            "{:?}",
+            &buf2[..8.min(buf2.len())]
+        );
     }
 }
