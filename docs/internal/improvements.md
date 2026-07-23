@@ -133,7 +133,18 @@ other shells get passthrough only.
 `source` `shellIntegration.fish` after config). Bash/zsh unchanged. Other shells
 still get raw PTY passthrough.
 
-### 14. `reshell ssh …` wrapper (post-v1)
+### 14. Interactive session picker for bare `reshell` — done
+
+**Was:** Bare `reshell` / `attach` with no name attached to the most recently
+active session (or created one if none existed).
+
+**Now:** On a TTY, shows a small picker: **Create new session** first, then
+detached sessions (by recent activity), then already-attached sessions dimmed
+and skipped by the cursor. Cursor defaults to the first detachable session.
+Non-TTY (scripts) keeps the most-recent fallback; empty still creates a new
+session.
+
+### 15. `reshell ssh …` wrapper (post-v1)
 
 **Today:** Explicit non-goal — no transparent SSH wrap.
 
@@ -148,8 +159,8 @@ so local session semantics stay clear.
 | Priority | Items                        | Why                                                   |
 | -------- | ---------------------------- | ----------------------------------------------------- |
 | First    | §§1–6 (hardening, CI, tests) | Correctness and maintainability without product drift |
-| Next     | §§7–13 done; §§14+ next  | Low surface area; matches dtach/abduco ergonomics     |
-| Later    | §§14–15 (optional depth)     | Real capability gains; still avoid multiplexer chrome |
+| Next     | §§7–14 done; §§15+ next  | Low surface area; matches dtach/abduco ergonomics     |
+| Later    | §§15+ (optional depth)     | Real capability gains; still avoid multiplexer chrome |
 
 When implementing any item, update user-facing README and/or `design.md` /
 `protocol.md` in the same change if behavior or interfaces change (see workspace

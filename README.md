@@ -7,6 +7,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Keep shells alive and running after SSH disconnects
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
 - Explicit sessions: `new` / `attach` / `list` / `info` / `context` / `kill`
+- Bare `reshell` opens a small session picker (create new, then attachable sessions; already-attached shown dimmed)
 - Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
 - Reattach restores TUI terminal modes (mouse, alt-screen, …), the window/tab title, and forces a redraw
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session (bash, zsh, fish)
@@ -52,7 +53,7 @@ pixi global install --git https://github.com/amirhosseindavoody/reshell.git --br
 ## Usage
 
 ```bash
-# Attach to the most recent session, or create one if none exist
+# Interactive session picker (create new / attach); creates one if none exist
 reshell
 # same as: reshell attach
 
@@ -70,7 +71,7 @@ reshell --scrollback 1M new demo --detach
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
 # or: reshell a demo       # short aliases: n/a/ls/i/c/r/k
-# or: reshell attach       # most recently active (or new if none)
+# or: reshell attach       # interactive picker (non-TTY: most recent / new)
 # or: reshell --detach-key '^a' attach demo
 
 # List sessions (created + last-active relative times; --json for scripts)
@@ -99,6 +100,12 @@ reshell kill demo
 ```
 
 Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.
+
+Bare `reshell` / `reshell attach` (no name) opens a small picker when stdin is a
+TTY: **Create new session**, then detached sessions (newest activity first), then
+already-attached sessions shown dimmed (not selectable). ↑/↓ or `j`/`k`, Enter to
+choose, `q` / Esc to cancel. With no sessions it creates one immediately. Without
+a TTY (scripts) it still falls back to the most recently active session.
 
 ### Shell completion
 
@@ -182,7 +189,7 @@ editors:
 | | reshell | dtach / abduco |
 |---|---|---|
 | **Core model** | One PTY per named session; raw byte pipe | Same idea |
-| **Session UX** | `new` / `attach` / `list` / `kill`; bare `reshell` attaches (or creates) the most recent session | Minimal CLI; dtach has little session management; abduco lists sessions but is otherwise sparse |
+| **Session UX** | `new` / `attach` / `list` / `kill`; bare `reshell` opens a small session picker (create new / attach) | Minimal CLI; dtach has little session management; abduco lists sessions but is otherwise sparse |
 | **Reattach redraw** | Restores DEC modes (mouse, alt-screen, …) and forces a two-phase resize so differential TUIs (e.g. ratatui / Fresh) full-paint | Passthrough only — terminal modes and screen contents are not restored; abduco recommends nesting [dvtm](https://github.com/martanne/dvtm) for that |
 | **Detach** | **Ctrl+\\** by default; overridable (`--detach-key` / `RESHELL_DETACH_KEY`) | Configurable detach key (similar spirit) |
 | **Editor / IDE terminals** | VS Code/Cursor sticky scroll: closes the outer `reshell` command and injects shell integration into the session | No awareness of OSC 633 / sticky scroll |

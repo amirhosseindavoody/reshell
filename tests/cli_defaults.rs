@@ -1,6 +1,7 @@
 //! `reshell new` defaults to attach; `--detach` creates without attaching.
-//! `reshell attach` with no name picks the most recently active session
-//! (or creates one if none exist). Bare `reshell` aliases `attach`.
+//! `reshell attach` / bare `reshell` with no name opens an interactive picker
+//! when stdin is a TTY; non-TTY falls back to the most recently active session
+//! (or creates one if none exist).
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::time::Duration;
@@ -53,7 +54,7 @@ fn new_without_detach_requires_tty() {
 }
 
 #[test]
-fn attach_without_name_picks_most_recent() {
+fn attach_without_name_nontty_picks_most_recent() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path();
 
@@ -88,6 +89,7 @@ fn attach_without_name_picks_most_recent() {
         String::from_utf8_lossy(&named.stderr)
     );
 
+    // Non-TTY unnamed attach keeps the most-recent fallback (picker needs a TTY).
     let unnamed = Command::new(reshell_bin())
         .args(["--dir", base.to_str().unwrap(), "attach"])
         .output()
@@ -145,7 +147,7 @@ fn attach_without_name_picks_most_recent() {
 
     new_detached(base, "alias-target");
 
-    // Bare `reshell` (no subcommand) is an alias for attach.
+    // Bare `reshell` (no subcommand) is an alias for attach (non-TTY → most recent).
     let bare = Command::new(reshell_bin())
         .args(["--dir", base.to_str().unwrap()])
         .output()
