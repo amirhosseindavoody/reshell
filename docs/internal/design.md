@@ -51,6 +51,7 @@ Single crate; binary name `reshell`.
 | File | Responsibility |
 |------|----------------|
 | [`src/main.rs`](../../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (short aliases `n`/`a`/`ls`/`i`/`c`/`r`/`k`); dynamic session-name completion (`attach` = detached only; flags hidden from Tab; subcommand Tab shows long name + `(alias)` description); detach-key + log + scrollback flags; default shell `/bin/zsh` |
+| [`src/picker.rs`](../../src/picker.rs) | Small raw-TTY session picker for bare `reshell` / `attach` with no name |
 | [`src/session.rs`](../../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session |
 | [`src/server.rs`](../../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots |
 | [`src/client.rs`](../../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP`, protocol I/O, context fetch |
@@ -134,12 +135,18 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
 
 ### Attach
 
-1. Require a local TTY on stdin.
-2. Resolve the session name: explicit argument, or the most recently active live
-   session (`last_active_unix`, falling back to `created_unix`). Bare `reshell`
-   (no subcommand) is an alias for `reshell attach`. If there are no live sessions,
-   bare attach creates a new one (same as `reshell new`). When resolving an
-   existing session, prints `attaching to <name>` on stderr before connecting.
+1. Require a local TTY on stdin (for named attach and for the interactive picker).
+2. Resolve the session name:
+   - Explicit argument → that session.
+   - No name + no live sessions → create a new one (same as `reshell new`).
+   - No name + TTY → interactive picker (first row: **Create new session**, then
+     detached sessions by recent activity, then already-attached sessions shown
+     dimmed and not selectable). Cursor defaults to the first detachable session
+     when one exists. ↑/↓ (or `j`/`k`), Enter to choose, `q` / Esc to cancel.
+   - No name + non-TTY (scripts) → most recently active live session
+     (`last_active_unix`, else `created_unix`).
+   Bare `reshell` (no subcommand) is an alias for `reshell attach`. When attaching
+   to an existing session, prints `attaching to <name>` on stderr before connecting.
 3. Refuse if meta missing, daemon dead, or an attach flock is already held
    (a leftover `attached` file without a live flock is treated as stale and cleared).
 4. Connect to `session.sock`.

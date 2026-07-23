@@ -18,7 +18,7 @@ pub struct SessionMeta {
     pub shell: String,
     pub created_unix: u64,
     pub attached: bool,
-    /// Last attach/detach time; used by `reshell attach` with no name.
+    /// Last attach/detach time; used by non-TTY bare attach and the picker sort.
     /// Older meta files omit this field (treated as 0 → fall back to created).
     #[serde(default)]
     pub last_active_unix: u64,

@@ -1,5 +1,6 @@
 mod client;
 mod context;
+mod picker;
 mod protocol;
 mod scrollback;
 mod server;
@@ -8,6 +9,7 @@ mod termstate;
 mod vscode_si;
 
 use std::ffi::OsStr;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -41,7 +43,7 @@ struct Cli {
     detach_key: String,
 
     /// Detached PTY bytes to keep and replay on attach (0=off). Examples: 1M, 512K.
-    /// Applied when creating a session (`new` / bare attach with no sessions). Also `RESHELL_SCROLLBACK`.
+    /// Applied when creating a session (`new` / picker "Create new"). Also `RESHELL_SCROLLBACK`.
     #[arg(long, global = true, env = "RESHELL_SCROLLBACK", default_value = "0")]
     scrollback: String,
 
@@ -63,11 +65,12 @@ enum Commands {
         #[arg(long, short = 'd')]
         detach: bool,
     },
-    /// Attach to an existing session (most recently active if name omitted).
-    /// With no sessions, creates a new one (same as `new`).
+    /// Attach to an existing session.
+    /// With no name: interactive picker (create new / attach). Non-TTY falls
+    /// back to the most recently active session; with no sessions, creates one.
     #[command(visible_alias = "a")]
     Attach {
-        /// Session name (defaults to the most recently active session)
+        /// Session name (omit for the interactive picker)
         #[arg(add = ArgValueCompleter::new(complete_attachable_session_name))]
         name: Option<String>,
     },
@@ -404,14 +407,61 @@ fn cmd_attach(
     match name {
         Some(n) => client::attach(base, &n, detach_key),
         None => {
-            let sessions = session::list_sessions(base)?;
+            let mut sessions = session::list_sessions(base)?;
             if sessions.is_empty() {
                 // No live sessions — same as `reshell new`.
                 return cmd_new(base, None, None, false, log, detach_key, scrollback);
             }
-            let meta = session::most_recent_session(base)?;
-            eprintln!("attaching to {}", meta.name);
-            client::attach(base, &meta.name, detach_key)
+
+            let stdin_fd = std::io::stdin().as_raw_fd();
+            let is_tty = nix::unistd::isatty(stdin_fd).unwrap_or(false);
+            if !is_tty {
+                // Scripts / pipes: keep the historical most-recent default.
+                let meta = session::most_recent_session(base)?;
+                eprintln!("attaching to {}", meta.name);
+                return client::attach(base, &meta.name, detach_key);
+            }
+
+            // Detached (attachable) first by activity, then attached (gray).
+            sessions.sort_by(|a, b| {
+                match (a.0.attached, b.0.attached) {
+                    (false, true) => std::cmp::Ordering::Less,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    _ => session::session_activity(&b.0)
+                        .cmp(&session::session_activity(&a.0))
+                        .then_with(|| a.0.name.cmp(&b.0.name)),
+                }
+            });
+
+            let rows: Vec<picker::SessionRow> = sessions
+                .iter()
+                .map(|(meta, _)| {
+                    let state = if meta.attached {
+                        "attached"
+                    } else {
+                        "detached"
+                    };
+                    let last = format_time_human(session::session_activity(meta));
+                    picker::SessionRow {
+                        name: meta.name.clone(),
+                        attached: meta.attached,
+                        detail: format!("{state:<10} {last:<16} {}", meta.shell),
+                    }
+                })
+                .collect();
+
+            match picker::pick_session(&rows)? {
+                picker::PickAction::CreateNew => {
+                    cmd_new(base, None, None, false, log, detach_key, scrollback)
+                }
+                picker::PickAction::Attach(n) => {
+                    eprintln!("attaching to {n}");
+                    client::attach(base, &n, detach_key)
+                }
+                picker::PickAction::Cancelled => {
+                    anyhow::bail!("cancelled");
+                }
+            }
         }
     }
 }
