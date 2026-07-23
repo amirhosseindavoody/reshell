@@ -43,9 +43,11 @@ enum AttachEnd {
     SwitchTo(String),
 }
 
-/// Attach to `name`, optionally switching to another session when the in-session
-/// picker requests it (`SIGUSR1` + `switch_to` file). The original session is
-/// detached before the new attach, freeing its attach lock.
+/// Attach to `name` on this process's TTY.
+///
+/// While attached, a `SIGUSR1` + `switch_to` request (from an in-session
+/// `join_session` / `new` / picker) detaches the current session and attaches
+/// to the next one in-loop — so leaving a session never nests a second client.
 pub fn attach(base: &std::path::Path, name: &str, detach_key: u8) -> Result<()> {
     // Validate target before requiring a TTY so scripts/tests get clear errors.
     preflight_attach(base, name, /*wait_if_attached=*/ false)?;
