@@ -77,6 +77,8 @@ $base/$name/
   meta.json       # name, daemon pid, shell path, created_unix, last_active_unix, attached
   session.sock    # Unix domain socket (mode 0600)
   attached        # flock-backed lock file held while a client is connected
+  client.pid      # pid of the interactive attach client (`SO_PEERCRED`); cleared on detach
+  switch_to       # optional one-shot target name for in-session switch (`SIGUSR1`)
   daemon.log      # per-session daemon log (startup, attach/detach, errors)
 ```
 
@@ -150,11 +152,16 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
      defaults to the first detachable session when one exists. Keys: ↑/↓ move,
      Enter or `s` attach/switch, `k` kill (y/N confirm), `q` / Esc cancel.
      Choosing create-new prompts for a name (editable `session-{unix}-{hex}`
-     default); Esc from the prompt returns to the list.
+     default); Esc from the prompt returns to the list. When the picker (or
+     `attach <name>`) runs **inside** a session, switch asks the outer attach
+     client (`SIGUSR1` + `switch_to`) to detach the current session (freeing
+     its attach lock) and attach to the target instead of nesting a second
+     client.
    - No name + non-TTY (scripts) → most recently active live session
      (`last_active_unix`, else `created_unix`).
    Bare `reshell` (no subcommand) is an alias for `reshell attach`. When attaching
-   to an existing session, prints `attaching to <name>` on stderr before connecting.
+   to an existing session, prints `attaching to <name>` on stderr before connecting
+   (or `switching from <old> to <new>` for an in-session switch).
 3. Refuse if meta missing, daemon dead, or an attach flock is already held
    (a leftover `attached` file without a live flock is treated as stale and cleared).
 4. Connect to `session.sock`.
@@ -164,6 +171,8 @@ the PTY when a client is attached (raw mode sends `0x03` as data).
    - socket `Data` → stdout
    - `SIGWINCH` → `Resize`
    - `SIGHUP` → send `Detach` and exit (session keeps running)
+   - `SIGUSR1` → read `switch_to`, send `Detach`, attach to the new session
+     (same process / TTY; previous session is freed)
 7. On client exit, write a best-effort DEC mode cleanup sequence (disable mouse /
    alt-screen / bracketed paste) before restoring termios, so the local shell is
    not left with sticky TUI modes.

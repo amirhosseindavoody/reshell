@@ -406,7 +406,7 @@ fn cmd_attach(
     scrollback: usize,
 ) -> Result<()> {
     match name {
-        Some(n) => client::attach(base, &n, detach_key),
+        Some(n) => attach_or_switch(base, &n, detach_key),
         None => {
             let mut sessions = session::list_sessions(base)?;
 
@@ -476,18 +476,44 @@ fn cmd_attach(
 
             match picker::pick_session(base, &rows)? {
                 picker::PickAction::CreateNew { name } => {
-                    cmd_new(base, Some(name), None, false, log, detach_key, scrollback)
+                    if let Some(cur) = session::current_session(base)? {
+                        // Create detached, then ask the outer attach client to
+                        // leave `cur` and attach to the new session.
+                        cmd_new(
+                            base,
+                            Some(name.clone()),
+                            None,
+                            true,
+                            log,
+                            detach_key,
+                            scrollback,
+                        )?;
+                        eprintln!("switching from {} to {name}", cur.name);
+                        session::request_attach_switch(base, &cur.name, &name)
+                    } else {
+                        cmd_new(base, Some(name), None, false, log, detach_key, scrollback)
+                    }
                 }
-                picker::PickAction::Attach(n) => {
-                    eprintln!("attaching to {n}");
-                    client::attach(base, &n, detach_key)
-                }
+                picker::PickAction::Attach(n) => attach_or_switch(base, &n, detach_key),
                 picker::PickAction::Cancelled => {
                     anyhow::bail!("cancelled");
                 }
             }
         }
     }
+}
+
+/// Attach to `target`, or if this process is inside another session, ask the
+/// outer attach client to detach (free) that session and switch to `target`.
+fn attach_or_switch(base: &Path, target: &str, detach_key: u8) -> Result<()> {
+    if let Some(cur) = session::current_session(base)? {
+        if cur.name != target {
+            eprintln!("switching from {} to {target}", cur.name);
+            return session::request_attach_switch(base, &cur.name, target);
+        }
+    }
+    eprintln!("attaching to {target}");
+    client::attach(base, target, detach_key)
 }
 
 fn cmd_list(base: &Path, json: bool) -> Result<()> {

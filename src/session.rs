@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use nix::errno::Errno;
 use nix::fcntl::{open, Flock, FlockArg, OFlag};
+use nix::sys::signal::{self, Signal};
 use nix::sys::stat::Mode;
 use nix::unistd::{getuid, Pid};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,14 @@ impl SessionPaths {
             daemon_log: dir.join("daemon.log"),
             dir,
         }
+    }
+
+    pub fn client_pid_file(&self) -> PathBuf {
+        self.dir.join("client.pid")
+    }
+
+    pub fn switch_to_file(&self) -> PathBuf {
+        self.dir.join("switch_to")
     }
 }
 
@@ -101,6 +110,7 @@ impl Drop for AttachLock {
     fn drop(&mut self) {
         if let Ok(paths) = paths_from_dir_fd(self.dir_fd.as_raw_fd()) {
             let _ = fs::remove_file(&paths.attach_lock);
+            let _ = clear_client_pid(&paths);
             let _ = mark_attached(&paths, false);
         }
     }
@@ -572,9 +582,90 @@ pub fn cleanup_session_files(paths: &SessionPaths) -> Result<()> {
     let _ = fs::remove_file(&paths.socket);
     let _ = fs::remove_file(&paths.meta);
     let _ = fs::remove_file(&paths.attach_lock);
+    let _ = fs::remove_file(paths.client_pid_file());
+    let _ = fs::remove_file(paths.switch_to_file());
     let _ = fs::remove_file(&paths.daemon_log);
     let _ = fs::remove_dir(&paths.dir);
     Ok(())
+}
+
+/// Record the interactive attach client's pid (from `SO_PEERCRED`).
+pub fn write_client_pid(paths: &SessionPaths, pid: i32) -> Result<()> {
+    let path = paths.client_pid_file();
+    let tmp = paths.dir.join(format!(".client.pid.{}.tmp", std::process::id()));
+    fs::write(&tmp, format!("{pid}\n")).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
+pub fn clear_client_pid(paths: &SessionPaths) -> Result<()> {
+    let _ = fs::remove_file(paths.client_pid_file());
+    Ok(())
+}
+
+pub fn read_client_pid(paths: &SessionPaths) -> Option<i32> {
+    let raw = fs::read_to_string(paths.client_pid_file()).ok()?;
+    raw.trim().parse().ok()
+}
+
+/// Ask the attach client for this session to switch to `target` (SIGUSR1 + file).
+pub fn write_switch_to(paths: &SessionPaths, target: &str) -> Result<()> {
+    validate_session_name(target)?;
+    let path = paths.switch_to_file();
+    let tmp = paths.dir.join(format!(".switch_to.{}.tmp", std::process::id()));
+    fs::write(&tmp, format!("{target}\n")).with_context(|| format!("write {}", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("rename to {}", path.display()))?;
+    Ok(())
+}
+
+/// Read and remove a pending switch target, if any.
+pub fn take_switch_to(paths: &SessionPaths) -> Option<String> {
+    let path = paths.switch_to_file();
+    let raw = fs::read_to_string(&path).ok()?;
+    let _ = fs::remove_file(&path);
+    let name = raw.trim().to_string();
+    if name.is_empty() || validate_session_name(&name).is_err() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Request that the outer attach client for `from` switch to `to`.
+///
+/// Writes `switch_to` and sends `SIGUSR1` to the recorded client pid so the
+/// original session is detached (freed) before the client attaches to `to`.
+pub fn request_attach_switch(base: &Path, from: &str, to: &str) -> Result<()> {
+    validate_session_name(from)?;
+    validate_session_name(to)?;
+    if from == to {
+        bail!("already in session '{from}'");
+    }
+    let from_paths = SessionPaths::for_name(base, from);
+    let to_paths = SessionPaths::for_name(base, to);
+    if !to_paths.meta.exists() {
+        bail!("session '{to}' not found");
+    }
+    if is_attached(&to_paths) {
+        bail!("session '{to}' is already attached");
+    }
+    let Some(pid) = read_client_pid(&from_paths) else {
+        bail!(
+            "cannot switch from '{from}': no attach client pid \
+             (outer attach is too old or not recorded)"
+        );
+    };
+    if !process_alive(pid) {
+        let _ = clear_client_pid(&from_paths);
+        bail!("cannot switch from '{from}': attach client pid {pid} is dead");
+    }
+    write_switch_to(&from_paths, to)?;
+    match signal::kill(Pid::from_raw(pid), Signal::SIGUSR1) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(from_paths.switch_to_file());
+            Err(e).context(format!("signal attach client pid {pid}"))
+        }
+    }
 }
 
 /// Append a line to the session daemon log (best effort).

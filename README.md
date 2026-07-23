@@ -109,8 +109,9 @@ than the current one) are shown dimmed. Long names truncate with an ellipsis so
 columns stay aligned. Keys: ↑/↓ move, Enter or `s` switch/attach, `k` kill
 (with y/N confirm), `q` / Esc cancel. Choosing create-new (or bare `reshell` with
 no sessions) prompts for a session name pre-filled with a generated `session-…`
-default you can edit. Without a TTY (scripts) it still falls back to the most
-recently active session.
+default you can edit. Switching from **inside** a session detaches (frees) that
+session before attaching to the target — it does not nest a second client.
+Without a TTY (scripts) it still falls back to the most recently active session.
 
 ### Shell completion
 
