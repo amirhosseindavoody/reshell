@@ -234,7 +234,7 @@ Always use `pixi run` / `pixi run -- cargo …` so the conda Rust toolchain is u
 
 ## Design docs
 
-Internal architecture notes: [docs/internal/](docs/internal/).
+Architecture and protocol notes: [docs/DESIGN.md](docs/DESIGN.md), [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## License
 

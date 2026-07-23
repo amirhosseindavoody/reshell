@@ -1,11 +1,12 @@
-# Client–daemon protocol
+# reshell Protocol
 
-Transport: Unix domain stream socket at
-`$base/$session/session.sock` (see [design.md](design.md)).
+Length-prefixed framing over a Unix domain stream socket between the attach
+client and the session daemon.
 
-Implementation: [`src/protocol.rs`](../../src/protocol.rs).
+Transport: `$base/$session/session.sock` (see [DESIGN.md](DESIGN.md) §6).
+Implementation: [`src/protocol.rs`](../src/protocol.rs).
 
-## Framing
+## 1. Framing
 
 Every message:
 
@@ -15,7 +16,7 @@ Every message:
 | `length` | 4 bytes | Little-endian `u32` payload length |
 | `payload` | `length` bytes | Kind-specific |
 
-## Message types
+## 2. Message Types
 
 | `type` | Name | Payload | Direction | Meaning |
 |--------|------|---------|-----------|---------|
@@ -26,7 +27,7 @@ Every message:
 | `5` | `ContextReq` | empty | client → server | Request a context snapshot (no attach lock) |
 | `6` | `ContextRes` | UTF-8 JSON | server → client | `ContextSnapshot` then socket close |
 
-### Winsize payload (`Attach` / `Resize`)
+### 2.1 Winsize payload (`Attach` / `Resize`)
 
 Little-endian:
 
@@ -35,14 +36,14 @@ Little-endian:
 | 0–1 | `rows` (`u16`) |
 | 2–3 | `cols` (`u16`) |
 
-### `Attach` vs `Resize`
+### 2.2 `Attach` vs `Resize`
 
 | Message | Server action |
 |---------|---------------|
 | `Attach` | Replay tracked DEC private modes and the last OSC 0/2 window title to the client as `Data`, clear the local screen, optionally replay detached scrollback as further `Data`, apply a temporary winsize so differential TUIs full-paint, then restore the real winsize shortly after. PTY forwarding starts only after this message. |
 | `Resize` | Apply size with `TIOCSWINSZ` only (normal live resize). |
 
-## Client conventions
+## 3. Client Conventions
 
 - After connect, send `Attach` with the current local winsize before any `Data`.
 - **Detach key:** by default byte `0x1c` (Ctrl+\) in the local stdin stream.
@@ -51,13 +52,17 @@ Little-endian:
   sends `Detach` and exits instead.
 - On local `SIGHUP`, send `Detach` (best effort) and exit.
 - On local `SIGWINCH`, send `Resize`.
+- On local `SIGUSR1` (in-session switch), read `switch_to`, send `Detach`, and
+  attach to the target session on the same TTY.
 - On exit, write a DEC mode cleanup sequence to the local TTY (disable mouse /
   alt-screen / bracketed paste) before restoring termios.
 
-## Server conventions
+## 4. Server Conventions
 
 - At most one attached client. Extra accepts are closed immediately; the daemon
   holds an advisory `flock` on `attached` while connected.
+- Record the peer pid (`SO_PEERCRED`) in `client.pid` while attached; clear on
+  detach.
 - `ContextReq` is classified from the first framed message on accept and answered
   with `ContextRes` **without** taking the attach lock (works while attached).
 - After `Detach` or client EOF/error, clear the attach lock and keep the shell.
@@ -71,7 +76,7 @@ Little-endian:
 - Unrecognized types are a protocol error for the reader; clients ignore unexpected
   control messages from the server (server emits `Data` and `ContextRes`).
 
-### `ContextRes` JSON
+### 4.1 `ContextRes` JSON
 
 ```json
 {
@@ -87,7 +92,7 @@ Little-endian:
 been seen. `alt_screen` is true when a full-screen app currently owns the PTY;
 `lines` then reflect history captured before alt-screen entry.
 
-## Example sequence
+## 5. Example Sequence
 
 ```text
 client                         daemon                         shell

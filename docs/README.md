@@ -2,8 +2,8 @@
 
 | Path | Audience |
 |------|----------|
-| [internal/](internal/) | Maintainers — design, protocol, process model, improvement notes |
+| [DESIGN.md](DESIGN.md) | Maintainers — problem, architecture, session lifecycle, modules |
+| [PROTOCOL.md](PROTOCOL.md) | Maintainers — socket framing and client–daemon messages |
+| [IMPROVEMENTS.md](IMPROVEMENTS.md) | Maintainers — hardening notes and post-v1 ideas |
 
 User-facing install and usage live in the root [README](../README.md).
-
-Internal docs of note: [design](internal/design.md), [protocol](internal/protocol.md), [proposed improvements](internal/improvements.md).
