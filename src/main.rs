@@ -451,6 +451,9 @@ fn cmd_attach(
                     .then_with(|| a.0.name.cmp(&b.0.name)),
             });
 
+            let current_name = session::current_session(base)?
+                .map(|m| m.name);
+
             let rows: Vec<picker::SessionRow> = sessions
                 .iter()
                 .map(|(meta, _)| {
@@ -462,6 +465,7 @@ fn cmd_attach(
                     picker::SessionRow {
                         name: meta.name.clone(),
                         attached: meta.attached,
+                        current: current_name.as_deref() == Some(meta.name.as_str()),
                         state: state.into(),
                         created: format_time_human(meta.created_unix),
                         last_active: format_time_human(session::session_activity(meta)),

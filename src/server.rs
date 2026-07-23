@@ -506,6 +506,11 @@ fn server_loop(
                     Ok(Incoming::AttachCandidate { stream, inbound }) => {
                         if client.is_some() {
                             log("reject attach: session already has a client");
+                            // Close immediately so the client sees EOF (do not
+                            // leave the socket half-open until the arm ends).
+                            drop(inbound);
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            drop(stream);
                         } else {
                             match (
                                 ClientConn::with_inbound(stream, inbound),
