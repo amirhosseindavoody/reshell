@@ -15,6 +15,7 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 - Survive SSH hangup: client exit or `SIGHUP` must not kill the session shell.
 - Minimal input interception: only a single detach byte (default **Ctrl+\** / ASCII `0x1c`; overridable via `--detach-key` / `RESHELL_DETACH_KEY`).
 - Explicit sessions: `new`, `attach`, `list`, `info`, `rename`, `clean`, `kill` — no transparent SSH wrap in v1.
+- Durable primary-screen history as rotating text files under the session dir (not a VT buffer; not replayed on attach).
 - Shell-agnostic: PTY passthrough so bash, zsh, fish, and full-screen apps work.
 - Linux servers only (`linux-64` pixi platform).
 
@@ -103,14 +104,23 @@ Non-TTY: most recently active session, or auto-create when none exist.
 │ SSH TTY /    │ ───────────────────► │ reshell session daemon   │
 │ attach client│ ◄─────────────────── │  - owns PTY master       │
 │ (raw mode)   │   framed messages    │  - poll loop + flock     │
-└──────────────┘                      └────────────┬─────────────┘
+└──────────────┘                      │  - history writer        │
+                                      └────────────┬─────────────┘
                                                    │ PTY
-                                                   ▼
-                                      ┌──────────────────────────┐
-                                      │ shell + children         │
-                                      │ (PTY slave = controlling │
-                                      │  TTY; RESHELL_SESSION)   │
-                                      └──────────────────────────┘
+                          ┌────────────────────────┼────────────────────────┐
+                          │                        ▼                        │
+                          │           ┌──────────────────────────┐          │
+                          │           │ shell + children         │          │
+                          │           │ (PTY slave = controlling │          │
+                          │           │  TTY; RESHELL_SESSION)   │          │
+                          │           └──────────────────────────┘          │
+                          │                                                 │
+                          │  primary-screen text (not alt-screen)           │
+                          ▼                                                 │
+               ┌──────────────────────┐                                     │
+               │ $session/history/    │◄────────────────────────────────────┘
+               │  0001.txt, 0002.txt… │
+               └──────────────────────┘
 ```
 
 ### 5.1 Process model
@@ -321,26 +331,83 @@ mode restore runs before live redraw data.
 
 ### 8.2 On-disk text history
 
-Every PTY read (attached or detached) is also fed to a history writer that:
+History is **not** a VT screen buffer and is **not** replayed on attach. It is an
+append-only, human-readable log of primary-screen shell output under the session
+directory, so `info` (and ordinary tools like `less` / `tail`) can show what a
+session has been doing.
 
-1. Strips CSI/OSC control sequences and accumulates UTF-8 text lines.
-2. **Pauses capture while the alternate screen is active** (DECSET 1049 / 1047 /
-   47). That is full-screen TUI mode — not the attach client's local raw TTY mode.
-3. Appends lines to `$session/history/NNNN.txt` (~2000 body lines per file).
-4. Rotates to the next file with begin/continue/end markers that name the session,
-   file index, timestamps, and previous/next file.
+#### What is captured
 
-Example marker shape:
+| Captured | Skipped |
+|----------|---------|
+| Primary-screen PTY output (attached **or** detached) | Alternate-screen / full-screen TUI output |
+| UTF-8 text lines after stripping CSI / OSC | Mouse, DEC private modes, raw control bytes |
+
+**Alternate screen vs raw mode:** the attach client always puts the *local* TTY in
+raw mode so keystrokes pass through. That is unrelated to history. Full-screen
+apps (editors, ratatui TUIs, …) enter the **alternate screen** via DEC private
+modes `1049` / `1047` / `47`. While those modes are set, history capture pauses
+so TUI redraws do not pollute the text log. Capture resumes when the session
+returns to the primary screen.
+
+#### Layout
 
 ```text
-*** reshell history: session=demo file=1 started=unix:… beginning of session history ***
-line from shell
+$session/history/
+  0001.txt
+  0002.txt
+  …
+```
+
+- Soft cap: **2000 body lines per file** (marker lines do not count toward the cap).
+- When the cap is reached, the daemon closes the current file with a “continuing
+  in file=N+1” marker and opens the next numbered file.
+- On session end (shell exit / daemon teardown), the current file gets a
+  “session closed” marker.
+- CSI/OSC sequences are stripped so the files stay readable as plain text.
+
+#### File format
+
+**History file 1** (`0001.txt`) — beginning of the session:
+
+```text
+*** reshell history: session=demo file=1 started=unix:1730000000 beginning of session history ***
+line 1 captured from shell
+line 2 captured from shell
 …
+line 2000
 *** reshell history: session=demo file=1 ended continuing in file=2 ***
 ```
 
-`reshell info` lists `history_dir` and each history file path (marking the current
-file). History is not replayed onto the TTY on attach.
+**History file 2** (`0002.txt`) — continuation:
+
+```text
+*** reshell history: session=demo file=2 started=unix:1730000100 previous_file=1 ***
+line 1
+line 2
+…
+line 2000
+*** reshell history: session=demo file=2 ended continuing in file=3 ***
+```
+
+**Last file** (when the session ends):
+
+```text
+*** reshell history: session=demo file=N started=unix:… previous_file=N-1 ***
+…
+*** reshell history: session=demo file=N ended session closed ***
+```
+
+#### How `info` exposes it
+
+`reshell info` (and `info --json`) lists:
+
+- `history_dir` — `$session/history`
+- `history` / `history_files` — ordered paths to `0001.txt`, `0002.txt`, …
+  (human output marks the newest file `(current)`)
+
+History is never written back into the live PTY on attach; reattach still relies
+on DEC restore + child redraw (§8.1).
 
 ### 8.3 VS Code / Cursor sticky scroll
 
@@ -433,6 +500,8 @@ conda Rust toolchain is used, not an older system rustup.
 - **Integration** (`tests/attach_race.rs`): concurrent attach (one survivor), stale
   `attached` recovery, kill / `kill --all`, missing-session errors, auto-name
   uniqueness, daemon log.
+- **Integration** (`tests/history_files.rs`): primary-screen lines land in
+  `history/0001.txt`; alt-screen output is skipped; `info` lists history paths.
 - **Integration** (`tests/switch_frees.rs`): in-session switch detaches the original
   session so its attach lock is freed.
 - Shared framing helpers live in `tests/common/` so integration tests stay DRY.
@@ -473,4 +542,6 @@ Linux.
   session), and kill sessions from the picker.
 - Second attach is rejected while the first holds the flock; stale `attached`
   files recover cleanly.
+- Primary-screen output appears in `$session/history/*.txt`; full-screen
+  (alt-screen) output does not; `reshell info` shows the history paths.
 - `pixi run test` / CI `cargo test --locked` pass on Linux without a controlling TTY.
