@@ -378,6 +378,11 @@ pub fn list_history_files(paths: &SessionPaths) -> Vec<PathBuf> {
     files
 }
 
+/// Path of the newest (current) history file, if any exist yet.
+pub fn current_history_file(paths: &SessionPaths) -> Option<PathBuf> {
+    list_history_files(paths).pop()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum Parser {
     #[default]
@@ -477,6 +482,11 @@ mod tests {
 
         let files = list_history_files(&paths);
         assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(
+            current_history_file(&paths).as_ref(),
+            files.last(),
+            "current should be the newest file"
+        );
         let first = fs::read_to_string(&files[0]).unwrap();
         assert!(first.contains("beginning of session history"), "{first}");
         assert!(first.contains("line-0"), "{first}");

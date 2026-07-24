@@ -35,6 +35,8 @@ const MARKER_W: usize = 2; // "> " or "  "
 const MIN_NAME_W: usize = 8;
 const MIN_SHELL_W: usize = 8;
 const MAX_SHELL_W: usize = 24;
+const MIN_HISTORY_W: usize = 8;
+const MAX_HISTORY_W: usize = 48;
 
 /// Outcome of the interactive session picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,8 @@ pub struct SessionRow {
     pub created: String,
     pub last_active: String,
     pub shell: String,
+    /// Path to the current (newest) history file, or a short placeholder.
+    pub history: String,
 }
 
 #[derive(Clone)]
@@ -68,11 +72,13 @@ struct Entry {
     created: String,
     last_active: String,
     shell: String,
+    history: String,
 }
 
 struct ColWidths {
     name: usize,
     shell: usize,
+    history: usize,
 }
 
 /// Interactive picker. Requires a controlling TTY (`/dev/tty` or stdin).
@@ -224,6 +230,7 @@ fn entry_from_row(s: &SessionRow) -> Entry {
         created: s.created.clone(),
         last_active: s.last_active.clone(),
         shell: s.shell.clone(),
+        history: s.history.clone(),
     }
 }
 
@@ -482,20 +489,40 @@ fn compute_widths(entries: &[Entry], cols: usize) -> ColWidths {
         .max()
         .unwrap_or(MIN_SHELL_W)
         .clamp(MIN_SHELL_W, MAX_SHELL_W);
+    let max_history = entries
+        .iter()
+        .map(|e| e.history.chars().count())
+        .max()
+        .unwrap_or(MIN_HISTORY_W)
+        .clamp(MIN_HISTORY_W, MAX_HISTORY_W);
 
-    // marker + name + gaps + state + created + last + shell
-    // gaps: 4 single spaces between the 5 data columns after marker
-    let fixed_rest = MARKER_W + 1 + STATE_W + 1 + TIME_W + 1 + TIME_W + 1;
+    // marker + name + gaps + state + created + last + shell + history
+    // gaps: 5 single spaces between the 6 data columns after marker
+    let fixed_rest = MARKER_W + 1 + STATE_W + 1 + TIME_W + 1 + TIME_W + 1 + 1;
     let available = cols.saturating_sub(fixed_rest);
-    // Prefer giving name room up to max_name; shell gets the remainder (clamped).
-    let shell = max_shell.min(available / 3).max(MIN_SHELL_W.min(available));
-    let name_avail = available.saturating_sub(shell);
-    let name = max_name.min(name_avail).max(MIN_NAME_W.min(name_avail));
-    // If name took less than available, give leftover to shell (still capped).
-    let shell = (available.saturating_sub(name))
-        .min(MAX_SHELL_W)
-        .max(MIN_SHELL_W.min(available.saturating_sub(name)));
-    ColWidths { name, shell }
+    // Prefer name room; shell is capped; leftover goes to history (paths are long).
+    let shell = max_shell.min(available / 4).max(MIN_SHELL_W.min(available));
+    let rest = available.saturating_sub(shell);
+    let name = max_name
+        .min(rest.saturating_sub(MIN_HISTORY_W.min(rest)))
+        .max(MIN_NAME_W.min(rest));
+    let history = max_history
+        .min(rest.saturating_sub(name))
+        .max(MIN_HISTORY_W.min(rest.saturating_sub(name)));
+    // If history needed less than its share, give leftover back to name.
+    let name = rest
+        .saturating_sub(history)
+        .min(max_name)
+        .max(name);
+    let history = rest
+        .saturating_sub(name)
+        .min(MAX_HISTORY_W)
+        .max(MIN_HISTORY_W.min(rest.saturating_sub(name)));
+    ColWidths {
+        name,
+        shell,
+        history,
+    }
 }
 
 fn pad_trunc(s: &str, width: usize) -> String {
@@ -511,6 +538,15 @@ fn pad_trunc(s: &str, width: usize) -> String {
     if width <= 1 {
         return "…".chars().take(width).collect();
     }
+    // Prefer keeping the end of paths (`…/history/0001.txt`) when truncated.
+    if s.contains('/') && width > 2 {
+        let keep = width - 1;
+        let chars: Vec<char> = s.chars().collect();
+        let start = chars.len().saturating_sub(keep);
+        let mut out = String::from("…");
+        out.extend(chars[start..].iter());
+        return out;
+    }
     let keep = width - 1;
     let mut out: String = s.chars().take(keep).collect();
     out.push('…');
@@ -524,15 +560,17 @@ fn format_session_row(
     created: &str,
     last_active: &str,
     shell: &str,
+    history: &str,
     widths: &ColWidths,
 ) -> String {
     format!(
-        "{marker}{name} {state:<state_w$} {created} {last_active} {shell}",
+        "{marker}{name} {state:<state_w$} {created} {last_active} {shell} {history}",
         name = pad_trunc(name, widths.name),
         state_w = STATE_W,
         created = pad_trunc(created, TIME_W),
         last_active = pad_trunc(last_active, TIME_W),
         shell = pad_trunc(shell, widths.shell),
+        history = pad_trunc(history, widths.history),
     )
 }
 
@@ -570,6 +608,7 @@ fn draw(
             "CREATED",
             "LAST ACTIVE",
             "SHELL",
+            "HISTORY",
             widths,
         );
         write_line(
@@ -587,6 +626,7 @@ fn draw(
                 &entry.created,
                 &entry.last_active,
                 &entry.shell,
+                &entry.history,
                 widths,
             );
             let line = if selected {
@@ -808,6 +848,7 @@ mod tests {
             created: "2h ago".into(),
             last_active: "1m ago".into(),
             shell: "/bin/zsh".into(),
+            history: "/tmp/reshell/demo/history/0001.txt".into(),
         }
     }
 
@@ -860,12 +901,20 @@ mod tests {
     }
 
     #[test]
+    fn pad_trunc_keeps_path_suffix() {
+        let out = pad_trunc("/tmp/reshell/demo/history/0001.txt", 18);
+        assert!(out.starts_with('…'), "{out}");
+        assert!(out.ends_with("0001.txt"), "{out}");
+        assert_eq!(out.chars().count(), 18);
+    }
+
+    #[test]
     fn widths_expand_for_long_names_and_keep_columns() {
         let entries = vec![
             sess("short", false),
             sess("this-is-a-very-long-session-name", false),
         ];
-        let w = compute_widths(&entries, 100);
+        let w = compute_widths(&entries, 120);
         assert!(w.name >= "this-is-a-very-long-session-name".len() || w.name >= MIN_NAME_W);
         let row = format_session_row(
             "  ",
@@ -874,28 +923,32 @@ mod tests {
             "2h ago",
             "1m ago",
             "/bin/zsh",
+            "/tmp/reshell/demo/history/0001.txt",
             &w,
         );
         // STATE column should still appear as a whole word (not glued to name).
         assert!(row.contains(" detached "));
         assert!(row.contains("CREATED") || row.contains("2h ago"));
+        assert!(row.contains("history") || row.contains("0001.txt"), "{row}");
     }
 
     #[test]
     fn draw_includes_header_and_n_new_help() {
         let entries = vec![sess("demo", false)];
-        let widths = compute_widths(&entries, 100);
+        let widths = compute_widths(&entries, 120);
         let mut buf = Vec::new();
         // n_lines = 2 + 1 + 1 = 4
-        draw(&mut buf, &entries, 0, true, 4, 100, &widths, None).unwrap();
+        draw(&mut buf, &entries, 0, true, 4, 120, &widths, None).unwrap();
         let text = String::from_utf8_lossy(&buf);
         assert!(!text.contains("Create new session"), "{text}");
         assert!(text.contains("n new"), "{text}");
         assert!(text.contains("CREATED"));
         assert!(text.contains("LAST ACTIVE"));
+        assert!(text.contains("HISTORY"));
         assert!(text.contains("2h ago"));
         assert!(text.contains("1m ago"));
         assert!(text.contains("demo"));
+        assert!(text.contains("0001.txt") || text.contains("history"), "{text}");
         assert!(text.contains("k kill"));
         assert!(text.contains("Enter/s switch") || text.contains("switch"));
     }

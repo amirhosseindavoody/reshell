@@ -97,15 +97,16 @@ Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach,
 
 Bare `reshell` / `reshell attach` (no name) opens a small picker when stdin is a
 TTY: a table of sessions (newest activity first among detached, then attached:
-name, state, created, last-active, shell). The session you are inside is marked
-with `*` and bolded. Already-attached sessions (other than the current one) are
-shown dimmed. Long names truncate with an ellipsis so columns stay aligned.
-Keys: ↑/↓ move, Enter or `s` switch/attach, `n` create (name prompt), `k` kill
-(with y/N confirm), `q` / Esc cancel. Pressing `n` (or bare `reshell` with no
-sessions) prompts for a session name pre-filled with a generated `session-…`
-default you can edit. Switching from **inside** a session detaches (frees) that
-session before attaching to the target — it does not nest a second client.
-Without a TTY (scripts) it still falls back to the most recently active session.
+name, state, created, last-active, shell, and the current history file path).
+The session you are inside is marked with `*` and bolded. Already-attached
+sessions (other than the current one) are shown dimmed. Long names and paths
+truncate with an ellipsis so columns stay aligned. Keys: ↑/↓ move, Enter or `s`
+switch/attach, `n` create (name prompt), `k` kill (with y/N confirm), `q` / Esc
+cancel. Pressing `n` (or bare `reshell` with no sessions) prompts for a session
+name pre-filled with a generated `session-…` default you can edit. Switching
+from **inside** a session detaches (frees) that session before attaching to the
+target — it does not nest a second client. Without a TTY (scripts) it still
+falls back to the most recently active session.
 
 ### Shell completion
 
