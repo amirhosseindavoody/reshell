@@ -2,8 +2,9 @@
 //!
 //! Order: detached (attachable), then attached (dimmed). The session this
 //! process is inside is marked with `*`. Cursor defaults to the first
-//! attachable session when one exists. Keys: Enter/`s` attach (switch), `n`
-//! create (name prompt), `k` kill with confirmation, `q`/Esc cancel.
+//! attachable session when one exists. Keys: Enter/`s` attach (switch;
+//! attached sessions confirm detach-first), `n` create (name prompt), `k`
+//! kill with confirmation, `q`/Esc cancel.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -43,8 +44,10 @@ const MAX_HISTORY_W: usize = 48;
 pub enum PickAction {
     /// Create a new session with the given name (already validated).
     CreateNew { name: String },
-    /// Attach / switch to this session.
+    /// Attach / switch to this session (currently detached).
     Attach(String),
+    /// User confirmed: detach the other client, then attach / switch.
+    AttachAfterDetach(String),
     Cancelled,
 }
 
@@ -83,10 +86,11 @@ struct ColWidths {
 
 /// Interactive picker. Requires a controlling TTY (`/dev/tty` or stdin).
 ///
-/// All rows are navigable. Detached sessions can be attached with Enter / `s`.
-/// Attached sessions are dimmed (Enter/`s` no-op). The current session is marked
-/// with `*`. `n` creates a new session (name prompt). `k` kills the highlighted
-/// session after confirmation.
+/// All rows are navigable. Detached sessions attach with Enter / `s`. Attached
+/// sessions (other than the current one) prompt to detach the other client
+/// first, then attach — still exclusive (one terminal at a time). The current
+/// session is marked with `*`. `n` creates a new session (name prompt). `k`
+/// kills the highlighted session after confirmation.
 pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> {
     let mut tty = open_tty()?;
     let tty_fd = tty.as_raw_fd();
@@ -153,13 +157,30 @@ pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> 
                         continue;
                     }
                     let entry = &entries[cursor];
+                    if entry.current {
+                        status = Some("already in this session".into());
+                        continue;
+                    }
                     if entry.attached {
-                        status = Some("session is already attached".into());
-                    } else {
                         let name = entry.name.clone();
                         clear_ui(&mut tty, n_lines)?;
-                        return Ok(PickAction::Attach(name));
+                        let confirmed = confirm_yn(
+                            &mut tty,
+                            tty_fd,
+                            &format!(
+                                "Session '{name}' is attached. Detach the other client and attach here?"
+                            ),
+                            cols,
+                        )?;
+                        first_draw = true;
+                        if confirmed {
+                            return Ok(PickAction::AttachAfterDetach(name));
+                        }
+                        continue;
                     }
+                    let name = entry.name.clone();
+                    clear_ui(&mut tty, n_lines)?;
+                    return Ok(PickAction::Attach(name));
                 }
                 Key::Char('n') | Key::Char('N') => {
                     clear_ui(&mut tty, n_lines)?;
@@ -850,6 +871,18 @@ mod tests {
             shell: "/bin/zsh".into(),
             history: "/tmp/reshell/demo/history/0001.txt".into(),
         }
+    }
+
+    #[test]
+    fn pick_action_attach_after_detach_variant() {
+        assert_ne!(
+            PickAction::Attach("x".into()),
+            PickAction::AttachAfterDetach("x".into())
+        );
+        assert_eq!(
+            PickAction::AttachAfterDetach("demo".into()),
+            PickAction::AttachAfterDetach("demo".into())
+        );
     }
 
     #[test]

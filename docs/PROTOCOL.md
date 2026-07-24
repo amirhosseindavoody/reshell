@@ -48,7 +48,8 @@ Little-endian:
   Overridable with `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or a
   single ASCII char). The client must not forward that byte to the session; it
   sends `Detach` and exits instead.
-- On local `SIGHUP`, send `Detach` (best effort) and exit.
+- On local `SIGHUP`, send `Detach` (best effort) and exit. (`reshell detach` and
+  the picker steal-confirm path signal `SIGHUP` to the recorded `client.pid`.)
 - On local `SIGWINCH`, send `Resize`.
 - On local `SIGUSR1` (in-session switch), read `switch_to`, send `Detach`, and
   attach to the target session on the same TTY.

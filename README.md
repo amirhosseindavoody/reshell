@@ -68,9 +68,13 @@ reshell new demo --detach
 
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
-# or: reshell a demo       # short aliases: n/a/ls/i/r/k
+# or: reshell a demo       # short aliases: n/a/d/ls/i/r/k
 # or: reshell attach       # interactive picker (non-TTY: most recent / new)
 # or: reshell --detach-key '^a' attach demo
+
+# Detach a client from a session (shell keeps running)
+reshell detach demo
+# or: reshell d            # current session when inside one; else most recent
 
 # List sessions (created + last-active relative times; --json for scripts)
 reshell list
@@ -93,7 +97,8 @@ reshell kill demo
 # or: reshell kill --all   # terminate every live session
 ```
 
-Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `r` rename, `k` kill.
+Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach,
+`d` detach, `ls` list, `i` info, `r` rename, `k` kill.
 
 Bare `reshell` / `reshell attach` (no name) opens a small picker when stdin is a
 TTY: a table of sessions (newest activity first among detached, then attached:
@@ -101,12 +106,13 @@ name, state, created, last-active, shell, and the current history file path).
 The session you are inside is marked with `*` and bolded. Already-attached
 sessions (other than the current one) are shown dimmed. Long names and paths
 truncate with an ellipsis so columns stay aligned. Keys: ↑/↓ move, Enter or `s`
-switch/attach, `n` create (name prompt), `k` kill (with y/N confirm), `q` / Esc
-cancel. Pressing `n` (or bare `reshell` with no sessions) prompts for a session
-name pre-filled with a generated `session-…` default you can edit. Switching
-from **inside** a session detaches (frees) that session before attaching to the
-target — it does not nest a second client. Without a TTY (scripts) it still
-falls back to the most recently active session.
+switch/attach (attached sessions confirm detach-first), `n` create (name prompt),
+`k` kill (with y/N confirm), `q` / Esc cancel. Pressing `n` (or bare `reshell`
+with no sessions) prompts for a session name pre-filled with a generated
+`session-…` default you can edit. Switching from **inside** a session detaches
+(frees) that session before attaching to the target — it does not nest a second
+client. A session still admits only one attached terminal at a time. Without a
+TTY (scripts) it still falls back to the most recently active session.
 
 ### Shell completion
 
@@ -124,7 +130,7 @@ reshell completion fish | source
 To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
 
 Completions call back into `reshell` at tab time, so `attach` suggests
-**detachable** session names only, while `info` / `kill` / `rename`
+**detachable** session names only, while `info` / `detach` / `kill` / `rename`
 suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). After `reshell`,
 Tab lists long subcommand names (and short aliases in the description where the
 shell shows them — e.g. `new (n)`). Option flags (`--dir`, …)

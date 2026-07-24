@@ -637,6 +637,46 @@ pub fn take_switch_to(paths: &SessionPaths) -> Option<String> {
     Some(name)
 }
 
+/// Ask the attach client for `name` to detach (shell keeps running).
+///
+/// Signals `SIGHUP` to the recorded outer client (`client.pid`), which sends
+/// `Detach` and exits — the same path as an SSH hangup. Waits until the attach
+/// lock is released. Idempotent when the session is already detached.
+pub fn request_detach(base: &Path, name: &str) -> Result<()> {
+    validate_session_name(name)?;
+    let paths = SessionPaths::for_name(base, name);
+    if !paths.meta.exists() {
+        bail!("session '{name}' not found");
+    }
+    if !is_attached(&paths) {
+        return Ok(());
+    }
+    let Some(pid) = read_client_pid(&paths) else {
+        bail!(
+            "cannot detach session '{name}': no attach client pid \
+             (outer attach is too old or not recorded)"
+        );
+    };
+    if !process_alive(pid) {
+        let _ = clear_client_pid(&paths);
+        if !is_attached(&paths) {
+            return Ok(());
+        }
+        bail!("cannot detach session '{name}': attach client pid {pid} is dead");
+    }
+    signal::kill(Pid::from_raw(pid), Signal::SIGHUP)
+        .with_context(|| format!("signal attach client pid {pid} (SIGHUP)"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if !is_attached(&paths) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    bail!("timed out waiting for session '{name}' to detach");
+}
+
 /// Ask the outer attach client for `from` to detach that session and attach to `to`.
 ///
 /// By construction this never nests a second attach client: the recorded outer
