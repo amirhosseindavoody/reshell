@@ -52,7 +52,7 @@ Multiplexers solve a different problem (many windows inside one connection). The
 ### 4.1 User experience
 
 ```bash
-# Interactive session picker (create / attach / switch / kill)
+# Interactive session picker (`n` new / attach / switch / kill)
 reshell
 # same as: reshell attach
 
