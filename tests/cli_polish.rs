@@ -56,6 +56,8 @@ fn info_shows_paths() {
     assert!(txt.contains("name:        info-me"));
     assert!(txt.contains("socket:"));
     assert!(txt.contains("daemon_log:"));
+    assert!(txt.contains("history_dir:"));
+    assert!(txt.contains("history:"));
     assert!(txt.contains("state:       detached"));
 
     let json = Command::new(reshell_bin())
@@ -284,13 +286,6 @@ fn short_subcommand_aliases_work() {
     assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
     assert!(String::from_utf8_lossy(&list.stdout).contains("\"name\": \"alias-me\""));
 
-    let ctx = Command::new(reshell_bin())
-        .args(["--dir", base.to_str().unwrap(), "c", "alias-me"])
-        .output()
-        .unwrap();
-    assert!(ctx.status.success(), "{}", String::from_utf8_lossy(&ctx.stderr));
-    assert!(String::from_utf8_lossy(&ctx.stdout).contains("session: alias-me"));
-
     kill_session(base, "alias-me");
 }
 
@@ -450,7 +445,6 @@ fn completion_omits_option_flags() {
         "short aliases should not be primary candidates: {txt:?}"
     );
     assert!(!txt.contains("--dir"), "flags should not complete: {txt:?}");
-    assert!(!txt.contains("--scrollback"), "flags should not complete: {txt:?}");
     assert!(!txt.contains("--help"), "flags should not complete: {txt:?}");
 
     // zsh/fish show the short alias in the description: `new` + `(n) …`
@@ -476,44 +470,6 @@ fn completion_omits_option_flags() {
     assert!(help.status.success());
     let help_txt = String::from_utf8_lossy(&help.stdout);
     assert!(help_txt.contains("--dir"), "help missing --dir: {help_txt}");
-    assert!(
-        help_txt.contains("--scrollback"),
-        "help missing --scrollback: {help_txt}"
-    );
-}
-
-#[test]
-fn scrollback_flag_is_validated() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path();
-    let bad = Command::new(reshell_bin())
-        .args([
-            "--dir",
-            base.to_str().unwrap(),
-            "--scrollback",
-            "not-a-size",
-            "list",
-        ])
-        .output()
-        .unwrap();
-    assert!(!bad.status.success());
-    assert!(
-        String::from_utf8_lossy(&bad.stderr).contains("scrollback"),
-        "{}",
-        String::from_utf8_lossy(&bad.stderr)
-    );
-
-    let ok = Command::new(reshell_bin())
-        .args([
-            "--dir",
-            base.to_str().unwrap(),
-            "--scrollback",
-            "1M",
-            "list",
-        ])
-        .output()
-        .unwrap();
-    assert!(ok.status.success());
 }
 
 #[test]

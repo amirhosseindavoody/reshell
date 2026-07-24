@@ -16,9 +16,8 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
 use nix::unistd::{read as nix_read, write as nix_write};
 
-use crate::context::{SessionContext, DEFAULT_CONTEXT_LINES};
+use crate::history::HistoryWriter;
 use crate::protocol::{self, Message, Winsize};
-use crate::scrollback::Scrollback;
 use crate::session::{
     self, append_daemon_log, cleanup_session_files, now_unix, open_session_dir_fd,
     paths_from_dir_fd, write_client_pid, write_meta, AttachLock, SessionMeta, SessionPaths,
@@ -32,9 +31,6 @@ const OUTBOUND_HIGH_WATER: usize = 256 * 1024;
 
 /// Stop reading client input while PTY writes are backed up this far.
 const PTY_OUTBOUND_HIGH_WATER: usize = 256 * 1024;
-
-/// Chunk size when replaying scrollback as `Data` frames on attach.
-const SCROLLBACK_REPLAY_CHUNK: usize = 64 * 1024;
 
 /// After attach, keep the temporary (bumped) winsize at least this long so
 /// differential TUIs (ratatui/crossterm) can emit a full cell dump at the new
@@ -51,8 +47,6 @@ pub struct NewSessionOpts {
     pub base: PathBuf,
     /// Optional log path override (`--log` / `RESHELL_LOG`). Default: `$session/daemon.log`.
     pub log_path: Option<PathBuf>,
-    /// Bytes of detached PTY output to keep and replay on attach (`0` = off).
-    pub scrollback: usize,
 }
 
 struct ClientConn {
@@ -278,22 +272,15 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
             append_daemon_log(
                 &paths,
                 &format!(
-                    "ready pid={} socket={} scrollback={}",
+                    "ready pid={} socket={}",
                     meta.pid,
-                    paths.socket.display(),
-                    opts.scrollback
+                    paths.socket.display()
                 ),
             );
 
             let dir_fd = open_session_dir_fd(&paths)?;
-            server_loop(
-                master,
-                listener,
-                shell_pid,
-                dir_fd,
-                opts.scrollback,
-                opts.name.clone(),
-            )?;
+            let history = HistoryWriter::open(&paths, &opts.name)?;
+            server_loop(master, listener, shell_pid, dir_fd, history)?;
             Ok(())
         }
         ForkResult::Child => {
@@ -404,15 +391,12 @@ fn server_loop(
     listener: UnixListener,
     shell_pid: Pid,
     dir_fd: OwnedFd,
-    scrollback_cap: usize,
-    session_name: String,
+    mut history: HistoryWriter,
 ) -> Result<()> {
     let master_fd = master.as_raw_fd();
     let mut client: Option<ClientConn> = None;
     let mut attach_lock: Option<AttachLock> = None;
     let mut term = TermState::new();
-    let mut scrollback = Scrollback::new(scrollback_cap);
-    let mut context = SessionContext::new(DEFAULT_CONTEXT_LINES);
     let mut pending_redraw: Option<PendingAttachRedraw> = None;
     let mut pty_outbound: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
@@ -444,7 +428,7 @@ fn server_loop(
 
         let want_pty_read = match &client {
             Some(c) => c.outbound.len() < OUTBOUND_HIGH_WATER,
-            None => true, // drain while detached (into scrollback when enabled)
+            None => true, // drain while detached (history still captures primary screen)
         };
         let want_pty_write = !pty_outbound.is_empty();
 
@@ -494,15 +478,6 @@ fn server_loop(
         if listen_revents.contains(PollFlags::POLLIN) {
             match listener.accept() {
                 Ok((stream, _)) => match classify_incoming(stream) {
-                    Ok(Incoming::Context { stream }) => {
-                        let alt = term.alt_screen();
-                        let snap = context.snapshot(&session_name, alt);
-                        if let Err(e) = reply_context(stream, &snap) {
-                            log(&format!("context reply failed: {e:#}"));
-                        } else {
-                            log("served context snapshot");
-                        }
-                    }
                     Ok(Incoming::AttachCandidate { stream, inbound }) => {
                         if client.is_some() {
                             log("reject attach: session already has a client");
@@ -522,7 +497,6 @@ fn server_loop(
                                         &mut c,
                                         master_fd,
                                         &term,
-                                        &mut scrollback,
                                         &mut pending_redraw,
                                         &mut pty_outbound,
                                     ) {
@@ -589,10 +563,13 @@ fn server_loop(
                 Ok(n) => {
                     // Always parse modes — including while detached — so reattach
                     // can restore mouse / alt-screen on the new client TTY.
-                    let alt = term.alt_screen();
+                    let was_alt = term.alt_screen();
                     term.feed(&buf[..n]);
-                    // Capture shell history for `reshell context` (pause in alt-screen).
-                    context.feed(&buf[..n], alt);
+                    let now_alt = term.alt_screen();
+                    // Skip the whole chunk if we were, are, or transition through
+                    // alt-screen in this read (avoids capturing TUI junk that
+                    // shares a buffer with the enter/leave CSI).
+                    history.feed(&buf[..n], was_alt || now_alt);
                     let forward = matches!(&client, Some(c) if c.ready);
                     if forward {
                         if let Some(ref mut c) = client {
@@ -604,9 +581,6 @@ fn server_loop(
                                 drop_client(&mut client, &mut attach_lock, &dir_fd);
                             }
                         }
-                    } else {
-                        // No ready client: keep bytes for optional attach replay.
-                        scrollback.push(&buf[..n]);
                     }
                 }
                 Err(Errno::EAGAIN) => {}
@@ -640,7 +614,6 @@ fn server_loop(
                             c,
                             master_fd,
                             &term,
-                            &mut scrollback,
                             &mut pending_redraw,
                             &mut pty_outbound,
                         ) {
@@ -666,6 +639,7 @@ fn server_loop(
         }
     }
 
+    history.finish();
     let _ = signal::kill(shell_pid, Signal::SIGHUP);
     let _ = waitpid(shell_pid, None);
     if let Ok(paths) = paths_from_dir_fd(dir_fd.as_raw_fd()) {
@@ -729,7 +703,6 @@ fn handle_client_messages(
     client: &mut ClientConn,
     master_fd: RawFd,
     term: &TermState,
-    scrollback: &mut Scrollback,
     pending_redraw: &mut Option<PendingAttachRedraw>,
     pty_outbound: &mut Vec<u8>,
 ) -> Result<bool> {
@@ -744,14 +717,6 @@ fn handle_client_messages(
                 // paint isn't merged onto stale local cells.
                 restore.extend_from_slice(b"\x1b[H\x1b[2J");
                 client.enqueue(&Message::Data(restore))?;
-
-                // Replay bytes captured while detached (plain-shell history).
-                let history = scrollback.take();
-                if !history.is_empty() {
-                    for chunk in history.chunks(SCROLLBACK_REPLAY_CHUNK) {
-                        client.enqueue(&Message::Data(chunk.to_vec()))?;
-                    }
-                }
 
                 // Phase 1: temporary geometry so ratatui invalidates its
                 // previous buffer and emits a full cell dump to this client.
@@ -778,18 +743,12 @@ fn handle_client_messages(
                 flush_pty_outbound(master_fd, pty_outbound)?;
             }
             Message::Detach => return Ok(true),
-            Message::ContextReq | Message::ContextRes(_) => {
-                // Context is handled on the accept path as a short-lived
-                // connection; ignore if it appears on an attach client.
-            }
         }
     }
     Ok(false)
 }
 
 enum Incoming {
-    /// Short-lived context query (no attach lock).
-    Context { stream: UnixStream },
     /// Potential interactive client; `inbound` may already contain `Attach`.
     AttachCandidate {
         stream: UnixStream,
@@ -798,7 +757,7 @@ enum Incoming {
     Rejected,
 }
 
-/// Read the first framed message to distinguish context queries from attach.
+/// Buffer the first framed message(s) so Attach can be handled immediately.
 fn classify_incoming(mut stream: UnixStream) -> Result<Incoming> {
     set_nonblocking(stream.as_raw_fd())?;
     let mut inbound = Vec::new();
@@ -807,25 +766,16 @@ fn classify_incoming(mut stream: UnixStream) -> Result<Incoming> {
     loop {
         let messages = protocol::drain_messages(&mut inbound)?;
         if !messages.is_empty() {
-            let mut iter = messages.into_iter();
-            let first = iter.next().expect("non-empty");
-            match first {
-                Message::ContextReq => {
-                    return Ok(Incoming::Context { stream });
-                }
-                other => {
-                    // Re-queue framed messages ahead of any undecoded bytes.
-                    let mut prefix = protocol::encode_message(&other)?;
-                    for msg in iter {
-                        prefix.extend(protocol::encode_message(&msg)?);
-                    }
-                    prefix.append(&mut inbound);
-                    return Ok(Incoming::AttachCandidate {
-                        stream,
-                        inbound: prefix,
-                    });
-                }
+            // Re-queue framed messages ahead of any undecoded bytes.
+            let mut prefix = Vec::new();
+            for msg in messages {
+                prefix.extend(protocol::encode_message(&msg)?);
             }
+            prefix.append(&mut inbound);
+            return Ok(Incoming::AttachCandidate {
+                stream,
+                inbound: prefix,
+            });
         }
         match stream.read(&mut buf) {
             Ok(0) => return Ok(Incoming::Rejected),
@@ -844,13 +794,4 @@ fn classify_incoming(mut stream: UnixStream) -> Result<Incoming> {
             Err(_) => return Ok(Incoming::Rejected),
         }
     }
-}
-
-fn reply_context(mut stream: UnixStream, snap: &crate::context::ContextSnapshot) -> Result<()> {
-    // Blocking write is fine for a tiny JSON reply on a short-lived socket.
-    let _ = stream.set_nonblocking(false);
-    let payload = serde_json::to_vec(snap).context("encode context snapshot")?;
-    protocol::write_message(&mut stream, &Message::ContextRes(payload))?;
-    let _ = stream.flush();
-    Ok(())
 }

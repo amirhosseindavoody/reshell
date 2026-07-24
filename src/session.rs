@@ -59,6 +59,11 @@ impl SessionPaths {
     pub fn switch_to_file(&self) -> PathBuf {
         self.dir.join("switch_to")
     }
+
+    /// Directory of rotating text history files (`0001.txt`, …).
+    pub fn history_dir(&self) -> PathBuf {
+        self.dir.join("history")
+    }
 }
 
 /// Resolve the current path of an open directory fd (Linux `/proc`).
@@ -586,6 +591,7 @@ pub fn cleanup_session_files(paths: &SessionPaths) -> Result<()> {
     let _ = fs::remove_file(paths.client_pid_file());
     let _ = fs::remove_file(paths.switch_to_file());
     let _ = fs::remove_file(&paths.daemon_log);
+    let _ = fs::remove_dir_all(paths.history_dir());
     let _ = fs::remove_dir(&paths.dir);
     Ok(())
 }

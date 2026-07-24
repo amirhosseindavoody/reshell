@@ -21,7 +21,7 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 ### Non-Goals (v1)
 
 - Window splitting, tabs, or status bars.
-- VT screen-buffer emulation / multiplexer-style scrollback UI (optional byte-ring replay of detached output is supported; apps still redraw on attach).
+- VT screen-buffer emulation / multiplexer-style scrollback UI (reattach relies on DEC restore + child redraw; history is logged to text files, not replayed onto the TTY).
 - Multi-client shared attach (second attach is rejected).
 - macOS / Windows.
 - Automatic `reshell ssh …` wrapper.
@@ -30,7 +30,7 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 
 ### 3.1 dtach / abduco
 
-Closest relatives: one PTY, detach/reattach, almost no UI chrome. reshell follows that model — raw PTY passthrough, exclusive attach, and a single detach key — while adding explicit session management (`list` / `info` / picker), DEC-mode restore, optional detached scrollback, and VS Code/Cursor sticky-scroll fixes.
+Closest relatives: one PTY, detach/reattach, almost no UI chrome. reshell follows that model — raw PTY passthrough, exclusive attach, and a single detach key — while adding explicit session management (`list` / `info` / picker), DEC-mode restore, on-disk text history, and VS Code/Cursor sticky-scroll fixes.
 
 ### 3.2 tmux / screen / Zellij
 
@@ -43,8 +43,7 @@ Multiplexers solve a different problem (many windows inside one connection). The
 | Named sessions + picker | Bare `reshell` / `attach` opens a small TUI when stdin is a TTY |
 | In-session switch | Switching frees the original attach lock (no nested clients) |
 | DEC + title restore | Reattach restores mouse / alt-screen / window title, then forces redraw |
-| Optional scrollback | Bounded ring of detached PTY bytes; not a VT buffer |
-| `context` snapshot | Last OSC 633 command + ~100 primary-screen lines without attaching |
+| On-disk history | Rotating text files under `$session/history/` (~2000 lines each); skips alt-screen |
 | VS Code / Cursor SI | Finish outer command + inject shell integration into the session shell |
 
 ## 4. Product Shape
@@ -62,19 +61,15 @@ reshell new                    # auto-generated name
 reshell new demo --shell /bin/bash
 reshell new demo --detach      # create only; print name on stdout
 
-# Keep ~1 MiB of detached output and replay it on attach
-reshell --scrollback 1M new demo --detach
-
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
-reshell a demo                 # short aliases: n/a/ls/i/c/r/k
+reshell a demo                 # short aliases: n/a/ls/i/r/k
 reshell --detach-key '^a' attach demo
 
 # Inspect / manage
 reshell list
 reshell ls --json
-reshell info demo
-reshell context demo
+reshell info demo              # includes history file paths
 reshell rename old new
 reshell clean
 reshell kill demo
@@ -99,7 +94,6 @@ Non-TTY: most recently active session, or auto-create when none exist.
 | Detach key | Ctrl+\ (`0x1c`) | `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or one ASCII char) |
 | Session base dir | `$XDG_RUNTIME_DIR/reshell` or `/tmp/reshell-$UID` | `--dir` / `RESHELL_DIR` |
 | Daemon log | `$base/$name/daemon.log` | `--log` / `RESHELL_LOG` |
-| Scrollback | `0` (off) | `--scrollback` / `RESHELL_SCROLLBACK` (`512K`, `1M`; max 16M) |
 | Default shell | `/bin/zsh` | `--shell` on `new` |
 
 ## 5. Architecture
@@ -147,8 +141,7 @@ reshell/
 │   ├── server.rs        # daemonize, openpty, accept, multiplex I/O
 │   ├── client.rs        # raw TTY, detach key, SIGWINCH / SIGHUP / SIGUSR1
 │   ├── protocol.rs      # length-prefixed framing (see PROTOCOL.md)
-│   ├── scrollback.rs    # bounded ring of detached PTY bytes
-│   ├── context.rs       # primary-screen lines + OSC 633 for `context`
+│   ├── history.rs       # rotating on-disk text history (primary screen)
 │   ├── termstate.rs     # DEC private mode + OSC title tracking
 │   └── vscode_si.rs     # VS Code/Cursor OSC 633 inject (bash/zsh/fish)
 ├── tests/
@@ -156,6 +149,7 @@ reshell/
 │   ├── session_smoke.rs
 │   ├── attach_restore.rs
 │   ├── attach_race.rs
+│   ├── history_files.rs
 │   └── switch_frees.rs
 ├── docs/DESIGN.md
 └── README.md
@@ -163,14 +157,13 @@ reshell/
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `context` / `rename` / `clean` / `kill` / `completion` (aliases `n`/`a`/`ls`/`i`/`c`/`r`/`k`); dynamic session-name completion; detach-key + log + scrollback flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `rename` / `clean` / `kill` / `completion` (aliases `n`/`a`/`ls`/`i`/`r`/`k`); dynamic session-name completion; detach-key + log flags; default shell `/bin/zsh` |
 | [`src/picker.rs`](../src/picker.rs) | Small raw-TTY session picker + name prompt for bare `reshell` / `attach` with no name |
 | [`src/session.rs`](../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session, `client.pid` / `switch_to` |
-| [`src/server.rs`](../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, scrollback replay, context snapshots, peer pid |
-| [`src/client.rs`](../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP` / `SIGUSR1`, protocol I/O, context fetch |
-| [`src/protocol.rs`](../src/protocol.rs) | Length-prefixed framing (see [PROTOCOL.md](PROTOCOL.md)); context req/res |
-| [`src/scrollback.rs`](../src/scrollback.rs) | Bounded ring of detached PTY bytes; size parsing (`1M`, `512K`) |
-| [`src/context.rs`](../src/context.rs) | Rolling primary-screen lines + OSC 633 last-command for `reshell context` |
+| [`src/server.rs`](../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, history writer, peer pid |
+| [`src/client.rs`](../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP` / `SIGUSR1`, protocol I/O |
+| [`src/protocol.rs`](../src/protocol.rs) | Length-prefixed framing (see [PROTOCOL.md](PROTOCOL.md)) |
+| [`src/history.rs`](../src/history.rs) | Rotating on-disk text history (~2000 lines/file); pauses on alt-screen |
 | [`src/termstate.rs`](../src/termstate.rs) | DEC private mode + OSC window-title tracking for restore-on-attach |
 | [`src/vscode_si.rs`](../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject (bash/zsh/fish) |
 
@@ -193,6 +186,7 @@ $base/$name/
   client.pid      # pid of the interactive attach client (SO_PEERCRED); cleared on detach
   switch_to       # optional one-shot target name for in-session switch (SIGUSR1)
   daemon.log      # per-session daemon log (startup, attach/detach, errors)
+  history/        # rotating text history (0001.txt, 0002.txt, …)
 ```
 
 Session names are limited to `[A-Za-z0-9._-]`, max 64 characters.
@@ -206,10 +200,8 @@ orphan session dirs that lack `meta.json`.
 
 `list` shows relative created and last-active times by default (`2h ago`);
 `list --json` is stable for scripts (includes `created_unix` / `last_active_unix`).
-`info` prints pid, shell, state, timestamps, and all session paths (`info --json` too).
-`context` prints the last known command (OSC 633 when present) and ~100 lines of
-primary-screen output via a short-lived `ContextReq` (no attach lock, not replayed
-into the PTY). With no name, `info` / `context` prefer the session this process is
+`info` prints pid, shell, state, timestamps, session paths, and history file paths
+(`info --json` too). With no name, `info` prefers the session this process is
 inside (daemon pid among process ancestors, else `$RESHELL_SESSION`), then the most
 recently active session.
 
@@ -313,9 +305,7 @@ reshell does not keep a VT screen buffer. The daemon always:
    including while detached.
 2. On `Attach`, sends those modes (and the remembered title) back to the new
    client as the first `Data` payload, then clears the local screen.
-3. If scrollback is enabled and non-empty, replays captured detached bytes as
-   further `Data` frames (then clears the ring).
-4. Forces a full child redraw that differential TUIs (notably ratatui/crossterm
+3. Forces a full child redraw that differential TUIs (notably ratatui/crossterm
    apps such as [fresh](https://github.com/sinelaw/fresh)) will actually emit:
    - Apply a temporary winsize (rows±1) so the app invalidates its previous cell
      buffer and dumps a full frame to the newly attached client.
@@ -327,14 +317,30 @@ crossterm only writes cells that differ from its previous buffer, so a blank
 reattach TTY stays blank until the user moves the mouse over dirty regions.
 
 PTY bytes are not forwarded to a client until `Attach` has been processed, so
-mode restore (and optional scrollback replay) runs before live redraw data.
+mode restore runs before live redraw data.
 
-### 8.2 Optional scrollback
+### 8.2 On-disk text history
 
-`--scrollback` / `RESHELL_SCROLLBACK` (set at session create; default `0` = off)
-keeps a bounded in-memory ring of raw PTY bytes while detached and replays them
-on the next attach — useful for plain-shell history, not a substitute for TUI
-redraw. Max 16M; suffixes `K` / `M`.
+Every PTY read (attached or detached) is also fed to a history writer that:
+
+1. Strips CSI/OSC control sequences and accumulates UTF-8 text lines.
+2. **Pauses capture while the alternate screen is active** (DECSET 1049 / 1047 /
+   47). That is full-screen TUI mode — not the attach client's local raw TTY mode.
+3. Appends lines to `$session/history/NNNN.txt` (~2000 body lines per file).
+4. Rotates to the next file with begin/continue/end markers that name the session,
+   file index, timestamps, and previous/next file.
+
+Example marker shape:
+
+```text
+*** reshell history: session=demo file=1 started=unix:… beginning of session history ***
+line from shell
+…
+*** reshell history: session=demo file=1 ended continuing in file=2 ***
+```
+
+`reshell info` lists `history_dir` and each history file path (marking the current
+file). History is not replayed onto the TTY on attach.
 
 ### 8.3 VS Code / Cursor sticky scroll
 
@@ -378,9 +384,10 @@ When the outbound (client) buffer exceeds a high-water mark, the daemon stops
 reading the PTY until it drains (backpressure). When the PTY write buffer is
 backed up, the daemon pauses reading the client socket. When no client is
 attached (or the client has not yet sent `Attach`), PTY output is still read:
-DEC modes are updated, and bytes are pushed into the optional scrollback ring
-when `--scrollback` / `RESHELL_SCROLLBACK` is non-zero (otherwise discarded).
-When the shell exits (`waitpid`), the daemon cleans up and exits.
+DEC modes are updated and primary-screen text is appended to the history files
+(alt-screen paused). When the shell exits (`waitpid`), the daemon finishes the
+history file and cleans up.
+
 
 Wire format details live in [PROTOCOL.md](PROTOCOL.md).
 
@@ -391,14 +398,13 @@ Wire format details live in [PROTOCOL.md](PROTOCOL.md).
 | `reshell` / `reshell attach [name]` | `a` | Attach; no name → picker (TTY) or most-recent / create |
 | `reshell new [name]` | `n` | Create session; attach unless `--detach` |
 | `reshell list` | `ls` | List live sessions (relative times; `--json`) |
-| `reshell info [name]` | `i` | Show pid, shell, state, paths (`--json`) |
-| `reshell context [name]` | `c` | Snapshot last command + primary-screen lines |
+| `reshell info [name]` | `i` | Show pid, shell, state, paths, history files (`--json`) |
 | `reshell rename <old> <new>` | `r` | Rename a live session directory |
 | `reshell clean` | | Remove dead / orphan session dirs and stale locks |
 | `reshell kill [name]` | `k` | Terminate daemon (+ `--all`) |
 | `reshell completion <shell>` | | Shell completions |
 
-Shared flags: `--dir`, `--detach-key`, `--log`, `--scrollback`, `--shell` (on `new`).
+Shared flags: `--dir`, `--detach-key`, `--log`, `--shell` (on `new`).
 
 ## 11. Packaging and Toolchain
 
@@ -417,8 +423,8 @@ conda Rust toolchain is used, not an older system rustup.
 ## 12. Testing Strategy
 
 - **Unit**: protocol roundtrip, session name validation, meta read/write,
-  DEC mode parse/restore (`termstate`), attach flock exclusivity / stale recovery,
-  kill SIGTERM→SIGKILL escalation.
+  DEC mode parse/restore (`termstate`), history strip/rotate, attach flock
+  exclusivity / stale recovery, kill SIGTERM→SIGKILL escalation.
 - **Integration** (`tests/session_smoke.rs`): `new` → speak protocol over the socket →
   detach → reconnect → confirm the same shell is still alive → `kill`.
 - **Integration** (`tests/attach_restore.rs`): child enables mouse/alt-screen → detach →
@@ -441,10 +447,10 @@ Linux.
 
 1. **`reshell ssh …` wrapper** — Thin SSH + remote `reshell` helper remains an
    explicit post-v1 idea (see [IMPROVEMENTS.md](IMPROVEMENTS.md) §4).
-2. **Append-only session log file** — Optional on-disk log beside the in-memory
-   scrollback ring; still not a VT buffer.
-3. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
+2. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
    protocol coverage stays the CI default to avoid flakes.
+3. **History retention after `kill`** — Today history lives under the session dir
+   and is removed with it; a keep-on-kill option is undecided.
 
 ### Resolved
 
@@ -453,7 +459,7 @@ Linux.
 - **In-session leave-and-join** — `attach` / `new` / picker always leave the
   current session before joining another; outer client handles `SIGUSR1` +
   `switch_to` on the same TTY (no nested clients).
-- **Scrollback** — Opt-in byte ring at session create; replay after DEC restore.
+- **On-disk history** — Rotating text files under `$session/history/`; skip alt-screen.
 - **Interactive picker** — Bare `reshell` / `attach` on a TTY; non-TTY keeps
   most-recent / auto-create fallbacks.
 
