@@ -196,7 +196,10 @@ $base/$name/
   client.pid      # pid of the interactive attach client (SO_PEERCRED); cleared on detach
   switch_to       # optional one-shot target name for in-session switch (SIGUSR1)
   daemon.log      # per-session daemon log (startup, attach/detach, errors)
-  history/        # rotating text history (0001.txt, 0002.txt, …)
+  history/        # rotating text history (see §8.2)
+    0001.txt
+    0002.txt
+    …
 ```
 
 Session names are limited to `[A-Za-z0-9._-]`, max 64 characters.
