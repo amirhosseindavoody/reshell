@@ -100,25 +100,19 @@ sessions, orphan dirs without meta, and stale attach locks.
 
 ## 4. Bigger Features
 
-### 4.1 Optional scrollback / session log — done
+### 4.1 Optional scrollback / session log — superseded
 
-**Was:** Explicit v1 non-goal — PTY output discarded while detached; DEC modes
-tracked so reattach can restore and force redraw.
+**Was / briefly:** In-memory `--scrollback` byte ring replayed on attach, plus
+`reshell context` line buffer over the socket.
 
-**Now:** `--scrollback` / `RESHELL_SCROLLBACK` (set at session create; default
-`0` = off) keeps a bounded in-memory ring of detached PTY bytes (max 16M;
-suffixes `K`/`M`). On attach, history is replayed as `Data` after DEC mode
-restore + clear, then the usual two-phase winsize. Not a VT screen buffer —
-TUIs still redraw. Append-only file logging remains a possible later add-on.
+**Now:** Scraped. Primary-screen output is written to rotating text files under
+`$session/history/` (~2000 lines each). Capture pauses on the alternate screen.
+`reshell info` lists history paths. No attach replay of history.
 
-### 4.2 `reshell context` — done
+### 4.2 `reshell context` — removed
 
-**Now:** `reshell context [name]` asks the daemon for a read-only snapshot: last
-OSC 633 command (when shell integration markers are present), exit code, and the
-last ~100 lines of primary-screen output. Uses `ContextReq` / `ContextRes` and
-does not take the attach lock or replay into the live PTY. Line capture pauses
-while the alternate screen is active. Name omitted → current session when inside
-one, else most recently active.
+Replaced by on-disk history files (§4.1). Use `reshell info` for paths and read
+the files directly.
 
 ### 4.3 Broader VS Code / Cursor shell integration — done
 

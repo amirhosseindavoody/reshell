@@ -24,8 +24,6 @@ Every message:
 | `2` | `Resize` | 4 bytes | client → server | Window size change |
 | `3` | `Detach` | empty | client → server | Client leaving; keep shell |
 | `4` | `Attach` | 4 bytes | client → server | First message after connect |
-| `5` | `ContextReq` | empty | client → server | Request a context snapshot (no attach lock) |
-| `6` | `ContextRes` | UTF-8 JSON | server → client | `ContextSnapshot` then socket close |
 
 ### 2.1 Winsize payload (`Attach` / `Resize`)
 
@@ -40,7 +38,7 @@ Little-endian:
 
 | Message | Server action |
 |---------|---------------|
-| `Attach` | Replay tracked DEC private modes and the last OSC 0/2 window title to the client as `Data`, clear the local screen, optionally replay detached scrollback as further `Data`, apply a temporary winsize so differential TUIs full-paint, then restore the real winsize shortly after. PTY forwarding starts only after this message. |
+| `Attach` | Replay tracked DEC private modes and the last OSC 0/2 window title to the client as `Data`, clear the local screen, apply a temporary winsize so differential TUIs full-paint, then restore the real winsize shortly after. PTY forwarding starts only after this message. |
 | `Resize` | Apply size with `TIOCSWINSZ` only (normal live resize). |
 
 ## 3. Client Conventions
@@ -63,34 +61,13 @@ Little-endian:
   holds an advisory `flock` on `attached` while connected.
 - Record the peer pid (`SO_PEERCRED`) in `client.pid` while attached; clear on
   detach.
-- `ContextReq` is classified from the first framed message on accept and answered
-  with `ContextRes` **without** taking the attach lock (works while attached).
 - After `Detach` or client EOF/error, clear the attach lock and keep the shell.
 - Track DEC private modes and the last OSC 0/2 window title from all PTY output
   (even while detached).
-- Keep a rolling primary-screen line history (~100 lines) plus last OSC 633
-  command markers for `reshell context` (independent of attach-replay scrollback).
-- When `--scrollback` / `RESHELL_SCROLLBACK` is set at session create, keep a
-  bounded ring of PTY bytes while no ready client is attached and replay them
-  after mode restore + clear on the next `Attach`.
+- Append primary-screen text to on-disk history files (see [DESIGN.md](DESIGN.md)
+  §8.2); pause while the alternate screen is active.
 - Unrecognized types are a protocol error for the reader; clients ignore unexpected
-  control messages from the server (server emits `Data` and `ContextRes`).
-
-### 4.1 `ContextRes` JSON
-
-```json
-{
-  "name": "demo",
-  "last_command": "cargo test",
-  "last_exit_code": 0,
-  "lines": ["…", "…"],
-  "alt_screen": false
-}
-```
-
-`last_command` / `last_exit_code` are null when no OSC 633 `E`/`D` markers have
-been seen. `alt_screen` is true when a full-screen app currently owns the PTY;
-`lines` then reflect history captured before alt-screen entry.
+  control messages from the server (server emits `Data`).
 
 ## 5. Example Sequence
 
@@ -98,7 +75,6 @@ been seen. `alt_screen` is true when a full-screen app currently owns the PTY;
 client                         daemon                         shell
   |-- Attach(24,80) ---------->|                                |
   |<- Data(DEC modes + clear) -|                                |
-  |<- Data(scrollback…) -------|  (if enabled and non-empty)    |
   |                            |-- TIOCSWINSZ(23,80)+SIGWINCH ->|
   |<- Data(full paint @23) ----|<-- ratatui invalidates buffer -|
   |                            |-- (≈50ms later) --------------->|
@@ -106,10 +82,11 @@ client                         daemon                         shell
   |<- Data(full paint @24) ----|<-- second full paint ----------|
   |-- Data("echo hi\n") ------>|-- write PTY ------------------>|
   |<- Data(prompt + "hi\n") ---|<-- read PTY -------------------|
+  |                            |  (also append "hi" to history)  |
   |-- Detach ----------------->|                                |
   |  (client exits; local DEC cleanup)
-  |                            |  (shell still running; optional|
-  |                            |   scrollback captures PTY out) |
-  |-- connect + Attach ------->|  restore + scrollback + winch  |
+  |                            |  (shell still running; history  |
+  |                            |   still captures primary screen)|
+  |-- connect + Attach ------->|  restore + winch redraw        |
   |-- Data(...) -------------->| ...                            |
 ```

@@ -43,7 +43,7 @@ pub fn parse_detach_key(s: &str) -> Result<u8> {
     match (chars.next(), chars.next()) {
         (Some(c), None) if c.is_ascii() => Ok(c as u8),
         _ => bail!(
-            "invalid detach key '{s}'; use ^\\ (default), ^a, a single ASCII char, or 0x1c"
+            "invalid detach key '{s}': use ^\\ (default), ^a, a single ASCII char, or 0x1c"
         ),
     }
 }
@@ -52,10 +52,6 @@ pub const MSG_DATA: u8 = 1;
 pub const MSG_RESIZE: u8 = 2;
 pub const MSG_DETACH: u8 = 3;
 pub const MSG_ATTACH: u8 = 4;
-/// Client → server: request a `ContextRes` snapshot (does not take attach lock).
-pub const MSG_CONTEXT_REQ: u8 = 5;
-/// Server → client: JSON `ContextSnapshot` payload, then the socket is closed.
-pub const MSG_CONTEXT_RES: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Winsize {
@@ -69,8 +65,6 @@ pub enum Message {
     Resize(Winsize),
     Detach,
     Attach(Winsize),
-    ContextReq,
-    ContextRes(Vec<u8>),
 }
 
 pub fn write_message(mut w: impl Write, msg: &Message) -> Result<()> {
@@ -90,8 +84,6 @@ pub fn encode_message(msg: &Message) -> Result<Vec<u8>> {
         Message::Attach(ws) => {
             return encode_winsize(MSG_ATTACH, *ws);
         }
-        Message::ContextReq => (MSG_CONTEXT_REQ, &[]),
-        Message::ContextRes(data) => (MSG_CONTEXT_RES, data.as_slice()),
     };
     encode_framed(kind, payload)
 }
@@ -159,8 +151,6 @@ pub fn read_message(mut r: impl Read) -> Result<Option<Message>> {
         MSG_RESIZE => Message::Resize(parse_winsize(&payload)?),
         MSG_DETACH => Message::Detach,
         MSG_ATTACH => Message::Attach(parse_winsize(&payload)?),
-        MSG_CONTEXT_REQ => Message::ContextReq,
-        MSG_CONTEXT_RES => Message::ContextRes(payload),
         other => bail!("unknown message type {other}"),
     };
     Ok(Some(msg))
@@ -193,8 +183,6 @@ mod tests {
                 rows: 40,
                 cols: 120,
             }),
-            Message::ContextReq,
-            Message::ContextRes(br#"{"name":"x"}"#.to_vec()),
         ];
 
         for original in &messages {
@@ -207,8 +195,6 @@ mod tests {
                 (Message::Resize(a), Message::Resize(b)) => assert_eq!(a, b),
                 (Message::Detach, Message::Detach) => {}
                 (Message::Attach(a), Message::Attach(b)) => assert_eq!(a, b),
-                (Message::ContextReq, Message::ContextReq) => {}
-                (Message::ContextRes(a), Message::ContextRes(b)) => assert_eq!(a, b),
                 _ => panic!("mismatch"),
             }
         }

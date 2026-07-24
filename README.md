@@ -6,10 +6,11 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 
 - Keep shells alive and running after SSH disconnects
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
-- Explicit sessions: `new` / `attach` / `list` / `info` / `context` / `kill`
+- Explicit sessions: `new` / `attach` / `list` / `info` / `kill`
 - Bare `reshell` opens a small session picker (`n` new / switch / kill; `*` marks the current session)
 - Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
 - Reattach restores TUI terminal modes (mouse, alt-screen, …), the window/tab title, and forces a redraw
+- Primary-screen output is logged to rotating text history files under the session dir (skipped while a full-screen TUI owns the alternate screen)
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session (bash, zsh, fish)
 - Targeted at SSH sessions into Linux servers
 - Defaults to **zsh** (`/bin/zsh`); override with `--shell` for bash, fish, etc.
@@ -65,12 +66,9 @@ reshell new demo
 # Create without attaching (prints the name)
 reshell new demo --detach
 
-# Keep ~1 MiB of output while detached and replay it on attach
-reshell --scrollback 1M new demo --detach
-
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
-# or: reshell a demo       # short aliases: n/a/ls/i/c/r/k
+# or: reshell a demo       # short aliases: n/a/ls/i/r/k
 # or: reshell attach       # interactive picker (non-TTY: most recent / new)
 # or: reshell --detach-key '^a' attach demo
 
@@ -78,13 +76,9 @@ reshell attach demo
 reshell list
 reshell ls --json
 
-# Session details (paths, pid, state, …)
+# Session details (paths, pid, state, history files, …)
 reshell info demo
 # or: reshell i        # current session when inside one; else most recent
-
-# Recent shell context (last command + trailing output; read-only)
-reshell context demo
-# or: reshell c        # current session when inside one; else most recent
 
 # Rename a live session
 reshell rename demo demo2
@@ -99,7 +93,7 @@ reshell kill demo
 # or: reshell kill --all   # terminate every live session
 ```
 
-Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.
+Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `r` rename, `k` kill.
 
 Bare `reshell` / `reshell attach` (no name) opens a small picker when stdin is a
 TTY: a table of sessions (newest activity first among detached, then attached:
@@ -129,32 +123,28 @@ reshell completion fish | source
 To load on every shell start, add the matching line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`.
 
 Completions call back into `reshell` at tab time, so `attach` suggests
-**detachable** session names only, while `info` / `context` / `kill` / `rename`
+**detachable** session names only, while `info` / `kill` / `rename`
 suggest all live sessions (honoring `--dir` / `RESHELL_DIR`). After `reshell`,
 Tab lists long subcommand names (and short aliases in the description where the
-shell shows them — e.g. `new (n)`). Option flags (`--dir`, `--scrollback`, …)
+shell shows them — e.g. `new (n)`). Option flags (`--dir`, …)
 are not offered on Tab — use `--help` for those.
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
 Inside a session shell, `RESHELL_SESSION` is set to the session name. Bare
-`reshell info` / `reshell context` use the current session (even after `rename`);
-outside a session they fall back to the most recently active one.
+`reshell info` uses the current session (even after `rename`);
+outside a session it falls back to the most recently active one.
 
-`reshell context` prints the last known command (when OSC 633 shell-integration
-markers are present) and the last ~100 lines of primary-screen output. It does
-not attach or replay into the live PTY — useful to recall what a session is
-doing. Full-screen apps pause line capture while they own the alternate screen.
+Primary-screen shell output is appended to rotating text files under
+`$session/history/` (`0001.txt`, `0002.txt`, …; ~2000 lines each). Capture
+pauses while a full-screen app owns the **alternate screen** (DEC 1049/1047/47)
+— that is TUI mode, not the attach client's local raw TTY mode.
+`reshell info` lists the history directory and file paths. CSI/OSC sequences are
+stripped so the files stay readable.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 
 Detach key defaults to **Ctrl+\**. Override with `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or a single ASCII char).
-
-Optional detached scrollback (set when creating a session): `--scrollback` /
-`RESHELL_SCROLLBACK` keeps a bounded ring of PTY output while detached and
-replays it on the next attach (default `0` = off; examples: `1M`, `512K`; max
-`16M`). This is raw byte history for shells — not a multiplexer scrollback UI;
-full-screen apps still redraw on attach.
 
 ## Why reshell?
 

@@ -1,8 +1,7 @@
 mod client;
-mod context;
+mod history;
 mod picker;
 mod protocol;
-mod scrollback;
 mod server;
 mod session;
 mod termstate;
@@ -19,7 +18,6 @@ use clap_complete::{CompleteEnv, Shell};
 use serde::Serialize;
 
 use protocol::parse_detach_key;
-use scrollback::parse_scrollback_size;
 use session::{allocate_session_name, now_unix, session_base_dir};
 
 #[derive(Debug, Parser)]
@@ -41,11 +39,6 @@ struct Cli {
     /// Detach key (default: Ctrl+\ ). Examples: ^\, ^a, 0x1c. Also `RESHELL_DETACH_KEY`.
     #[arg(long, global = true, env = "RESHELL_DETACH_KEY", default_value = "^\\")]
     detach_key: String,
-
-    /// Detached PTY bytes to keep and replay on attach (0=off). Examples: 1M, 512K.
-    /// Applied when creating a session (`new` / picker `n`). Also `RESHELL_SCROLLBACK`.
-    #[arg(long, global = true, env = "RESHELL_SCROLLBACK", default_value = "0")]
-    scrollback: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -85,17 +78,6 @@ enum Commands {
     /// Show details for a session
     #[command(visible_alias = "i")]
     Info {
-        /// Session name (defaults to the current session when inside one,
-        /// otherwise the most recently active session)
-        #[arg(add = ArgValueCompleter::new(complete_session_name))]
-        name: Option<String>,
-        /// Machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show recent shell context (last command + trailing output)
-    #[command(visible_alias = "c")]
-    Context {
         /// Session name (defaults to the current session when inside one,
         /// otherwise the most recently active session)
         #[arg(add = ArgValueCompleter::new(complete_session_name))]
@@ -233,7 +215,6 @@ fn run() -> Result<()> {
     };
     let log = cli.log;
     let detach_key = parse_detach_key(&cli.detach_key)?;
-    let scrollback = parse_scrollback_size(&cli.scrollback)?;
 
     // Bare `reshell` is an alias for `reshell attach`.
     let command = cli.command.unwrap_or(Commands::Attach { name: None });
@@ -243,11 +224,10 @@ fn run() -> Result<()> {
             name,
             shell,
             detach,
-        } => cmd_new(&base, name, shell, detach, log, detach_key, scrollback),
-        Commands::Attach { name } => cmd_attach(&base, name, log, detach_key, scrollback),
+        } => cmd_new(&base, name, shell, detach, log, detach_key),
+        Commands::Attach { name } => cmd_attach(&base, name, log, detach_key),
         Commands::List { json } => cmd_list(&base, json),
         Commands::Info { name, json } => cmd_info(&base, name, json),
-        Commands::Context { name, json } => cmd_context(&base, name, json),
         Commands::Rename { old_name, new_name } => {
             session::rename_session(&base, &old_name, &new_name)?;
             println!("renamed {old_name} → {new_name}");
@@ -373,7 +353,6 @@ fn cmd_new(
     detach: bool,
     log: Option<PathBuf>,
     detach_key: u8,
-    scrollback: usize,
 ) -> Result<()> {
     let _ = session::cleanup_stale_sessions(base)?;
     let name = match name {
@@ -386,7 +365,6 @@ fn cmd_new(
         shell,
         base: base.to_path_buf(),
         log_path: log,
-        scrollback,
     })?;
     if detach {
         println!("{name}");
@@ -405,7 +383,6 @@ fn cmd_attach(
     name: Option<String>,
     log: Option<PathBuf>,
     detach_key: u8,
-    scrollback: usize,
 ) -> Result<()> {
     match name {
         Some(n) => join_session(base, &n, detach_key),
@@ -420,21 +397,13 @@ fn cmd_attach(
                     // Prompt for a name (editable suggested default), then create.
                     match picker::prompt_new_session_name(base)? {
                         Some(n) => {
-                            return cmd_new(
-                                base,
-                                Some(n),
-                                None,
-                                false,
-                                log,
-                                detach_key,
-                                scrollback,
-                            );
+                            return cmd_new(base, Some(n), None, false, log, detach_key);
                         }
                         None => anyhow::bail!("cancelled"),
                     }
                 }
                 // Non-TTY: same as `reshell new` (auto name).
-                return cmd_new(base, None, None, false, log, detach_key, scrollback);
+                return cmd_new(base, None, None, false, log, detach_key);
             }
 
             if !is_tty {
@@ -478,7 +447,7 @@ fn cmd_attach(
             match picker::pick_session(base, &rows)? {
                 // `cmd_new` / `join_session` leave the current session when inside one.
                 picker::PickAction::CreateNew { name } => {
-                    cmd_new(base, Some(name), None, false, log, detach_key, scrollback)
+                    cmd_new(base, Some(name), None, false, log, detach_key)
                 }
                 picker::PickAction::Attach(n) => join_session(base, &n, detach_key),
                 picker::PickAction::Cancelled => {
@@ -590,30 +559,20 @@ fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
     println!("meta:        {}", paths.meta.display());
     println!("attach_lock: {}", paths.attach_lock.display());
     println!("daemon_log:  {}", paths.daemon_log.display());
-    Ok(())
-}
-
-fn cmd_context(base: &Path, name: Option<String>, json: bool) -> Result<()> {
-    let name = resolve_session_name(base, name)?;
-    let snap = client::fetch_context(base, &name)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&snap)?);
-        return Ok(());
-    }
-    println!("session: {}", snap.name);
-    match &snap.last_command {
-        Some(cmd) => match snap.last_exit_code {
-            Some(code) => println!("last_command: {cmd}  (exit {code})"),
-            None => println!("last_command: {cmd}"),
-        },
-        None => println!("last_command: (unknown)"),
-    }
-    if snap.alt_screen {
-        println!("note: session is in a full-screen app; showing shell history from before it");
-    }
-    println!("--- output (last {} lines) ---", snap.lines.len());
-    for line in &snap.lines {
-        println!("{line}");
+    println!("history_dir: {}", paths.history_dir().display());
+    let history_files = history::list_history_files(&paths);
+    if history_files.is_empty() {
+        println!("history:     (none yet)");
+    } else {
+        let last_i = history_files.len() - 1;
+        for (i, path) in history_files.iter().enumerate() {
+            let label = if i == 0 { "history:" } else { "         " };
+            if i == last_i {
+                println!("{label}     {}  (current)", path.display());
+            } else {
+                println!("{label}     {}", path.display());
+            }
+        }
     }
     Ok(())
 }
@@ -631,10 +590,13 @@ struct SessionJson {
     meta: String,
     attach_lock: String,
     daemon_log: String,
+    history_dir: String,
+    history_files: Vec<String>,
 }
 
 impl SessionJson {
     fn from_session(meta: &session::SessionMeta, paths: &session::SessionPaths) -> Self {
+        let history_files = history::list_history_files(paths);
         Self {
             name: meta.name.clone(),
             pid: meta.pid,
@@ -647,6 +609,11 @@ impl SessionJson {
             meta: paths.meta.display().to_string(),
             attach_lock: paths.attach_lock.display().to_string(),
             daemon_log: paths.daemon_log.display().to_string(),
+            history_dir: paths.history_dir().display().to_string(),
+            history_files: history_files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         }
     }
 }
