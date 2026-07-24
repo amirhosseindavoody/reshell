@@ -85,11 +85,10 @@ reshell kill --all
 
 When `attach` has no name and stdin is a TTY:
 
-1. First row: **Create new session**.
-2. Then a table: NAME / STATE / CREATED / LAST ACTIVE / SHELL (detached by recent activity, then attached).
-3. Current session marked `*` (bold); other attached sessions dimmed; long names truncate with `…`.
-4. Keys: ↑/↓ move, Enter or `s` attach/switch, `k` kill (y/N), `q` / Esc cancel.
-5. Create-new (or empty list) prompts for an editable name prefilled with `session-{unix}-{hex}`.
+1. Table of sessions: NAME / STATE / CREATED / LAST ACTIVE / SHELL (detached by recent activity, then attached).
+2. Current session marked `*` (bold); other attached sessions dimmed; long names truncate with `…`.
+3. Keys: ↑/↓ move, Enter or `s` attach/switch, `n` create (name prompt), `k` kill (y/N), `q` / Esc cancel.
+4. Pressing `n` (or bare `reshell` with no sessions) prompts for an editable name prefilled with `session-{unix}-{hex}`.
 
 Non-TTY: most recently active session, or auto-create when none exist.
 

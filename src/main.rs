@@ -43,7 +43,7 @@ struct Cli {
     detach_key: String,
 
     /// Detached PTY bytes to keep and replay on attach (0=off). Examples: 1M, 512K.
-    /// Applied when creating a session (`new` / picker "Create new"). Also `RESHELL_SCROLLBACK`.
+    /// Applied when creating a session (`new` / picker `n`). Also `RESHELL_SCROLLBACK`.
     #[arg(long, global = true, env = "RESHELL_SCROLLBACK", default_value = "0")]
     scrollback: String,
 
@@ -66,7 +66,7 @@ enum Commands {
         detach: bool,
     },
     /// Attach to an existing session.
-    /// With no name: interactive picker (create new with name prompt / attach).
+    /// With no name: interactive picker (`n` create / attach).
     /// Non-TTY falls back to the most recently active session; with no sessions,
     /// creates one (TTY: prompts for name).
     #[command(visible_alias = "a")]

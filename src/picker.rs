@@ -1,10 +1,9 @@
 //! Minimal session picker for bare `reshell` / `reshell attach` (no name).
 //!
-//! Order: create-new, then detached (attachable), then attached (dimmed).
-//! The session this process is inside is marked with `*`. Cursor defaults to
-//! the first attachable session when one exists. Keys: Enter/`s` attach (switch),
-//! `k` kill with confirmation, `q`/Esc cancel. Choosing create-new prompts for
-//! a session name (editable suggested default).
+//! Order: detached (attachable), then attached (dimmed). The session this
+//! process is inside is marked with `*`. Cursor defaults to the first
+//! attachable session when one exists. Keys: Enter/`s` attach (switch), `n`
+//! create (name prompt), `k` kill with confirmation, `q`/Esc cancel.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -61,17 +60,14 @@ pub struct SessionRow {
 }
 
 #[derive(Clone)]
-enum Entry {
-    CreateNew,
-    Session {
-        name: String,
-        attached: bool,
-        current: bool,
-        state: String,
-        created: String,
-        last_active: String,
-        shell: String,
-    },
+struct Entry {
+    name: String,
+    attached: bool,
+    current: bool,
+    state: String,
+    created: String,
+    last_active: String,
+    shell: String,
 }
 
 struct ColWidths {
@@ -83,7 +79,8 @@ struct ColWidths {
 ///
 /// All rows are navigable. Detached sessions can be attached with Enter / `s`.
 /// Attached sessions are dimmed (Enter/`s` no-op). The current session is marked
-/// with `*`. `k` kills the highlighted session after confirmation.
+/// with `*`. `n` creates a new session (name prompt). `k` kills the highlighted
+/// session after confirmation.
 pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> {
     let mut tty = open_tty()?;
     let tty_fd = tty.as_raw_fd();
@@ -91,9 +88,7 @@ pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> 
         bail!("no tty available; session picker requires a terminal");
     }
 
-    let mut entries: Vec<Entry> = Vec::with_capacity(sessions.len() + 1);
-    entries.push(Entry::CreateNew);
-
+    let mut entries: Vec<Entry> = Vec::with_capacity(sessions.len());
     let mut detached: Vec<&SessionRow> = sessions.iter().filter(|s| !s.attached).collect();
     let mut attached: Vec<&SessionRow> = sessions.iter().filter(|s| s.attached).collect();
     for s in detached.drain(..) {
@@ -118,7 +113,7 @@ pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> 
     tty.flush().ok();
 
     let cols = tty_cols(tty_fd).unwrap_or(80).max(40) as usize;
-    let mut n_lines = list_n_lines(&entries);
+    let mut n_lines = list_n_lines(entries.len());
     let mut widths = compute_widths(&entries, cols);
     let mut first_draw = true;
     let mut status: Option<String> = None;
@@ -146,80 +141,59 @@ pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> 
                         cursor += 1;
                     }
                 }
-                Key::Enter => match &entries[cursor] {
-                    Entry::CreateNew => {
-                        clear_ui(&mut tty, n_lines)?;
-                        first_draw = true;
-                        match prompt_session_name(&mut tty, tty_fd, base, cols)? {
-                            Some(name) => return Ok(PickAction::CreateNew { name }),
-                            None => {
-                                first_draw = true;
-                            }
-                        }
+                Key::Enter | Key::Char('s') | Key::Char('S') => {
+                    if entries.is_empty() {
+                        status = Some("no sessions — press n to create".into());
+                        continue;
                     }
-                    Entry::Session {
-                        name,
-                        attached: false,
-                        ..
-                    } => {
-                        let name = name.clone();
-                        clear_ui(&mut tty, n_lines)?;
-                        return Ok(PickAction::Attach(name));
-                    }
-                    Entry::Session {
-                        attached: true, ..
-                    } => {
+                    let entry = &entries[cursor];
+                    if entry.attached {
                         status = Some("session is already attached".into());
-                    }
-                },
-                Key::Char('s') | Key::Char('S') => match &entries[cursor] {
-                    Entry::Session {
-                        name,
-                        attached: false,
-                        ..
-                    } => {
-                        let name = name.clone();
-                        clear_ui(&mut tty, n_lines)?;
-                        return Ok(PickAction::Attach(name));
-                    }
-                    Entry::Session {
-                        attached: true, ..
-                    } => {
-                        status = Some("session is already attached".into());
-                    }
-                    Entry::CreateNew => {
-                        status = Some("select a session to switch, or Enter to create".into());
-                    }
-                },
-                Key::Char('k') | Key::Char('K') => {
-                    if let Entry::Session { name, .. } = &entries[cursor] {
-                        let name = name.clone();
-                        clear_ui(&mut tty, n_lines)?;
-                        let confirmed = confirm_yn(
-                            &mut tty,
-                            tty_fd,
-                            &format!("Kill session '{name}'?"),
-                            cols,
-                        )?;
-                        first_draw = true;
-                        if confirmed {
-                            match session::kill_session(base, &name) {
-                                Ok(()) => {
-                                    entries.remove(cursor);
-                                    if cursor >= entries.len() {
-                                        cursor = entries.len().saturating_sub(1);
-                                    }
-                                    n_lines = list_n_lines(&entries);
-                                    widths = compute_widths(&entries, cols);
-                                    status = Some(format!("killed {name}"));
-                                }
-                                Err(e) => {
-                                    status = Some(format!("kill failed: {e:#}"));
-                                }
-                            }
-                        }
                     } else {
-                        status = Some("select a session to kill".into());
+                        let name = entry.name.clone();
+                        clear_ui(&mut tty, n_lines)?;
+                        return Ok(PickAction::Attach(name));
+                    }
+                }
+                Key::Char('n') | Key::Char('N') => {
+                    clear_ui(&mut tty, n_lines)?;
+                    first_draw = true;
+                    match prompt_session_name(&mut tty, tty_fd, base, cols)? {
+                        Some(name) => return Ok(PickAction::CreateNew { name }),
+                        None => {
+                            first_draw = true;
+                        }
+                    }
+                }
+                Key::Char('k') | Key::Char('K') => {
+                    if entries.is_empty() {
+                        status = Some("no sessions to kill".into());
+                        continue;
+                    }
+                    let name = entries[cursor].name.clone();
+                    clear_ui(&mut tty, n_lines)?;
+                    let confirmed = confirm_yn(
+                        &mut tty,
+                        tty_fd,
+                        &format!("Kill session '{name}'?"),
+                        cols,
+                    )?;
+                    first_draw = true;
+                    if confirmed {
+                        match session::kill_session(base, &name) {
+                            Ok(()) => {
+                                entries.remove(cursor);
+                                if cursor >= entries.len() {
+                                    cursor = entries.len().saturating_sub(1);
+                                }
+                                n_lines = list_n_lines(entries.len());
+                                widths = compute_widths(&entries, cols);
+                                status = Some(format!("killed {name}"));
+                            }
+                            Err(e) => {
+                                status = Some(format!("kill failed: {e:#}"));
+                            }
+                        }
                     }
                 }
                 Key::Cancel | Key::Char('q') | Key::Char('Q') => {
@@ -242,7 +216,7 @@ pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> 
 }
 
 fn entry_from_row(s: &SessionRow) -> Entry {
-    Entry::Session {
+    Entry {
         name: s.name.clone(),
         attached: s.attached,
         current: s.current,
@@ -253,11 +227,10 @@ fn entry_from_row(s: &SessionRow) -> Entry {
     }
 }
 
-fn list_n_lines(entries: &[Entry]) -> usize {
-    let session_count = entries.len().saturating_sub(1);
-    // title, blank, create [, blank, col header, sessions…]
+fn list_n_lines(session_count: usize) -> usize {
+    // title, blank, [col header + sessions…] or empty hint
     if session_count > 0 {
-        2 + 1 + 1 + 1 + session_count
+        2 + 1 + session_count
     } else {
         2 + 1
     }
@@ -299,8 +272,8 @@ fn confirm_yn(tty: &mut impl Write, tty_fd: RawFd, prompt: &str, cols: usize) ->
 
 /// Ask for a session name with an editable suggested default.
 ///
-/// Used when there are no sessions yet (skip the list) or after choosing
-/// "Create new session" in the picker. Returns `None` if cancelled.
+/// Used when there are no sessions yet (skip the list) or after pressing `n`
+/// in the picker. Returns `None` if cancelled.
 pub fn prompt_new_session_name(base: &Path) -> Result<Option<String>> {
     let mut tty = open_tty()?;
     let tty_fd = tty.as_raw_fd();
@@ -478,12 +451,12 @@ fn open_tty() -> Result<std::fs::File> {
     }
 }
 
-/// Initial cursor: first detachable session, else Create new (index 0).
+/// Initial cursor: first detachable session, else first row.
 fn first_cursor(entries: &[Entry]) -> Option<usize> {
     entries
         .iter()
         .enumerate()
-        .find(|(_, e)| matches!(e, Entry::Session { attached: false, .. }))
+        .find(|(_, e)| !e.attached)
         .map(|(i, _)| i)
         .or((!entries.is_empty()).then_some(0))
 }
@@ -499,21 +472,13 @@ fn display_name(name: &str, current: bool) -> String {
 fn compute_widths(entries: &[Entry], cols: usize) -> ColWidths {
     let max_name = entries
         .iter()
-        .filter_map(|e| match e {
-            Entry::Session { name, current, .. } => {
-                Some(display_name(name, *current).chars().count())
-            }
-            Entry::CreateNew => None,
-        })
+        .map(|e| display_name(&e.name, e.current).chars().count())
         .max()
         .unwrap_or(MIN_NAME_W)
         .max(MIN_NAME_W);
     let max_shell = entries
         .iter()
-        .filter_map(|e| match e {
-            Entry::Session { shell, .. } => Some(shell.chars().count()),
-            Entry::CreateNew => None,
-        })
+        .map(|e| e.shell.chars().count())
         .max()
         .unwrap_or(MIN_SHELL_W)
         .clamp(MIN_SHELL_W, MAX_SHELL_W);
@@ -587,72 +552,54 @@ fn draw(
     }
     let help = match status {
         Some(s) => s.to_string(),
-        None => "↑/↓  Enter/s switch  k kill  q quit  *=current".into(),
+        None => "↑/↓  Enter/s switch  n new  k kill  q quit  *=current".into(),
     };
     write_line(out, &truncate_visible(&help, cols))?;
     write_line(out, "")?;
 
-    let has_sessions = entries.iter().any(|e| matches!(e, Entry::Session { .. }));
-
-    for (i, entry) in entries.iter().enumerate() {
-        if i == 1 && has_sessions {
-            // Blank + column header after the create-new row.
-            write_line(out, "")?;
-            let header = format_session_row(
-                "  ",
-                "NAME",
-                "STATE",
-                "CREATED",
-                "LAST ACTIVE",
-                "SHELL",
+    if entries.is_empty() {
+        write_line(
+            out,
+            &truncate_visible(&format!("{SGR_DIM}(no sessions — press n to create){SGR_RESET}"), cols),
+        )?;
+    } else {
+        let header = format_session_row(
+            "  ",
+            "NAME",
+            "STATE",
+            "CREATED",
+            "LAST ACTIVE",
+            "SHELL",
+            widths,
+        );
+        write_line(
+            out,
+            &truncate_visible(&format!("{SGR_BOLD}{header}{SGR_RESET}"), cols),
+        )?;
+        for (i, entry) in entries.iter().enumerate() {
+            let selected = i == cursor;
+            let marker = if selected { "> " } else { "  " };
+            let shown = display_name(&entry.name, entry.current);
+            let body = format_session_row(
+                marker,
+                &shown,
+                &entry.state,
+                &entry.created,
+                &entry.last_active,
+                &entry.shell,
                 widths,
             );
-            write_line(
-                out,
-                &truncate_visible(&format!("{SGR_BOLD}{header}{SGR_RESET}"), cols),
-            )?;
+            let line = if selected {
+                format!("{SGR_REVERSE}{body}{SGR_RESET}")
+            } else if entry.attached && !entry.current {
+                format!("{SGR_DIM}{body}{SGR_RESET}")
+            } else if entry.current {
+                format!("{SGR_BOLD}{body}{SGR_RESET}")
+            } else {
+                body
+            };
+            write_line(out, &truncate_visible(&line, cols))?;
         }
-        let selected = i == cursor;
-        let line = match entry {
-            Entry::CreateNew => {
-                if selected {
-                    format!("{SGR_REVERSE}> Create new session{SGR_RESET}")
-                } else {
-                    "  Create new session".to_string()
-                }
-            }
-            Entry::Session {
-                name,
-                attached,
-                current,
-                state,
-                created,
-                last_active,
-                shell,
-            } => {
-                let marker = if selected { "> " } else { "  " };
-                let shown = display_name(name, *current);
-                let body = format_session_row(
-                    marker,
-                    &shown,
-                    state,
-                    created,
-                    last_active,
-                    shell,
-                    widths,
-                );
-                if selected {
-                    format!("{SGR_REVERSE}{body}{SGR_RESET}")
-                } else if *attached && !*current {
-                    format!("{SGR_DIM}{body}{SGR_RESET}")
-                } else if *current {
-                    format!("{SGR_BOLD}{body}{SGR_RESET}")
-                } else {
-                    body
-                }
-            }
-        };
-        write_line(out, &truncate_visible(&line, cols))?;
     }
     out.flush().ok();
     Ok(())
@@ -849,7 +796,7 @@ mod tests {
     }
 
     fn sess_cur(name: &str, attached: bool, current: bool) -> Entry {
-        Entry::Session {
+        Entry {
             name: name.into(),
             attached,
             current,
@@ -866,32 +813,33 @@ mod tests {
 
     #[test]
     fn cursor_prefers_first_detached() {
-        let entries = vec![Entry::CreateNew, sess("a", false), sess("b", true)];
+        let entries = vec![sess("a", false), sess("b", true)];
+        assert_eq!(first_cursor(&entries), Some(0));
+        let entries = vec![sess("busy", true), sess("free", false)];
         assert_eq!(first_cursor(&entries), Some(1));
     }
 
     #[test]
-    fn cursor_falls_back_to_create_when_all_attached() {
-        let entries = vec![Entry::CreateNew, sess("busy", true)];
+    fn cursor_falls_back_to_first_when_all_attached() {
+        let entries = vec![sess("busy", true), sess("also", true)];
         assert_eq!(first_cursor(&entries), Some(0));
     }
 
     #[test]
     fn navigation_includes_attached() {
-        let entries = vec![Entry::CreateNew, sess("free", false), sess("busy", true)];
-        // All rows are navigable with ↑/↓ (no skipping).
-        assert_eq!(entries.len(), 3);
-        assert!(matches!(entries[2], Entry::Session { attached: true, .. }));
+        let entries = vec![sess("free", false), sess("busy", true)];
+        assert_eq!(entries.len(), 2);
+        assert!(entries[1].attached);
     }
 
     #[test]
     fn current_session_marked_with_asterisk() {
         assert_eq!(display_name("demo", true), "*demo");
         assert_eq!(display_name("demo", false), "demo");
-        let entries = vec![Entry::CreateNew, sess_cur("mine", true, true)];
+        let entries = vec![sess_cur("mine", true, true)];
         let widths = compute_widths(&entries, 100);
         let mut buf = Vec::new();
-        draw(&mut buf, &entries, 1, true, 6, 100, &widths, None).unwrap();
+        draw(&mut buf, &entries, 0, true, 4, 100, &widths, None).unwrap();
         let text = String::from_utf8_lossy(&buf);
         assert!(text.contains("*mine"), "{text}");
         assert!(text.contains("*=current") || text.contains("current"), "{text}");
@@ -914,7 +862,6 @@ mod tests {
     #[test]
     fn widths_expand_for_long_names_and_keep_columns() {
         let entries = vec![
-            Entry::CreateNew,
             sess("short", false),
             sess("this-is-a-very-long-session-name", false),
         ];
@@ -935,14 +882,15 @@ mod tests {
     }
 
     #[test]
-    fn draw_includes_created_and_header() {
-        let entries = vec![Entry::CreateNew, sess("demo", false)];
+    fn draw_includes_header_and_n_new_help() {
+        let entries = vec![sess("demo", false)];
         let widths = compute_widths(&entries, 100);
         let mut buf = Vec::new();
-        // n_lines = 2 + 1 + 1 + 1 + 1 = 6
-        draw(&mut buf, &entries, 1, true, 6, 100, &widths, None).unwrap();
+        // n_lines = 2 + 1 + 1 = 4
+        draw(&mut buf, &entries, 0, true, 4, 100, &widths, None).unwrap();
         let text = String::from_utf8_lossy(&buf);
-        assert!(text.contains("Create new session"));
+        assert!(!text.contains("Create new session"), "{text}");
+        assert!(text.contains("n new"), "{text}");
         assert!(text.contains("CREATED"));
         assert!(text.contains("LAST ACTIVE"));
         assert!(text.contains("2h ago"));
@@ -950,6 +898,17 @@ mod tests {
         assert!(text.contains("demo"));
         assert!(text.contains("k kill"));
         assert!(text.contains("Enter/s switch") || text.contains("switch"));
+    }
+
+    #[test]
+    fn draw_empty_list_hints_n_to_create() {
+        let entries: Vec<Entry> = vec![];
+        let widths = compute_widths(&entries, 100);
+        let mut buf = Vec::new();
+        draw(&mut buf, &entries, 0, true, 3, 100, &widths, None).unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("n to create") || text.contains("n new"), "{text}");
+        assert!(!text.contains("Create new session"), "{text}");
     }
 
     #[test]
