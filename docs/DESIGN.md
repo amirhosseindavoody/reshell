@@ -81,7 +81,7 @@ reshell kill --all
 
 When `attach` has no name and stdin is a TTY:
 
-1. Table of sessions: NAME / STATE / CREATED / LAST ACTIVE / SHELL (detached by recent activity, then attached).
+1. Table of sessions: NAME / STATE / CREATED / LAST ACTIVE / SHELL / HISTORY (detached by recent activity, then attached). HISTORY is the current (newest) on-disk history file path, or `(none)` if capture has not written a file yet.
 2. Current session marked `*` (bold); other attached sessions dimmed; long names truncate with `…`.
 3. Keys: ↑/↓ move, Enter or `s` attach/switch, `n` create (name prompt), `k` kill (y/N), `q` / Esc cancel.
 4. Pressing `n` (or bare `reshell` with no sessions) prompts for an editable name prefilled with `session-{unix}-{hex}`.
@@ -417,13 +417,16 @@ line 2000
 *** reshell history: session=demo file=N ended session closed ***
 ```
 
-#### How `info` exposes it
+#### How `info` and the picker expose it
 
 `reshell info` (and `info --json`) lists:
 
 - `history_dir` — `$session/history`
 - `history` / `history_files` — ordered paths to `0001.txt`, `0002.txt`, …
   (human output marks the newest file `(current)`)
+
+The interactive session picker shows the current (newest) history file path in
+a HISTORY column for each session (`(none)` when no file exists yet).
 
 History is never written back into the live PTY on attach; reattach still relies
 on DEC restore + child redraw (§8.1).
@@ -562,5 +565,6 @@ Linux.
 - Second attach is rejected while the first holds the flock; stale `attached`
   files recover cleanly.
 - Primary-screen output appears in `$session/history/*.txt`; full-screen
-  (alt-screen) output does not; `reshell info` shows the history paths.
+  (alt-screen) output does not; `reshell info` and the session picker show the
+  current history path.
 - `pixi run test` / CI `cargo test --locked` pass on Linux without a controlling TTY.

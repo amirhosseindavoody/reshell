@@ -426,12 +426,15 @@ fn cmd_attach(
 
             let rows: Vec<picker::SessionRow> = sessions
                 .iter()
-                .map(|(meta, _)| {
+                .map(|(meta, paths)| {
                     let state = if meta.attached {
                         "attached"
                     } else {
                         "detached"
                     };
+                    let history = history::current_history_file(paths)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(none)".into());
                     picker::SessionRow {
                         name: meta.name.clone(),
                         attached: meta.attached,
@@ -440,6 +443,7 @@ fn cmd_attach(
                         created: format_time_human(meta.created_unix),
                         last_active: format_time_human(session::session_activity(meta)),
                         shell: meta.shell.clone(),
+                        history,
                     }
                 })
                 .collect();
