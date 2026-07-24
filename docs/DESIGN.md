@@ -173,7 +173,7 @@ reshell/
 | [`src/server.rs`](../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, history writer, peer pid |
 | [`src/client.rs`](../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP` / `SIGUSR1`, protocol I/O |
 | [`src/protocol.rs`](../src/protocol.rs) | Length-prefixed framing (see [PROTOCOL.md](PROTOCOL.md)) |
-| [`src/history.rs`](../src/history.rs) | Rotating on-disk text history (~2000 lines/file); pauses on alt-screen |
+| [`src/history.rs`](../src/history.rs) | Rotating on-disk text history (~2000 lines/file); line-cursor collapse of redraws; pauses on alt-screen |
 | [`src/termstate.rs`](../src/termstate.rs) | DEC private mode + OSC window-title tracking for restore-on-attach |
 | [`src/vscode_si.rs`](../src/vscode_si.rs) | VS Code/Cursor OSC 633 sticky-scroll + shell-integration inject (bash/zsh/fish) |
 
@@ -344,7 +344,22 @@ session has been doing.
 | Captured | Skipped |
 |----------|---------|
 | Primary-screen PTY output (attached **or** detached) | Alternate-screen / full-screen TUI output |
-| UTF-8 text lines after stripping CSI / OSC | Mouse, DEC private modes, raw control bytes |
+| UTF-8 text lines after collapsing same-line redraws | Vertical CSI, mouse, DEC private modes, raw controls |
+
+History is **not** a VT screen buffer. Capture keeps a single current-line
+buffer with a column cursor so interactive shell editing looks like the final
+line you saw:
+
+| Input | Effect on current line |
+|-------|-------------------------|
+| Printable / UTF-8 | Overwrite or extend at the cursor |
+| `\r` | Column → start of line |
+| Backspace / DEL | Move cursor left (no delete; overwrite handles edits) |
+| `\t` | Advance to the next 8-column tab stop with spaces |
+| `\n` | Commit the line to the history file |
+| CSI `G` / `C` / `D` | Horizontal absolute / forward / back |
+| CSI `K` (erase in line) | Truncate or blank within the current line |
+| Other CSI / OSC | Stripped (ignored for the text log) |
 
 **Alternate screen vs raw mode:** the attach client always puts the *local* TTY in
 raw mode so keystrokes pass through. That is unrelated to history. Full-screen
@@ -367,7 +382,8 @@ $session/history/
   in file=N+1” marker and opens the next numbered file.
 - On session end (shell exit / daemon teardown), the current file gets a
   “session closed” marker.
-- CSI/OSC sequences are stripped so the files stay readable as plain text.
+- Same-line redraws are collapsed; other CSI/OSC is stripped so files stay
+  readable as plain text (still not a full VT emulator).
 
 #### File format
 
