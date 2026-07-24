@@ -267,6 +267,7 @@ fn short_subcommand_aliases_work() {
     let help_txt = String::from_utf8_lossy(&help.stdout);
     assert!(
         help_txt.contains("[alias: a]")
+            && help_txt.contains("[alias: d]")
             && help_txt.contains("[alias: ls]")
             && help_txt.contains("[alias: i]"),
         "expected visible short aliases in help: {help_txt}"
@@ -437,11 +438,12 @@ fn completion_omits_option_flags() {
     assert!(root.status.success(), "{}", String::from_utf8_lossy(&root.stderr));
     let txt = String::from_utf8_lossy(&root.stdout);
     assert!(txt.contains("attach"), "missing long subcommands: {txt:?}");
+    assert!(txt.contains("detach"), "missing detach: {txt:?}");
     assert!(txt.contains("new"), "missing new: {txt:?}");
     assert!(txt.contains("list"), "missing list: {txt:?}");
     // Short aliases must not replace the long names in the candidate list.
     assert!(
-        !txt.lines().any(|l| l == "n" || l == "a" || l == "k"),
+        !txt.lines().any(|l| l == "n" || l == "a" || l == "d" || l == "k"),
         "short aliases should not be primary candidates: {txt:?}"
     );
     assert!(!txt.contains("--dir"), "flags should not complete: {txt:?}");
