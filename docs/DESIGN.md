@@ -164,6 +164,7 @@ reshell/
 │   ├── session_smoke.rs
 │   ├── attach_restore.rs
 │   ├── attach_race.rs
+│   ├── cli_detach.rs
 │   ├── history_files.rs
 │   └── switch_frees.rs
 ├── docs/DESIGN.md
