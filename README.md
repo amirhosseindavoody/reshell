@@ -7,7 +7,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Keep shells alive and running after SSH disconnects
 - Minimal footprint so CLI tools, TUI apps, and scripts just work — no prefix keys stolen
 - Explicit sessions: `new` / `attach` / `list` / `info` / `context` / `kill`
-- Bare `reshell` opens a small session picker (create / switch / kill; `*` marks the current session)
+- Bare `reshell` opens a small session picker (`n` new / switch / kill; `*` marks the current session)
 - Detach with **Ctrl+\** by default (overridable); client exits, session keeps running
 - Reattach restores TUI terminal modes (mouse, alt-screen, …), the window/tab title, and forces a redraw
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session (bash, zsh, fish)
@@ -53,7 +53,7 @@ pixi global install --git https://github.com/amirhosseindavoody/reshell.git --br
 ## Usage
 
 ```bash
-# Interactive session picker (create new with name prompt / attach)
+# Interactive session picker (`n` to create / attach)
 reshell
 # same as: reshell attach
 
@@ -102,13 +102,13 @@ reshell kill demo
 Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach, `ls` list, `i` info, `c` context, `r` rename, `k` kill.
 
 Bare `reshell` / `reshell attach` (no name) opens a small picker when stdin is a
-TTY: **Create new session**, then a table of sessions (newest activity first among
-detached, then attached: name, state, created, last-active, shell). The session
-you are inside is marked with `*` and bolded. Already-attached sessions (other
-than the current one) are shown dimmed. Long names truncate with an ellipsis so
-columns stay aligned. Keys: ↑/↓ move, Enter or `s` switch/attach, `k` kill
-(with y/N confirm), `q` / Esc cancel. Choosing create-new (or bare `reshell` with
-no sessions) prompts for a session name pre-filled with a generated `session-…`
+TTY: a table of sessions (newest activity first among detached, then attached:
+name, state, created, last-active, shell). The session you are inside is marked
+with `*` and bolded. Already-attached sessions (other than the current one) are
+shown dimmed. Long names truncate with an ellipsis so columns stay aligned.
+Keys: ↑/↓ move, Enter or `s` switch/attach, `n` create (name prompt), `k` kill
+(with y/N confirm), `q` / Esc cancel. Pressing `n` (or bare `reshell` with no
+sessions) prompts for a session name pre-filled with a generated `session-…`
 default you can edit. Switching from **inside** a session detaches (frees) that
 session before attaching to the target — it does not nest a second client.
 Without a TTY (scripts) it still falls back to the most recently active session.
@@ -195,7 +195,7 @@ editors:
 | | reshell | dtach / abduco |
 |---|---|---|
 | **Core model** | One PTY per named session; raw byte pipe | Same idea |
-| **Session UX** | `new` / `attach` / `list` / `kill`; bare `reshell` opens a small session picker (create new / attach) | Minimal CLI; dtach has little session management; abduco lists sessions but is otherwise sparse |
+| **Session UX** | `new` / `attach` / `list` / `kill`; bare `reshell` opens a small session picker (`n` new / attach) | Minimal CLI; dtach has little session management; abduco lists sessions but is otherwise sparse |
 | **Reattach redraw** | Restores DEC modes (mouse, alt-screen, …) and forces a two-phase resize so differential TUIs (e.g. ratatui / Fresh) full-paint | Passthrough only — terminal modes and screen contents are not restored; abduco recommends nesting [dvtm](https://github.com/martanne/dvtm) for that |
 | **Detach** | **Ctrl+\\** by default; overridable (`--detach-key` / `RESHELL_DETACH_KEY`) | Configurable detach key (similar spirit) |
 | **Editor / IDE terminals** | VS Code/Cursor sticky scroll: closes the outer `reshell` command and injects shell integration into the session | No awareness of OSC 633 / sticky scroll |
