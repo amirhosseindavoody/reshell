@@ -139,8 +139,10 @@ Primary-screen shell output is appended to rotating text files under
 `$session/history/` (`0001.txt`, `0002.txt`, …; ~2000 lines each). Capture
 pauses while a full-screen app owns the **alternate screen** (DEC 1049/1047/47)
 — that is TUI mode, not the attach client's local raw TTY mode.
-`reshell info` lists the history directory and file paths. CSI/OSC sequences are
-stripped so the files stay readable.
+`reshell info` lists the history directory and file paths. History stays a
+plain-text line log (not a VT screen buffer): interactive redraws are collapsed
+with a current-line cursor model (`\r`, backspace, same-line CSI erase/moves);
+other CSI/OSC is stripped.
 
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 
