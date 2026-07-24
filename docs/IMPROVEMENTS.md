@@ -131,13 +131,15 @@ active session (or created one if none existed).
 **Now:** On a TTY, shows a small picker: a table of sessions (name / state /
 created / last-active / shell / current history file path; detached by recent
 activity, then attached; long names and paths truncate with `…`). The session
-this process is inside is marked with `*`. Enter / `s` attach (switch), `n`
-creates (name prompt), `k` kills with confirmation, `q`/Esc cancel. From inside
-a session, attach / create / `new` always leave the current session first (outer
-client detach + reattach); they never nest a second attach client. Pressing `n`
-(or bare `reshell` with no sessions) prompts for a session name pre-filled with
-an allocated `session-…` default. Non-TTY (scripts) keeps the most-recent
-fallback; empty non-TTY still auto-creates.
+this process is inside is marked with `*`. Enter / `s` attach (switch; attached
+sessions confirm detach-first), `n` creates (name prompt), `k` kills with
+confirmation, `q`/Esc cancel. From inside a session, attach / create / `new`
+always leave the current session first (outer client detach + reattach); they
+never nest a second attach client. Pressing `n` (or bare `reshell` with no
+sessions) prompts for a session name pre-filled with an allocated `session-…`
+default. Non-TTY (scripts) keeps the most-recent fallback; empty non-TTY still
+auto-creates. `reshell detach` can also free an attached session without killing
+the shell.
 
 ### 4.5 `reshell ssh …` wrapper (post-v1)
 

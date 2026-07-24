@@ -64,8 +64,12 @@ reshell new demo --detach      # create only; print name on stdout
 
 # Attach (Ctrl+\ detaches without killing the shell by default)
 reshell attach demo
-reshell a demo                 # short aliases: n/a/ls/i/r/k
+reshell a demo                 # short aliases: n/a/d/ls/i/r/k
 reshell --detach-key '^a' attach demo
+
+# Detach a client (shell keeps running)
+reshell detach demo
+reshell d                      # current / most recent
 
 # Inspect / manage
 reshell list
@@ -83,8 +87,9 @@ When `attach` has no name and stdin is a TTY:
 
 1. Table of sessions: NAME / STATE / CREATED / LAST ACTIVE / SHELL / HISTORY (detached by recent activity, then attached). HISTORY is the current (newest) on-disk history file path, or `(none)` if capture has not written a file yet.
 2. Current session marked `*` (bold); other attached sessions dimmed; long names truncate with `…`.
-3. Keys: ↑/↓ move, Enter or `s` attach/switch, `n` create (name prompt), `k` kill (y/N), `q` / Esc cancel.
+3. Keys: ↑/↓ move, Enter or `s` attach/switch (attached sessions confirm detach-first), `n` create (name prompt), `k` kill (y/N), `q` / Esc cancel.
 4. Pressing `n` (or bare `reshell` with no sessions) prompts for an editable name prefilled with `session-{unix}-{hex}`.
+5. Confirming attach on an already-attached session detaches the other client (`SIGHUP` → `Detach`) then attaches here — still exclusive (one terminal at a time).
 
 Non-TTY: most recently active session, or auto-create when none exist.
 
@@ -159,6 +164,7 @@ reshell/
 │   ├── session_smoke.rs
 │   ├── attach_restore.rs
 │   ├── attach_race.rs
+│   ├── cli_detach.rs
 │   ├── history_files.rs
 │   └── switch_frees.rs
 ├── docs/DESIGN.md
@@ -167,9 +173,9 @@ reshell/
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../src/main.rs) | Clap CLI: `new` / `attach` / `list` / `info` / `rename` / `clean` / `kill` / `completion` (aliases `n`/`a`/`ls`/`i`/`r`/`k`); dynamic session-name completion; detach-key + log flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../src/main.rs) | Clap CLI: `new` / `attach` / `detach` / `list` / `info` / `rename` / `clean` / `kill` / `completion` (aliases `n`/`a`/`d`/`ls`/`i`/`r`/`k`); dynamic session-name completion; detach-key + log flags; default shell `/bin/zsh` |
 | [`src/picker.rs`](../src/picker.rs) | Small raw-TTY session picker + name prompt for bare `reshell` / `attach` with no name |
-| [`src/session.rs`](../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill, attach lock, most-recent / current session, `client.pid` / `switch_to` |
+| [`src/session.rs`](../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill/detach, attach lock, most-recent / current session, `client.pid` / `switch_to` |
 | [`src/server.rs`](../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, history writer, peer pid |
 | [`src/client.rs`](../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP` / `SIGUSR1`, protocol I/O |
 | [`src/protocol.rs`](../src/protocol.rs) | Length-prefixed framing (see [PROTOCOL.md](PROTOCOL.md)) |
@@ -297,14 +303,17 @@ detached and the target is attached before exiting successfully.
 |-------|--------|--------|-------|
 | Detach key (default Ctrl+\) | exits | drops client, clears attach lock | keeps running |
 | SSH hangup (`SIGHUP` to client) | exits after `Detach` | same as above | keeps running |
+| `reshell detach` / picker steal-confirm | signals `SIGHUP` to `client.pid` | same as hangup | keeps running |
 | Client crash / socket close | gone | drops client | keeps running |
 | Shell exits | eventually EOF on socket | cleans up session files, exits | — |
 | `reshell kill` | n/a | terminated | terminated with PTY teardown |
 
 Only one client may be attached. Exclusivity is enforced by an advisory `flock`
 on the `attached` file held by the daemon for the life of the connection: a second
-socket is accepted then immediately closed, and `reshell attach` refuses early
-when the flock is held. A leftover `attached` file with no flock holder is treated
+socket is accepted then immediately closed, and `reshell attach <name>` refuses early
+when the flock is held. The interactive picker (and `reshell detach`) can free a
+busy session first by signaling the recorded attach client, then attach — still
+one terminal at a time. A leftover `attached` file with no flock holder is treated
 as stale and cleared.
 
 ## 8. Reattach Semantics
@@ -486,6 +495,7 @@ Wire format details live in [PROTOCOL.md](PROTOCOL.md).
 |---------|---------|---------|
 | `reshell` / `reshell attach [name]` | `a` | Attach; no name → picker (TTY) or most-recent / create |
 | `reshell new [name]` | `n` | Create session; attach unless `--detach` |
+| `reshell detach [name]` | `d` | Detach client from session (shell keeps running) |
 | `reshell list` | `ls` | List live sessions (relative times; `--json`) |
 | `reshell info [name]` | `i` | Show pid, shell, state, paths, history files (`--json`) |
 | `reshell rename <old> <new>` | `r` | Rename a live session directory |
@@ -521,7 +531,7 @@ conda Rust toolchain is used, not an older system rustup.
   final winsize (two-phase full paint for differential TUIs).
 - **Integration** (`tests/attach_race.rs`): concurrent attach (one survivor), stale
   `attached` recovery, kill / `kill --all`, missing-session errors, auto-name
-  uniqueness, daemon log.
+  uniqueness, daemon log, `reshell detach` force-detach.
 - **Integration** (`tests/history_files.rs`): primary-screen lines land in
   `history/0001.txt`; alt-screen output is skipped; `info` lists history paths.
 - **Integration** (`tests/switch_frees.rs`): in-session switch detaches the original

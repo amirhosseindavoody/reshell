@@ -68,6 +68,15 @@ enum Commands {
         #[arg(add = ArgValueCompleter::new(complete_attachable_session_name))]
         name: Option<String>,
     },
+    /// Detach the client from a session (shell keeps running).
+    /// Defaults to the current session when inside one, otherwise the most
+    /// recently active session.
+    #[command(visible_alias = "d")]
+    Detach {
+        /// Session name (omit for current / most recent)
+        #[arg(add = ArgValueCompleter::new(complete_session_name))]
+        name: Option<String>,
+    },
     /// List running sessions
     #[command(visible_alias = "ls")]
     List {
@@ -226,6 +235,7 @@ fn run() -> Result<()> {
             detach,
         } => cmd_new(&base, name, shell, detach, log, detach_key),
         Commands::Attach { name } => cmd_attach(&base, name, log, detach_key),
+        Commands::Detach { name } => cmd_detach(&base, name),
         Commands::List { json } => cmd_list(&base, json),
         Commands::Info { name, json } => cmd_info(&base, name, json),
         Commands::Rename { old_name, new_name } => {
@@ -283,7 +293,7 @@ fn print_completion_registration(shell: Shell) -> Result<()> {
     Ok(())
 }
 
-/// Tab-complete live session names for `info` / `context` / `kill` / `rename`.
+/// Tab-complete live session names for `info` / `detach` / `kill` / `rename`.
 fn complete_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
     complete_sessions(current, /*attachable_only=*/ false)
 }
@@ -454,12 +464,34 @@ fn cmd_attach(
                     cmd_new(base, Some(name), None, false, log, detach_key)
                 }
                 picker::PickAction::Attach(n) => join_session(base, &n, detach_key),
+                picker::PickAction::AttachAfterDetach(n) => {
+                    // Confirmed in the picker: free the other terminal first, then
+                    // join (still exclusive — only one attach at a time).
+                    eprintln!("detaching {n}");
+                    session::request_detach(base, &n)?;
+                    join_session(base, &n, detach_key)
+                }
                 picker::PickAction::Cancelled => {
                     anyhow::bail!("cancelled");
                 }
             }
         }
     }
+}
+
+fn cmd_detach(base: &Path, name: Option<String>) -> Result<()> {
+    let name = resolve_session_name(base, name)?;
+    let paths = session::SessionPaths::for_name(base, &name);
+    if !paths.meta.exists() {
+        anyhow::bail!("session '{name}' not found");
+    }
+    if !session::is_attached(&paths) {
+        println!("session '{name}' is already detached");
+        return Ok(());
+    }
+    session::request_detach(base, &name)?;
+    println!("detached {name}");
+    Ok(())
 }
 
 /// Join `target`, never nesting on top of a session this process is already in.
