@@ -18,8 +18,8 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 - Durable primary-screen history as rotating text files under the session dir (not a VT buffer; not replayed on attach); retained in a durable archive when the session ends.
 - Shell-agnostic: PTY passthrough so bash, zsh, fish, and full-screen apps work.
 - Linux servers only for the session daemon (`linux-64` pixi platform). Windows
-  (`win-64`) ships an `ssh`-only client binary via the same pixi package so
-  `pixi global install` on Windows exposes `reshell` → `reshell ssh <host>`.
+  (`win-64` / `win-arm64`) ships an `ssh`-only client binary via the same pixi
+  package so `pixi global install` on Windows exposes `reshell` → `reshell ssh <host>`.
 
 ### Non-Goals (v1)
 
@@ -590,8 +590,8 @@ Mirrors the csv-utils dual-manifest pattern:
 | File | Role |
 |------|------|
 | `Cargo.toml` / `Cargo.lock` | Rust crate; lockfile used with `--locked` in conda builds |
-| `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build; platforms `linux-64` + `win-64` |
-| `recipe/recipe.yaml` | rattler-build → `$PREFIX/bin/reshell` (Unix) or `%LIBRARY_BIN%\reshell.exe` (Windows) |
+| `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build; platforms `linux-64` + `win-64` + `win-arm64` |
+| `recipe/recipe.yaml` | rattler-build via `cargo install --root` → `$PREFIX/bin/reshell` (Unix) or `%PREFIX%\Library\bin\reshell.exe` (Windows) |
 | `scripts/update-version.sh` | CalVer `YYYY.M.D+N` across Cargo / pixi / recipe |
 
 `win-64` builds an ssh-client-only binary (daemon modules are `cfg(unix)`). Dev
@@ -627,9 +627,7 @@ Linux.
 
 ## 13. Open Questions
 
-1. **Windows arm64 package** — `win-64` ships the ssh client; `win-arm64` can
-   follow the same pattern if needed.
-2. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
+1. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
    protocol coverage stays the CI default to avoid flakes.
 
 ### Resolved
@@ -637,9 +635,10 @@ Linux.
 - **`reshell ssh` wrapper** — Thin `ssh -t` relay with remote version check /
   pixi install, named session create/attach, and reconnect backoff + R/Q
   (see §4.4).
-- **Windows client package** — `win-64` pixi platform builds an ssh-only
-  `reshell.exe` so `pixi global install` on Windows exposes a binary (daemon
-  remains Linux-only).
+- **Windows client package** — `win-64` / `win-arm64` pixi platforms build an
+  ssh-only `reshell.exe` via `cargo install --root` into `Library\bin` so
+  `pixi global install` exposes a real binary (earlier `copy target\release\…`
+  could miss the triple-specific path and yield an empty package).
 - **Attach exclusivity** — Advisory `flock` on `attached` for the life of the
   connection; stale files without a holder are cleared.
 - **In-session leave-and-join** — `attach` / `new` / picker always leave the

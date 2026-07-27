@@ -161,7 +161,7 @@ is a thin `ssh -t` relay; the daemon stays on the server. See [DESIGN.md](DESIGN
 |----------|-------|-----|
 | First | §§2.1–2.6 (hardening, CI, tests) | Correctness and maintainability without product drift |
 | Next | §§3.1–4.5 done | Low surface area; matches dtach/abduco ergonomics |
-| Later | `win-arm64`, deeper polish | Optional; `win-64` ssh client covers the main Windows path |
+| Later | Deeper polish | `win-64` / `win-arm64` ssh client covers the main Windows path |
 
 When implementing any item, update user-facing README and/or [DESIGN.md](DESIGN.md) /
 [PROTOCOL.md](PROTOCOL.md) in the same change if behavior or interfaces change
