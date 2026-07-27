@@ -4,6 +4,7 @@ mod picker;
 mod protocol;
 mod server;
 mod session;
+mod ssh;
 mod termstate;
 mod vscode_si;
 
@@ -138,6 +139,44 @@ enum Commands {
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
+    /// SSH to a Linux host, ensure remote reshell, and attach (with reconnect)
+    ///
+    /// Thin wrapper: SSHes in, checks/installs a compatible remote `reshell`
+    /// (`pixi global install` when needed), then creates or attaches a session
+    /// daemon on the server. If the SSH link drops, waits with backoff
+    /// (1s → 60s) and reconnects; press `R` to retry immediately, `Q` to quit.
+    /// Clean detach (Ctrl+\ by default) exits without reconnecting.
+    ///
+    /// Examples:
+    ///
+    ///   reshell ssh myserver
+    ///
+    ///   reshell ssh -n demo user@host
+    ///
+    ///   reshell ssh -- -J bastion -p 2222 user@host
+    Ssh {
+        /// Remote session name (generated once if omitted; reused on reconnect)
+        #[arg(long, short = 'n')]
+        name: Option<String>,
+        /// Shell for a newly created remote session (default: /bin/zsh)
+        #[arg(long)]
+        shell: Option<String>,
+        /// Do not auto-install remote reshell via pixi when missing/incompatible
+        #[arg(long)]
+        no_install: bool,
+        /// Git URL for remote `pixi global install --git` (default: GitHub repo)
+        #[arg(long, default_value = ssh::DEFAULT_INSTALL_GIT)]
+        install_git: String,
+        /// Git branch/tag for remote install (default: main)
+        #[arg(long, default_value = ssh::DEFAULT_INSTALL_REF)]
+        install_ref: String,
+        /// Destination (`Host` from ssh config, or `user@host`).
+        /// Omit when the host is among the forwarded ssh args after `--`.
+        destination: Option<String>,
+        /// Extra arguments forwarded to `ssh` (place after `--` if they look like flags)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        ssh_args: Vec<String>,
+    },
     /// Print shell completion script to stdout
     Completion {
         /// Shell to generate completions for
@@ -250,6 +289,30 @@ fn run() -> Result<()> {
     let command = cli.command.unwrap_or(Commands::Attach { name: None });
 
     match command {
+        Commands::Ssh {
+            name,
+            shell,
+            no_install,
+            install_git,
+            install_ref,
+            destination,
+            ssh_args,
+        } => {
+            // SSH mode does not use the local session dir; remote owns the daemon.
+            let _ = (&base, &archive, &log);
+            ssh::run(ssh::SshOpts {
+                name,
+                shell,
+                detach_key: cli.detach_key,
+                no_install,
+                install_git,
+                install_ref,
+                destination,
+                ssh_args,
+                ssh_bin: None,
+                expected_version: None,
+            })
+        }
         Commands::New {
             name,
             shell,
