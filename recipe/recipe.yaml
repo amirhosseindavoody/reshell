@@ -14,13 +14,22 @@ source:
 build:
   number: 0
   script:
-    - |
-      set -euo pipefail
-      cd "$SRC_DIR"
-      host="$(rustc -vV | sed -n 's/^host: //p')"
-      cargo build --locked --release
-      install -Dm755 "target/${host}/release/reshell" "$PREFIX/bin/reshell"
-      rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
+    - if: unix
+      then: |
+        set -euo pipefail
+        cd "$SRC_DIR"
+        host="$(rustc -vV | sed -n 's/^host: //p')"
+        cargo build --locked --release
+        install -Dm755 "target/${host}/release/reshell" "$PREFIX/bin/reshell"
+        rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
+    - if: win
+      then: |
+        cd %SRC_DIR%
+        cargo build --locked --release
+        if not exist "%LIBRARY_BIN%" mkdir "%LIBRARY_BIN%"
+        copy /Y "target\release\reshell.exe" "%LIBRARY_BIN%\reshell.exe"
+        if exist "%PREFIX%\.crates.toml" del /F /Q "%PREFIX%\.crates.toml"
+        if exist "%PREFIX%\.crates2.json" del /F /Q "%PREFIX%\.crates2.json"
 
 requirements:
   build:
@@ -29,7 +38,14 @@ requirements:
 
 tests:
   - script:
-      - reshell --help
+      - if: unix
+        then:
+          - reshell --help
+          - reshell ssh --help
+      - if: win
+        then:
+          - reshell --help
+          - reshell ssh --help
 
 about:
   summary: Keep shells alive across SSH disconnects with explicit attach/detach sessions

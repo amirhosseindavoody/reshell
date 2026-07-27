@@ -1,3 +1,6 @@
+//! Length-prefixed framing between attach client and session daemon.
+#![cfg_attr(windows, allow(dead_code))]
+
 use std::io::{self, Read, Write};
 
 use anyhow::{bail, Context, Result};

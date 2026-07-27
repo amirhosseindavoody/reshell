@@ -1,31 +1,46 @@
+#[cfg(unix)]
 mod client;
+#[cfg(unix)]
 mod history;
+mod nameutil;
+#[cfg(unix)]
 mod picker;
 mod protocol;
+#[cfg(unix)]
 mod server;
+#[cfg(unix)]
 mod session;
 mod ssh;
+#[cfg(unix)]
 mod termstate;
+#[cfg(unix)]
 mod vscode_si;
 
 use std::ffi::OsStr;
-use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use clap_complete::{CompleteEnv, Shell};
+#[cfg(unix)]
 use serde::Serialize;
 
+#[cfg(unix)]
 use protocol::parse_detach_key;
+#[cfg(unix)]
 use session::{allocate_session_name, now_unix, session_base_dir};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "reshell",
     version,
-    about = "Keep shells alive across SSH disconnects with explicit attach/detach sessions",
+    about = "Keep shells alive across SSH disconnects (Linux daemon; Windows/Linux `ssh` client)",
     subcommand_required = false
 )]
 struct Cli {
@@ -54,6 +69,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Create a new session and attach to it
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "n")]
     New {
         /// Session name (generated if omitted)
@@ -69,6 +85,7 @@ enum Commands {
     /// With no name: interactive picker (`n` create / attach).
     /// Non-TTY falls back to the most recently active session; with no sessions,
     /// creates one (TTY: prompts for name).
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "a")]
     Attach {
         /// Session name (omit for the interactive picker)
@@ -78,6 +95,7 @@ enum Commands {
     /// Detach the client from a session (shell keeps running).
     /// Defaults to the current session when inside one, otherwise the most
     /// recently active session.
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "d")]
     Detach {
         /// Session name (omit for current / most recent)
@@ -85,6 +103,7 @@ enum Commands {
         name: Option<String>,
     },
     /// List running sessions
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "ls")]
     List {
         /// Machine-readable JSON (stable fields for scripts)
@@ -95,6 +114,7 @@ enum Commands {
         all: bool,
     },
     /// Show details for a session
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "i")]
     Info {
         /// Session name or archive id (`name@unix`). Defaults to the current
@@ -108,6 +128,7 @@ enum Commands {
         json: bool,
     },
     /// Rename a live session
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "r")]
     Rename {
         /// Current session name
@@ -121,12 +142,14 @@ enum Commands {
     /// Without flags: remove dead / orphan *live* session directories (after
     /// archiving their history and daemon.log). Live sessions keep running;
     /// archives are not deleted. Also runs automatically as part of `list`.
+    #[cfg_attr(windows, command(hide = true))]
     Clean {
         /// Also purge archived ended sessions (history + daemon.log)
         #[arg(long)]
         all: bool,
     },
     /// Terminate a session and its shell
+    #[cfg_attr(windows, command(hide = true))]
     #[command(visible_alias = "k")]
     Kill {
         /// Session name (required unless `--all`)
@@ -146,6 +169,8 @@ enum Commands {
     /// daemon on the server. If the SSH link drops, waits with backoff
     /// (1s → 60s) and reconnects; press `R` to retry immediately, `Q` to quit.
     /// Clean detach (Ctrl+\ by default) exits without reconnecting.
+    ///
+    /// On Windows this is the primary command (session daemons are Linux-only).
     ///
     /// Examples:
     ///
@@ -276,106 +301,132 @@ fn run() -> Result<()> {
         return print_completion_registration(shell);
     }
 
-    let custom_base = cli.dir.is_some();
-    let base = match cli.dir {
-        Some(d) => d,
-        None => session_base_dir()?,
-    };
-    let archive = session::resolve_archive_dir(cli.archive_dir.as_deref(), &base, custom_base);
-    let log = cli.log;
-    let detach_key = parse_detach_key(&cli.detach_key)?;
-
-    // Bare `reshell` is an alias for `reshell attach`.
-    let command = cli.command.unwrap_or(Commands::Attach { name: None });
-
-    match command {
-        Commands::Ssh {
+    // SSH is available on every platform (Windows client → Linux daemon).
+    if let Some(Commands::Ssh {
+        name,
+        shell,
+        no_install,
+        install_git,
+        install_ref,
+        destination,
+        ssh_args,
+    }) = cli.command
+    {
+        return ssh::run(ssh::SshOpts {
             name,
             shell,
+            detach_key: cli.detach_key,
             no_install,
             install_git,
             install_ref,
             destination,
             ssh_args,
-        } => {
-            // SSH mode does not use the local session dir; remote owns the daemon.
-            let _ = (&base, &archive, &log);
-            ssh::run(ssh::SshOpts {
+            ssh_bin: None,
+            expected_version: None,
+        });
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = cli.dir;
+        match cli.command {
+            None => bail!(
+                "on Windows the session daemon is not available locally.\n\
+                 Use: reshell ssh <host>\n\
+                 (OpenSSH client + Linux server; see README)"
+            ),
+            Some(_) => bail!(
+                "this command requires Linux; on Windows use `reshell ssh <host>`"
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let custom_base = cli.dir.is_some();
+        let base = match cli.dir {
+            Some(d) => d,
+            None => session_base_dir()?,
+        };
+        let archive = session::resolve_archive_dir(cli.archive_dir.as_deref(), &base, custom_base);
+        let log = cli.log;
+        let detach_key = parse_detach_key(&cli.detach_key)?;
+
+        // Bare `reshell` is an alias for `reshell attach`.
+        let command = cli.command.unwrap_or(Commands::Attach { name: None });
+
+        match command {
+            Commands::Ssh { .. } => unreachable!("handled above"),
+            Commands::New {
                 name,
                 shell,
-                detach_key: cli.detach_key,
-                no_install,
-                install_git,
-                install_ref,
-                destination,
-                ssh_args,
-                ssh_bin: None,
-                expected_version: None,
-            })
-        }
-        Commands::New {
-            name,
-            shell,
-            detach,
-        } => cmd_new(&base, &archive, name, shell, detach, log, detach_key),
-        Commands::Attach { name } => cmd_attach(&base, &archive, name, log, detach_key),
-        Commands::Detach { name } => cmd_detach(&base, &archive, name),
-        Commands::List { json, all } => cmd_list(&base, &archive, json, all),
-        Commands::Info { name, json } => cmd_info(&base, &archive, name, json),
-        Commands::Rename { old_name, new_name } => {
-            session::rename_session(&base, &old_name, &new_name)?;
-            println!("renamed {old_name} → {new_name}");
-            Ok(())
-        }
-        Commands::Clean { all } => {
-            let n_live = session::cleanup_stale_sessions(&base, &archive)?;
-            if all {
-                let n_arch = session::purge_ended_sessions(&archive)?;
-                if n_live == 0 && n_arch == 0 {
+                detach,
+            } => cmd_new(&base, &archive, name, shell, detach, log, detach_key),
+            Commands::Attach { name } => cmd_attach(&base, &archive, name, log, detach_key),
+            Commands::Detach { name } => cmd_detach(&base, &archive, name),
+            Commands::List { json, all } => cmd_list(&base, &archive, json, all),
+            Commands::Info { name, json } => cmd_info(&base, &archive, name, json),
+            Commands::Rename { old_name, new_name } => {
+                session::rename_session(&base, &old_name, &new_name)?;
+                println!("renamed {old_name} → {new_name}");
+                Ok(())
+            }
+            Commands::Clean { all } => {
+                let n_live = session::cleanup_stale_sessions(&base, &archive)?;
+                if all {
+                    let n_arch = session::purge_ended_sessions(&archive)?;
+                    if n_live == 0 && n_arch == 0 {
+                        println!("(nothing to clean)");
+                    } else {
+                        if n_live > 0 {
+                            println!(
+                                "cleaned {n_live} dead/orphan live session dir(s); \
+                                 history/logs were archived under {}",
+                                archive.display()
+                            );
+                        }
+                        if n_arch > 0 {
+                            println!(
+                                "purged {n_arch} ended session(s) from {}",
+                                archive.display()
+                            );
+                        } else if n_live > 0 {
+                            println!(
+                                "(no ended sessions to purge under {})",
+                                archive.display()
+                            );
+                        }
+                    }
+                } else if n_live == 0 {
                     println!("(nothing to clean)");
                 } else {
-                    if n_live > 0 {
-                        println!(
-                            "cleaned {n_live} dead/orphan live session dir(s); \
-                             history/logs were archived under {}",
-                            archive.display()
-                        );
-                    }
-                    if n_arch > 0 {
-                        println!("purged {n_arch} ended session(s) from {}", archive.display());
-                    } else if n_live > 0 {
-                        println!("(no ended sessions to purge under {})", archive.display());
-                    }
+                    println!(
+                        "cleaned {n_live} dead/orphan live session dir(s); \
+                         history/logs kept under {}",
+                        archive.display()
+                    );
                 }
-            } else if n_live == 0 {
-                println!("(nothing to clean)");
-            } else {
-                println!(
-                    "cleaned {n_live} dead/orphan live session dir(s); \
-                     history/logs kept under {}",
-                    archive.display()
-                );
+                Ok(())
             }
-            Ok(())
-        }
-        Commands::Kill { name, all } => {
-            if all {
-                let killed = session::kill_all_sessions(&base, &archive)?;
-                if killed.is_empty() {
-                    println!("(no sessions)");
+            Commands::Kill { name, all } => {
+                if all {
+                    let killed = session::kill_all_sessions(&base, &archive)?;
+                    if killed.is_empty() {
+                        println!("(no sessions)");
+                    } else {
+                        for name in &killed {
+                            println!("killed {name}");
+                        }
+                    }
                 } else {
-                    for name in &killed {
-                        println!("killed {name}");
-                    }
+                    let name = name.expect("clap requires name unless --all");
+                    session::kill_session(&base, &name, &archive)?;
+                    println!("killed {name}");
                 }
-            } else {
-                let name = name.expect("clap requires name unless --all");
-                session::kill_session(&base, &name, &archive)?;
-                println!("killed {name}");
+                Ok(())
             }
-            Ok(())
+            Commands::Completion { .. } => unreachable!("handled above"),
         }
-        Commands::Completion { .. } => unreachable!("handled above"),
     }
 }
 
@@ -401,14 +452,31 @@ fn print_completion_registration(shell: Shell) -> Result<()> {
 
 /// Tab-complete live session names for `info` / `detach` / `kill` / `rename`.
 fn complete_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
-    complete_sessions(current, /*attachable_only=*/ false)
+    #[cfg(unix)]
+    {
+        complete_sessions(current, /*attachable_only=*/ false)
+    }
+    #[cfg(windows)]
+    {
+        let _ = current;
+        Vec::new()
+    }
 }
 
 /// Tab-complete sessions that can be attached (live and not already attached).
 fn complete_attachable_session_name(current: &OsStr) -> Vec<CompletionCandidate> {
-    complete_sessions(current, /*attachable_only=*/ true)
+    #[cfg(unix)]
+    {
+        complete_sessions(current, /*attachable_only=*/ true)
+    }
+    #[cfg(windows)]
+    {
+        let _ = current;
+        Vec::new()
+    }
 }
 
+#[cfg(unix)]
 fn complete_sessions(current: &OsStr, attachable_only: bool) -> Vec<CompletionCandidate> {
     let Some(current) = current.to_str() else {
         return Vec::new();
@@ -427,6 +495,7 @@ fn complete_sessions(current: &OsStr, attachable_only: bool) -> Vec<CompletionCa
         .collect()
 }
 
+#[cfg(unix)]
 fn completion_dirs() -> (PathBuf, PathBuf) {
     let custom = dir_from_completion_args().is_some()
         || std::env::var("RESHELL_DIR").map(|s| !s.is_empty()).unwrap_or(false);
@@ -442,6 +511,7 @@ fn completion_dirs() -> (PathBuf, PathBuf) {
     (base, archive)
 }
 
+#[cfg(unix)]
 fn completion_base_dir() -> PathBuf {
     if let Some(dir) = dir_from_completion_args() {
         return dir;
@@ -455,14 +525,17 @@ fn completion_base_dir() -> PathBuf {
 }
 
 /// Parse `--dir` from the shell words passed to the dynamic completer.
+#[cfg(unix)]
 fn dir_from_completion_args() -> Option<PathBuf> {
     flag_value_from_completion_args("--dir")
 }
 
+#[cfg(unix)]
 fn archive_dir_from_completion_args() -> Option<PathBuf> {
     flag_value_from_completion_args("--archive-dir")
 }
 
+#[cfg(unix)]
 fn flag_value_from_completion_args(flag: &str) -> Option<PathBuf> {
     let args: Vec<_> = std::env::args_os().collect();
     let start = args
@@ -486,6 +559,7 @@ fn flag_value_from_completion_args(flag: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(unix)]
 fn cmd_new(
     base: &Path,
     archive: &Path,
@@ -520,6 +594,7 @@ fn cmd_new(
     }
 }
 
+#[cfg(unix)]
 fn cmd_attach(
     base: &Path,
     archive: &Path,
@@ -611,6 +686,7 @@ fn cmd_attach(
     }
 }
 
+#[cfg(unix)]
 fn cmd_detach(base: &Path, archive: &Path, name: Option<String>) -> Result<()> {
     let name = resolve_session_name(base, archive, name)?;
     let paths = session::SessionPaths::for_name(base, &name);
@@ -631,6 +707,7 @@ fn cmd_detach(base: &Path, archive: &Path, name: Option<String>) -> Result<()> {
 /// Invariant: if `current_session` is some other live session, ask its outer
 /// attach client to detach that session and attach to `target` instead of
 /// calling `client::attach` from this process. Same-session is a no-op.
+#[cfg(unix)]
 fn join_session(base: &Path, archive: &Path, target: &str, detach_key: u8) -> Result<()> {
     if let Some(cur) = session::current_session(base, archive)? {
         if cur.name == target {
@@ -644,6 +721,7 @@ fn join_session(base: &Path, archive: &Path, target: &str, detach_key: u8) -> Re
     client::attach(base, target, detach_key)
 }
 
+#[cfg(unix)]
 fn cmd_list(base: &Path, archive: &Path, json: bool, all: bool) -> Result<()> {
     let sessions = session::list_sessions(base, archive)?;
     let ended = if all {
@@ -714,6 +792,7 @@ fn cmd_list(base: &Path, archive: &Path, json: bool, all: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn resolve_session_name(base: &Path, archive: &Path, name: Option<String>) -> Result<String> {
     match name {
         Some(n) => Ok(n),
@@ -724,6 +803,7 @@ fn resolve_session_name(base: &Path, archive: &Path, name: Option<String>) -> Re
     }
 }
 
+#[cfg(unix)]
 fn cmd_info(base: &Path, archive: &Path, name: Option<String>, json: bool) -> Result<()> {
     // Prefer live; if missing/dead after cleanup, fall back to newest archive.
     // Archive ids (`name@unix`) are accepted via the ended-session lookup.
@@ -764,6 +844,7 @@ fn cmd_info(base: &Path, archive: &Path, name: Option<String>, json: bool) -> Re
     }
 }
 
+#[cfg(unix)]
 fn print_session_info(
     meta: &session::SessionMeta,
     paths: &session::SessionPaths,
@@ -844,6 +925,7 @@ fn print_session_info(
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(unix)]
 struct SessionJson {
     name: String,
     pid: i32,
@@ -868,6 +950,7 @@ struct SessionJson {
     history_files: Vec<String>,
 }
 
+#[cfg(unix)]
 impl SessionJson {
     fn from_session(
         meta: &session::SessionMeta,
@@ -911,11 +994,13 @@ impl SessionJson {
     }
 }
 
+#[cfg(unix)]
 fn default_shell() -> String {
     "/bin/zsh".into()
 }
 
 /// Relative time for human list/info output (no extra time deps).
+#[cfg(unix)]
 fn format_time_human(ts: u64) -> String {
     if ts == 0 {
         return "-".into();
