@@ -15,7 +15,7 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 - Survive SSH hangup: client exit or `SIGHUP` must not kill the session shell.
 - Minimal input interception: only a single detach byte (default **Ctrl+\** / ASCII `0x1c`; overridable via `--detach-key` / `RESHELL_DETACH_KEY`).
 - Explicit sessions: `new`, `attach`, `list`, `info`, `rename`, `clean`, `kill` — no transparent SSH wrap in v1.
-- Durable primary-screen history as rotating text files under the session dir (not a VT buffer; not replayed on attach).
+- Durable primary-screen history as rotating text files under the session dir (not a VT buffer; not replayed on attach); retained in a durable archive when the session ends.
 - Shell-agnostic: PTY passthrough so bash, zsh, fish, and full-screen apps work.
 - Linux servers only (`linux-64` pixi platform).
 
@@ -74,9 +74,12 @@ reshell d                      # current / most recent
 # Inspect / manage
 reshell list
 reshell ls --json
-reshell info demo              # includes history file paths
+reshell list --all             # live + archived / crashed / killed
+reshell info demo              # includes history file paths; falls back to archive
+reshell info demo@1730000000   # exact archive id
 reshell rename old new
-reshell clean
+reshell clean                  # archive then remove dead live dirs (keeps archives)
+reshell clean --all            # also purge archives
 reshell kill demo
 reshell kill --all
 ```
@@ -99,6 +102,7 @@ Non-TTY: most recently active session, or auto-create when none exist.
 |------|---------|----------|
 | Detach key | Ctrl+\ (`0x1c`) | `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or one ASCII char) |
 | Session base dir | `$XDG_RUNTIME_DIR/reshell` or `/tmp/reshell-$UID` | `--dir` / `RESHELL_DIR` |
+| Ended-session archive | `$XDG_STATE_HOME/reshell/archive` (or `~/.local/state/…`); with `--dir`: `$dir/archive` | `--archive-dir` / `RESHELL_ARCHIVE_DIR` |
 | Daemon log | `$base/$name/daemon.log` | `--log` / `RESHELL_LOG` |
 | Default shell | `/bin/zsh` | `--shell` on `new` |
 
@@ -201,6 +205,7 @@ $base/$name/
   attached        # flock-backed lock file held while a client is connected
   client.pid      # pid of the interactive attach client (SO_PEERCRED); cleared on detach
   switch_to       # optional one-shot target name for in-session switch (SIGUSR1)
+  archive_root    # absolute path of the archive dir used when this session ends
   daemon.log      # per-session daemon log (startup, attach/detach, errors)
   history/        # rotating text history (see §8.2)
     0001.txt
@@ -213,24 +218,55 @@ Auto-generated names look like `session-{unix_secs}-{4 hex digits}` so concurren
 `new` calls in the same second do not collide.
 
 `list` skips directories whose daemon pid is dead and removes stale files (also
-available explicitly as `reshell clean`). It recovers a leftover `attached` file
+available explicitly as `reshell clean`). Dead sessions are **archived** first
+(see §6.1): `meta.json`, `daemon.log`, and `history/` move under the archive
+root; sockets/locks are discarded. `list` recovers a leftover `attached` file
 when nobody holds the advisory flock (e.g. after a crashed daemon), and removes
-orphan session dirs that lack `meta.json`.
+orphan session dirs that lack `meta.json` (nothing useful to archive).
 
 `list` shows relative created and last-active times by default (`2h ago`);
 `list --json` is stable for scripts (includes `created_unix` / `last_active_unix`).
+`list --all` appends archived sessions (newest first) after the live rows.
 `info` prints pid, shell, state, timestamps, session paths, and history file paths
 (`info --json` too). With no name, `info` prefers the session this process is
 inside (daemon pid among process ancestors, else `$RESHELL_SESSION`), then the most
-recently active session.
+recently active session; if the live session is gone it falls back to the newest
+matching archive (or an exact `name@unix` archive id).
 
 `rename old new` renames a live session directory and updates `meta.name`. The
 daemon keeps a directory fd open so meta/lock/log writes survive the move; the
 Unix socket path moves with the directory.
 
-`kill` sends `SIGTERM` (then `SIGKILL`) to the daemon pid and deletes the session dir.
-`kill --all` terminates every live session under the session base dir.
-Attach/kill failures include concrete reasons (dead pid, lock held, socket missing, …).
+`kill` sends `SIGTERM` (then `SIGKILL`) to the daemon pid and archives then
+deletes the live session dir. `kill --all` terminates every live session under
+the session base dir. Attach/kill failures include concrete reasons (dead pid,
+lock held, socket missing, …).
+
+### 6.1 Ended-session archive
+
+Live session dirs are ephemeral (often under `$XDG_RUNTIME_DIR` / `/tmp`). When a
+session ends, durable artifacts are moved to an archive so users can still
+discover names and read logs after a crash, `kill`, or stale cleanup:
+
+```text
+$archive_root/<name>@<ended_unix>/
+  meta.json       # includes ended_unix + end_reason
+  daemon.log
+  history/
+    0001.txt
+    …
+```
+
+Archive root resolution:
+
+1. `--archive-dir` / `RESHELL_ARCHIVE_DIR`
+2. If CLI `--dir` was set: `$dir/archive`
+3. Else `$XDG_STATE_HOME/reshell/archive` or `$HOME/.local/state/reshell/archive`
+4. Else `$base/archive`
+
+`end_reason` is one of `shell_exit`, `killed`, `stale`, or `replaced`.
+`reshell clean` only removes dead/orphan **live** dirs (after archiving).
+`reshell clean --all` also purges archive entries.
 
 ## 7. Session Lifecycle
 
@@ -496,14 +532,14 @@ Wire format details live in [PROTOCOL.md](PROTOCOL.md).
 | `reshell` / `reshell attach [name]` | `a` | Attach; no name → picker (TTY) or most-recent / create |
 | `reshell new [name]` | `n` | Create session; attach unless `--detach` |
 | `reshell detach [name]` | `d` | Detach client from session (shell keeps running) |
-| `reshell list` | `ls` | List live sessions (relative times; `--json`) |
-| `reshell info [name]` | `i` | Show pid, shell, state, paths, history files (`--json`) |
+| `reshell list` | `ls` | List live sessions (relative times; `--json`; `--all` adds archives) |
+| `reshell info [name]` | `i` | Show pid, shell, state, paths, history files (`--json`; archive fallback) |
 | `reshell rename <old> <new>` | `r` | Rename a live session directory |
-| `reshell clean` | | Remove dead / orphan session dirs and stale locks |
-| `reshell kill [name]` | `k` | Terminate daemon (+ `--all`) |
+| `reshell clean` | | Remove dead / orphan live dirs (archives history/logs first); `--all` also purges archives |
+| `reshell kill [name]` | `k` | Terminate daemon (+ `--all`); archives then removes live dir |
 | `reshell completion <shell>` | | Shell completions |
 
-Shared flags: `--dir`, `--detach-key`, `--log`, `--shell` (on `new`).
+Shared flags: `--dir`, `--archive-dir`, `--detach-key`, `--log`, `--shell` (on `new`).
 
 ## 11. Packaging and Toolchain
 
@@ -550,8 +586,6 @@ Linux.
    explicit post-v1 idea (see [IMPROVEMENTS.md](IMPROVEMENTS.md) §4).
 2. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
    protocol coverage stays the CI default to avoid flakes.
-3. **History retention after `kill`** — Today history lives under the session dir
-   and is removed with it; a keep-on-kill option is undecided.
 
 ### Resolved
 
@@ -563,6 +597,10 @@ Linux.
 - **On-disk history** — Rotating text files under `$session/history/`; skip alt-screen.
 - **Interactive picker** — Bare `reshell` / `attach` on a TTY; non-TTY keeps
   most-recent / auto-create fallbacks.
+- **History retention after end** — On kill / shell exit / stale cleanup, move
+  `meta.json`, `daemon.log`, and `history/` to `$XDG_STATE_HOME/reshell/archive`
+  (or `$dir/archive` / `--archive-dir`); `list --all` / `info` (archive fallback) /
+  `clean --all` manage them.
 
 ## 14. Success Criteria
 
@@ -577,4 +615,7 @@ Linux.
 - Primary-screen output appears in `$session/history/*.txt`; full-screen
   (alt-screen) output does not; `reshell info` and the session picker show the
   current history path.
+- After a session ends, history and `daemon.log` remain under the archive root
+  and are discoverable via `list --all` / `info` even if the live
+  name was forgotten.
 - `pixi run test` / CI `cargo test --locked` pass on Linux without a controlling TTY.

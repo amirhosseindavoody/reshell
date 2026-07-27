@@ -24,7 +24,43 @@ pub struct SessionMeta {
     /// Older meta files omit this field (treated as 0 → fall back to created).
     #[serde(default)]
     pub last_active_unix: u64,
+    /// Set when the session has ended and been moved to the archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_unix: Option<u64>,
+    /// Why the session ended: `shell_exit`, `killed`, `stale`, or `replaced`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
 }
+
+/// Why a session directory was torn down (recorded in archived `meta.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    /// Shell exited; daemon finished normally.
+    ShellExit,
+    /// `reshell kill` (or equivalent) terminated the daemon.
+    Killed,
+    /// Dead pid / leftover discovered by `list` / `clean` / attach preflight.
+    Stale,
+    /// A new session reused the name and replaced dead leftovers.
+    Replaced,
+}
+
+impl EndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ShellExit => "shell_exit",
+            Self::Killed => "killed",
+            Self::Stale => "stale",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
+/// Colocated archive directory name under a custom `--dir` base (skipped by list).
+pub const ARCHIVE_DIR_NAME: &str = "archive";
+
+/// File in a live session dir that records where to archive on exit.
+const ARCHIVE_ROOT_FILE: &str = "archive_root";
 
 #[derive(Debug, Clone)]
 pub struct SessionPaths {
@@ -148,6 +184,78 @@ pub fn session_base_dir() -> Result<PathBuf> {
     }
     let uid = getuid().as_raw();
     Ok(PathBuf::from(format!("/tmp/reshell-{uid}")))
+}
+
+/// Durable archive root for ended sessions (history + daemon.log + meta).
+///
+/// Resolution order:
+/// 1. `explicit` (`--archive-dir`)
+/// 2. `RESHELL_ARCHIVE_DIR`
+/// 3. If `custom_base` is true (CLI `--dir` was set): `$base/archive`
+/// 4. `$XDG_STATE_HOME/reshell/archive` or `$HOME/.local/state/reshell/archive`
+/// 5. `$base/archive` (last resort)
+pub fn resolve_archive_dir(
+    explicit: Option<&Path>,
+    base: &Path,
+    custom_base: bool,
+) -> PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    if let Ok(d) = std::env::var("RESHELL_ARCHIVE_DIR") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    if custom_base {
+        return base.join(ARCHIVE_DIR_NAME);
+    }
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        if !state.is_empty() {
+            return PathBuf::from(state).join("reshell").join(ARCHIVE_DIR_NAME);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("reshell")
+                .join(ARCHIVE_DIR_NAME);
+        }
+    }
+    base.join(ARCHIVE_DIR_NAME)
+}
+
+pub fn ensure_archive_dir(archive_root: &Path) -> Result<()> {
+    fs::create_dir_all(archive_root)
+        .with_context(|| format!("create archive dir {}", archive_root.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(archive_root, fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+/// Persist the archive root inside a live session so the daemon can find it on exit.
+pub fn write_archive_root(paths: &SessionPaths, archive_root: &Path) -> Result<()> {
+    let path = paths.dir.join(ARCHIVE_ROOT_FILE);
+    fs::write(&path, format!("{}\n", archive_root.display()))
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Read archive root recorded at session create; fall back to `fallback`.
+pub fn read_archive_root(paths: &SessionPaths, fallback: &Path) -> PathBuf {
+    let path = paths.dir.join(ARCHIVE_ROOT_FILE);
+    if let Ok(raw) = fs::read_to_string(&path) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    fallback.to_path_buf()
 }
 
 pub fn ensure_base_dir(base: &Path) -> Result<()> {
@@ -327,9 +435,9 @@ pub fn recover_stale_attach_lock(paths: &SessionPaths) -> bool {
     }
 }
 
-pub fn list_sessions(base: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
+pub fn list_sessions(base: &Path, archive_root: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
     ensure_base_dir(base)?;
-    let _ = cleanup_stale_sessions(base)?;
+    let _ = cleanup_stale_sessions(base, archive_root)?;
     let mut out = Vec::new();
     let entries = match fs::read_dir(base) {
         Ok(e) => e,
@@ -344,6 +452,9 @@ pub fn list_sessions(base: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ARCHIVE_DIR_NAME {
+            continue;
+        }
         let paths = SessionPaths::for_name(base, &name);
         if !paths.meta.exists() {
             continue;
@@ -368,8 +479,9 @@ pub fn list_sessions(base: &Path) -> Result<Vec<(SessionMeta, SessionPaths)>> {
 }
 
 /// Remove dead-session leftovers, orphan dirs, and stale attach locks.
-/// Returns how many session directories were removed.
-pub fn cleanup_stale_sessions(base: &Path) -> Result<usize> {
+/// Ended sessions with history/logs are moved under `archive_root` first.
+/// Returns how many live session directories were removed.
+pub fn cleanup_stale_sessions(base: &Path, archive_root: &Path) -> Result<usize> {
     ensure_base_dir(base)?;
     let mut removed = 0usize;
     let entries = match fs::read_dir(base) {
@@ -391,11 +503,14 @@ pub fn cleanup_stale_sessions(base: &Path) -> Result<usize> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ARCHIVE_DIR_NAME {
+            continue;
+        }
         let paths = SessionPaths::for_name(base, &name);
 
         if !paths.meta.exists() {
             // Orphan dir (no meta): remove leftover sock/lock/log then the dir.
-            let _ = cleanup_session_files(&paths);
+            let _ = cleanup_session_files(&paths, archive_root, EndReason::Stale);
             if !paths.dir.exists() {
                 removed += 1;
             }
@@ -405,14 +520,14 @@ pub fn cleanup_stale_sessions(base: &Path) -> Result<usize> {
         let meta = match read_meta(&paths) {
             Ok(m) => m,
             Err(_) => {
-                let _ = cleanup_session_files(&paths);
+                let _ = cleanup_session_files(&paths, archive_root, EndReason::Stale);
                 removed += 1;
                 continue;
             }
         };
 
         if !process_alive(meta.pid) {
-            let _ = cleanup_session_files(&paths);
+            let _ = cleanup_session_files(&paths, archive_root, EndReason::Stale);
             removed += 1;
             continue;
         }
@@ -446,7 +561,8 @@ pub fn rename_session(base: &Path, old_name: &str, new_name: &str) -> Result<()>
 
     let meta = read_meta(&old_paths)?;
     if !process_alive(meta.pid) {
-        let _ = cleanup_session_files(&old_paths);
+        let archive = read_archive_root(&old_paths, &base.join(ARCHIVE_DIR_NAME));
+        let _ = cleanup_session_files(&old_paths, &archive, EndReason::Stale);
         bail!("session '{old_name}' is not running (cleaned up stale files)");
     }
 
@@ -470,16 +586,21 @@ pub fn rename_session(base: &Path, old_name: &str, new_name: &str) -> Result<()>
 }
 
 /// Load a live session for `info` (refuses dead/missing).
-pub fn session_info(base: &Path, name: &str) -> Result<(SessionMeta, SessionPaths)> {
+pub fn session_info(
+    base: &Path,
+    name: &str,
+    archive_root: &Path,
+) -> Result<(SessionMeta, SessionPaths)> {
     validate_session_name(name)?;
-    let _ = cleanup_stale_sessions(base)?;
+    let _ = cleanup_stale_sessions(base, archive_root)?;
     let paths = SessionPaths::for_name(base, name);
     if !paths.meta.exists() {
         bail!("session '{name}' not found");
     }
     let mut meta = read_meta(&paths)?;
     if !process_alive(meta.pid) {
-        let _ = cleanup_session_files(&paths);
+        let archive = read_archive_root(&paths, archive_root);
+        let _ = cleanup_session_files(&paths, &archive, EndReason::Stale);
         bail!("session '{name}' is not running (cleaned up leftovers)");
     }
     meta.attached = is_attached(&paths);
@@ -500,8 +621,8 @@ pub fn session_activity(meta: &SessionMeta) -> u64 {
 }
 
 /// Most recently active live session (by `last_active_unix`, then created).
-pub fn most_recent_session(base: &Path) -> Result<SessionMeta> {
-    let mut sessions = list_sessions(base)?;
+pub fn most_recent_session(base: &Path, archive_root: &Path) -> Result<SessionMeta> {
+    let mut sessions = list_sessions(base, archive_root)?;
     if sessions.is_empty() {
         bail!("no sessions found");
     }
@@ -522,9 +643,9 @@ pub const RESHELL_SESSION_ENV: &str = "RESHELL_SESSION";
 /// Prefers a daemon pid found among process ancestors (survives `rename`, which
 /// leaves a stale `RESHELL_SESSION` value). Falls back to `$RESHELL_SESSION`
 /// when that names a live session.
-pub fn current_session(base: &Path) -> Result<Option<SessionMeta>> {
-    let _ = cleanup_stale_sessions(base)?;
-    let sessions = list_sessions(base)?;
+pub fn current_session(base: &Path, archive_root: &Path) -> Result<Option<SessionMeta>> {
+    let _ = cleanup_stale_sessions(base, archive_root)?;
+    let sessions = list_sessions(base, archive_root)?;
     if sessions.is_empty() {
         return Ok(None);
     }
@@ -584,16 +705,281 @@ fn read_ppid(pid: i32) -> Option<i32> {
     fields.next()?.parse().ok()
 }
 
-pub fn cleanup_session_files(paths: &SessionPaths) -> Result<()> {
+/// Archive durable artifacts (meta, daemon.log, history/) then remove the live dir.
+///
+/// Returns the archive directory path when something useful was preserved.
+pub fn cleanup_session_files(
+    paths: &SessionPaths,
+    archive_root: &Path,
+    reason: EndReason,
+) -> Result<Option<PathBuf>> {
+    let archive = read_archive_root(paths, archive_root);
+    let archived = archive_session(paths, &archive, reason)?;
+
+    // Remove ephemeral leftovers (and anything archive did not move).
     let _ = fs::remove_file(&paths.socket);
-    let _ = fs::remove_file(&paths.meta);
     let _ = fs::remove_file(&paths.attach_lock);
     let _ = fs::remove_file(paths.client_pid_file());
     let _ = fs::remove_file(paths.switch_to_file());
+    let _ = fs::remove_file(paths.dir.join(ARCHIVE_ROOT_FILE));
+    let _ = fs::remove_file(&paths.meta);
     let _ = fs::remove_file(&paths.daemon_log);
     let _ = fs::remove_dir_all(paths.history_dir());
-    let _ = fs::remove_dir(&paths.dir);
+    // vscode-si helper dir, etc.
+    if paths.dir.exists() {
+        let _ = fs::remove_dir_all(&paths.dir);
+    }
+    Ok(archived)
+}
+
+/// Move meta / daemon.log / history into `$archive_root/<name>@<ended_unix>/`.
+fn archive_session(
+    paths: &SessionPaths,
+    archive_root: &Path,
+    reason: EndReason,
+) -> Result<Option<PathBuf>> {
+    let has_meta = paths.meta.exists();
+    let has_log = paths.daemon_log.exists();
+    let hist = paths.history_dir();
+    let has_history = hist.is_dir()
+        && fs::read_dir(&hist)
+            .map(|rd| rd.filter_map(|e| e.ok()).next().is_some())
+            .unwrap_or(false);
+
+    if !has_meta && !has_log && !has_history {
+        return Ok(None);
+    }
+
+    ensure_archive_dir(archive_root)?;
+    let ended = now_unix();
+    let name = read_meta(paths)
+        .map(|m| m.name)
+        .unwrap_or_else(|_| {
+            paths
+                .dir
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into())
+        });
+    let archive_id = format!("{name}@{ended}");
+    let dest = archive_root.join(&archive_id);
+    // Collision in the same second: append a counter.
+    let dest = if dest.exists() {
+        let mut n = 1u32;
+        loop {
+            let cand = archive_root.join(format!("{archive_id}-{n}"));
+            if !cand.exists() {
+                break cand;
+            }
+            n += 1;
+            if n > 1000 {
+                bail!("could not allocate archive dir under {}", archive_root.display());
+            }
+        }
+    } else {
+        dest
+    };
+
+    fs::create_dir_all(&dest)
+        .with_context(|| format!("create archive session dir {}", dest.display()))?;
+
+    let dest_paths = SessionPaths::for_dir(dest.clone());
+
+    if has_meta {
+        let mut meta = read_meta(paths)?;
+        meta.attached = false;
+        meta.ended_unix = Some(ended);
+        meta.end_reason = Some(reason.as_str().to_string());
+        write_meta(&dest_paths, &meta)?;
+    } else {
+        // Minimal meta so `list --all` / `info` still work.
+        let meta = SessionMeta {
+            name: name.clone(),
+            pid: 0,
+            shell: String::new(),
+            created_unix: 0,
+            attached: false,
+            last_active_unix: 0,
+            ended_unix: Some(ended),
+            end_reason: Some(reason.as_str().to_string()),
+        };
+        write_meta(&dest_paths, &meta)?;
+    }
+
+    if has_log {
+        let _ = fs::rename(&paths.daemon_log, &dest_paths.daemon_log)
+            .or_else(|_| fs::copy(&paths.daemon_log, &dest_paths.daemon_log).map(|_| ()));
+    }
+    if has_history {
+        let dest_hist = dest_paths.history_dir();
+        if dest_hist.exists() {
+            let _ = fs::remove_dir_all(&dest_hist);
+        }
+        if fs::rename(&hist, &dest_hist).is_err() {
+            // Cross-device: copy tree then leave original for cleanup.
+            copy_dir_recursive(&hist, &dest_hist)?;
+        }
+    }
+
+    Ok(Some(dest))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .with_context(|| format!("create {}", dst.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to)
+                .with_context(|| format!("copy {} → {}", entry.path().display(), to.display()))?;
+        }
+    }
     Ok(())
+}
+
+/// An ended session preserved under the archive root.
+#[derive(Debug, Clone)]
+pub struct EndedSession {
+    pub meta: SessionMeta,
+    pub paths: SessionPaths,
+    /// Directory name under the archive root (`name@unix`).
+    pub archive_id: String,
+}
+
+/// List archived (ended) sessions, newest first.
+pub fn list_ended_sessions(archive_root: &Path) -> Result<Vec<EndedSession>> {
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(archive_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).context("read archive dir"),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let archive_id = entry.file_name().to_string_lossy().into_owned();
+        let paths = SessionPaths::for_dir(entry.path());
+        if !paths.meta.exists() {
+            continue;
+        }
+        let meta = match read_meta(&paths) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        out.push(EndedSession {
+            meta,
+            paths,
+            archive_id,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.meta
+            .ended_unix
+            .unwrap_or(0)
+            .cmp(&a.meta.ended_unix.unwrap_or(0))
+            .then_with(|| a.meta.name.cmp(&b.meta.name))
+            .then_with(|| a.archive_id.cmp(&b.archive_id))
+    });
+    Ok(out)
+}
+
+/// Find the newest archived session with this live name (or exact archive id).
+pub fn find_ended_session(archive_root: &Path, name_or_id: &str) -> Result<EndedSession> {
+    let ended = list_ended_sessions(archive_root)?;
+    if let Some(e) = ended.iter().find(|e| e.archive_id == name_or_id) {
+        return Ok(e.clone());
+    }
+    if let Some(e) = ended.into_iter().find(|e| e.meta.name == name_or_id) {
+        return Ok(e);
+    }
+    bail!("ended session '{name_or_id}' not found under {}", archive_root.display());
+}
+
+/// Delete archived sessions. Returns how many archive dirs were removed.
+pub fn purge_ended_sessions(archive_root: &Path) -> Result<usize> {
+    let ended = list_ended_sessions(archive_root)?;
+    let mut removed = 0usize;
+    for e in ended {
+        if fs::remove_dir_all(&e.paths.dir).is_ok() {
+            removed += 1;
+        }
+    }
+    // Remove empty archive root (best effort).
+    let _ = fs::remove_dir(archive_root);
+    Ok(removed)
+}
+
+pub fn kill_session(base: &Path, name: &str, archive_root: &Path) -> Result<()> {
+    validate_session_name(name)?;
+    let paths = SessionPaths::for_name(base, name);
+    if !paths.meta.exists() {
+        if paths.dir.exists() {
+            bail!(
+                "session '{name}' meta missing under {} (incomplete session dir)",
+                paths.dir.display()
+            );
+        }
+        bail!("session '{name}' not found");
+    }
+    let meta = read_meta(&paths).with_context(|| {
+        format!(
+            "read meta for session '{name}' at {}",
+            paths.meta.display()
+        )
+    })?;
+    if process_alive(meta.pid) {
+        let pid = Pid::from_raw(meta.pid);
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).with_context(|| {
+            format!(
+                "send SIGTERM to session '{name}' pid {} (permission denied or invalid pid?)",
+                meta.pid
+            )
+        })?;
+        // Brief wait then escalate.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if process_alive(meta.pid) {
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).with_context(|| {
+                format!("send SIGKILL to session '{name}' pid {}", meta.pid)
+            })?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if process_alive(meta.pid) {
+                bail!(
+                    "session '{name}' pid {} still alive after SIGTERM and SIGKILL",
+                    meta.pid
+                );
+            }
+        }
+    }
+    let archive = read_archive_root(&paths, archive_root);
+    cleanup_session_files(&paths, &archive, EndReason::Killed)?;
+    Ok(())
+}
+
+/// Terminate every live session under `base`. Returns killed session names
+/// (sorted, same order as [`list_sessions`]).
+pub fn kill_all_sessions(base: &Path, archive_root: &Path) -> Result<Vec<String>> {
+    let sessions = list_sessions(base, archive_root)?;
+    let mut killed = Vec::with_capacity(sessions.len());
+    for (meta, _) in sessions {
+        kill_session(base, &meta.name, archive_root)?;
+        killed.push(meta.name);
+    }
+    Ok(killed)
 }
 
 /// Record the interactive attach client's pid (from `SO_PEERCRED`).
@@ -729,7 +1115,7 @@ pub fn request_attach_switch(base: &Path, from: &str, to: &str) -> Result<()> {
     }
 
     while Instant::now() < deadline {
-        if is_attached(&to_paths) {
+        if is_attached(&to_paths) && read_client_pid(&to_paths).is_some() {
             return Ok(());
         }
         if !process_alive(pid) {
@@ -750,63 +1136,6 @@ pub fn append_daemon_log(paths: &SessionPaths, message: &str) {
         .append(true)
         .open(&paths.daemon_log)
         .and_then(|mut f| writeln!(f, "{}", message));
-}
-
-pub fn kill_session(base: &Path, name: &str) -> Result<()> {
-    validate_session_name(name)?;
-    let paths = SessionPaths::for_name(base, name);
-    if !paths.meta.exists() {
-        if paths.dir.exists() {
-            bail!(
-                "session '{name}' meta missing under {} (incomplete session dir)",
-                paths.dir.display()
-            );
-        }
-        bail!("session '{name}' not found");
-    }
-    let meta = read_meta(&paths).with_context(|| {
-        format!(
-            "read meta for session '{name}' at {}",
-            paths.meta.display()
-        )
-    })?;
-    if process_alive(meta.pid) {
-        let pid = Pid::from_raw(meta.pid);
-        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM).with_context(|| {
-            format!(
-                "send SIGTERM to session '{name}' pid {} (permission denied or invalid pid?)",
-                meta.pid
-            )
-        })?;
-        // Brief wait then escalate.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if process_alive(meta.pid) {
-            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).with_context(|| {
-                format!("send SIGKILL to session '{name}' pid {}", meta.pid)
-            })?;
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            if process_alive(meta.pid) {
-                bail!(
-                    "session '{name}' pid {} still alive after SIGTERM and SIGKILL",
-                    meta.pid
-                );
-            }
-        }
-    }
-    cleanup_session_files(&paths)?;
-    Ok(())
-}
-
-/// Terminate every live session under `base`. Returns killed session names
-/// (sorted, same order as [`list_sessions`]).
-pub fn kill_all_sessions(base: &Path) -> Result<Vec<String>> {
-    let sessions = list_sessions(base)?;
-    let mut killed = Vec::with_capacity(sessions.len());
-    for (meta, _) in sessions {
-        kill_session(base, &meta.name)?;
-        killed.push(meta.name);
-    }
-    Ok(killed)
 }
 
 #[cfg(test)]
@@ -842,6 +1171,8 @@ mod tests {
             created_unix: 123,
             attached: false,
             last_active_unix: 0,
+            ended_unix: None,
+            end_reason: None,
         };
         write_meta(&paths, &meta).unwrap();
         let loaded = read_meta(&paths).unwrap();
@@ -861,6 +1192,8 @@ mod tests {
             created_unix: 1,
             attached: false,
             last_active_unix: 0,
+            ended_unix: None,
+            end_reason: None,
         };
         write_meta(&paths, &base).unwrap();
 
@@ -876,6 +1209,8 @@ mod tests {
                         created_unix: 1,
                         attached: i % 2 == 0,
                         last_active_unix: (i * 100 + j) as u64,
+                        ended_unix: None,
+                        end_reason: None,
                     };
                     write_meta(&paths, &meta).expect("concurrent write_meta");
                 }
@@ -905,6 +1240,8 @@ mod tests {
                 created_unix: 1,
                 attached: false,
                 last_active_unix: 1,
+                ended_unix: None,
+                end_reason: None,
             },
         )
         .unwrap();
@@ -918,6 +1255,8 @@ mod tests {
                 created_unix: 1,
                 attached: false,
                 last_active_unix: 99,
+                ended_unix: None,
+                end_reason: None,
             },
         )
         .unwrap();
@@ -928,7 +1267,9 @@ mod tests {
         unsafe {
             std::env::set_var(RESHELL_SESSION_ENV, "stale-name");
         }
-        let cur = current_session(base).unwrap().expect("current");
+        let cur = current_session(base, &base.join(ARCHIVE_DIR_NAME))
+            .unwrap()
+            .expect("current");
         unsafe {
             std::env::remove_var(RESHELL_SESSION_ENV);
         }
@@ -952,6 +1293,8 @@ mod tests {
                     created_unix: 1,
                     attached: false,
                     last_active_unix: last,
+                    ended_unix: None,
+                    end_reason: None,
                 },
             )
             .unwrap();
@@ -961,7 +1304,9 @@ mod tests {
         unsafe {
             std::env::set_var(RESHELL_SESSION_ENV, "mine");
         }
-        let cur = current_session(base).unwrap().expect("current");
+        let cur = current_session(base, &base.join(ARCHIVE_DIR_NAME))
+            .unwrap()
+            .expect("current");
         unsafe {
             std::env::remove_var(RESHELL_SESSION_ENV);
         }
@@ -992,12 +1337,14 @@ mod tests {
                     created_unix: created,
                     attached: false,
                     last_active_unix: last,
+                    ended_unix: None,
+                    end_reason: None,
                 },
             )
             .unwrap();
         }
 
-        let recent = most_recent_session(base).unwrap();
+        let recent = most_recent_session(base, &base.join(ARCHIVE_DIR_NAME)).unwrap();
         assert_eq!(recent.name, "newer");
     }
 
@@ -1028,6 +1375,8 @@ mod tests {
                 created_unix: 1,
                 attached: true,
                 last_active_unix: 1,
+                ended_unix: None,
+                end_reason: None,
             },
         )
         .unwrap();
@@ -1053,6 +1402,8 @@ mod tests {
                 created_unix: 1,
                 attached: false,
                 last_active_unix: 0,
+                ended_unix: None,
+                end_reason: None,
             },
         )
         .unwrap();
@@ -1082,6 +1433,8 @@ mod tests {
                 created_unix: 1,
                 attached: false,
                 last_active_unix: 1,
+                ended_unix: None,
+                end_reason: None,
             },
         )
         .unwrap();
@@ -1115,14 +1468,22 @@ mod tests {
                 created_unix: 1,
                 attached: false,
                 last_active_unix: 0,
+                ended_unix: None,
+                end_reason: None,
             },
         )
         .unwrap();
 
-        let n = cleanup_stale_sessions(base).unwrap();
+        let n = cleanup_stale_sessions(base, &base.join(ARCHIVE_DIR_NAME)).unwrap();
         assert!(n >= 2, "expected orphan+dead removed, got {n}");
         assert!(!orphan.exists());
         assert!(!dead.dir.exists());
+        // Dead session with meta should be archived.
+        let ended = list_ended_sessions(&base.join(ARCHIVE_DIR_NAME)).unwrap();
+        assert!(
+            ended.iter().any(|e| e.meta.name == "dead"),
+            "expected dead session archived: {ended:?}"
+        );
     }
 
     #[test]
@@ -1150,10 +1511,12 @@ mod tests {
                         created_unix: 1,
                         attached: false,
                         last_active_unix: 0,
+                        ended_unix: None,
+                        end_reason: None,
                     },
                 )
                 .unwrap();
-                kill_session(base, name).expect("kill_session");
+                kill_session(base, name, &base.join(ARCHIVE_DIR_NAME)).expect("kill_session");
                 // Reap so the test process does not leave a zombie around.
                 let _ = waitpid(child, None);
                 assert!(
@@ -1163,5 +1526,44 @@ mod tests {
                 assert!(!paths.meta.exists());
             }
         }
+    }
+
+    #[test]
+    fn kill_archives_history_and_daemon_log() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        ensure_base_dir(base).unwrap();
+        let archive = base.join(ARCHIVE_DIR_NAME);
+        let name = "keep-me";
+        let paths = SessionPaths::for_name(base, name);
+        write_meta(
+            &paths,
+            &SessionMeta {
+                name: name.into(),
+                pid: i32::MAX - 2,
+                shell: "/bin/bash".into(),
+                created_unix: 10,
+                attached: false,
+                last_active_unix: 10,
+                ended_unix: None,
+                end_reason: None,
+            },
+        )
+        .unwrap();
+        write_archive_root(&paths, &archive).unwrap();
+        fs::write(&paths.daemon_log, "daemon started\n").unwrap();
+        fs::create_dir_all(paths.history_dir()).unwrap();
+        fs::write(paths.history_dir().join("0001.txt"), "hello from shell\n").unwrap();
+
+        kill_session(base, name, &archive).unwrap();
+        assert!(!paths.dir.exists());
+        let ended = list_ended_sessions(&archive).unwrap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].meta.name, name);
+        assert_eq!(ended[0].meta.end_reason.as_deref(), Some("killed"));
+        assert!(ended[0].paths.daemon_log.exists());
+        assert!(ended[0].paths.history_dir().join("0001.txt").exists());
+        let found = find_ended_session(&archive, name).unwrap();
+        assert_eq!(found.archive_id, ended[0].archive_id);
     }
 }

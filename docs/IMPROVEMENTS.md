@@ -107,7 +107,10 @@ sessions, orphan dirs without meta, and stale attach locks.
 
 **Now:** Scraped. Primary-screen output is written to rotating text files under
 `$session/history/` (~2000 lines each). Capture pauses on the alternate screen.
-`reshell info` lists history paths. No attach replay of history.
+`reshell info` lists history paths. No attach replay of history. When a session
+ends, history + `daemon.log` + meta are moved to a durable archive
+(`$XDG_STATE_HOME/reshell/archive` by default) and listed with
+`reshell list --all`.
 
 ### 4.2 `reshell context` — removed
 

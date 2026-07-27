@@ -60,15 +60,17 @@ fn wait_states(base: &std::path::Path, from: &str, to: &str) {
     while Instant::now() < deadline {
         let from_free = list_state(base, from).contains("detached");
         let to_held = list_state(base, to).contains("attached");
-        if from_free && to_held {
+        let to_pid = base.join(to).join("client.pid").exists();
+        if from_free && to_held && to_pid {
             return;
         }
         thread::sleep(Duration::from_millis(40));
     }
     panic!(
-        "handoff incomplete: {from}={:?} {to}={:?}",
+        "handoff incomplete: {from}={:?} {to}={:?} {to}/client.pid={}",
         list_state(base, from),
-        list_state(base, to)
+        list_state(base, to),
+        base.join(to).join("client.pid").exists()
     );
 }
 

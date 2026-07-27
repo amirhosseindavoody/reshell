@@ -88,8 +88,15 @@ reshell info demo
 reshell rename demo demo2
 # or: reshell r demo demo2
 
-# Remove dead-session leftovers (also runs as part of `list`)
+# Remove dead/orphan *live* session dirs (archives history/logs first; does not
+# delete archives). Also runs as part of `list`.
 reshell clean
+
+# List live + ended sessions (forgotten names, crash forensics)
+reshell list --all
+reshell info demo                  # live, or newest matching archive
+reshell info demo@1730000000       # exact archive id
+reshell clean --all                # also purge archived history/logs
 
 # Kill a session
 reshell kill demo
@@ -138,9 +145,18 @@ are not offered on Tab — use `--help` for those.
 
 Session files live under `$XDG_RUNTIME_DIR/reshell` (fallback `/tmp/reshell-$UID`). Override with `--dir` or `RESHELL_DIR`.
 
+Ended sessions (after `kill`, shell exit, or stale cleanup) keep their **history** and **daemon.log** under an archive directory:
+
+- Default: `$XDG_STATE_HOME/reshell/archive` (fallback `$HOME/.local/state/reshell/archive`) so logs survive reboot and `/tmp` cleanup
+- With `--dir`: `$dir/archive` (keeps tests and custom layouts self-contained)
+- Override: `--archive-dir` / `RESHELL_ARCHIVE_DIR`
+
+Archive entries are named `name@unix` (e.g. `demo@1730000000`). Use `reshell list --all` to see live and ended sessions together, and `reshell info <name-or-id>` to inspect one. `reshell clean` only sweeps dead *live* dirs (after archiving); `reshell clean --all` also deletes archives.
+
 Inside a session shell, `RESHELL_SESSION` is set to the session name. Bare
 `reshell info` uses the current session (even after `rename`);
-outside a session it falls back to the most recently active one.
+outside a session it falls back to the most recently active one. If that live
+session is gone, `info` falls back to the newest matching ended archive.
 
 Primary-screen shell output is appended to rotating text files under
 `$session/history/` (`0001.txt`, `0002.txt`, …; ~2000 lines each). Capture
@@ -154,6 +170,71 @@ other CSI/OSC is stripped.
 Daemon logs go to `$session/daemon.log` by default. Override with `--log` / `RESHELL_LOG`.
 
 Detach key defaults to **Ctrl+\**. Override with `--detach-key` / `RESHELL_DETACH_KEY` (`^\`, `^a`, `0x1c`, or a single ASCII char).
+
+## Troubleshooting
+
+### Sessions disappeared after SSH disconnect
+
+An SSH hangup should only detach the client — the session daemon and shell keep
+running. If `reshell list` is empty afterward, the session itself exited (shell
+quit, daemon crash, OOM killer, reboot, or someone ran `kill` / `clean`).
+
+1. **List what is still live**
+   ```bash
+   reshell list
+   reshell list --json
+   ```
+2. **List live and ended sessions** (names you forgot, crash leftovers)
+   ```bash
+   reshell list --all
+   reshell list --all --json
+   ```
+   Default archive root is under `$XDG_STATE_HOME/reshell/archive` (see above).
+   With a custom `--dir`, look in `$dir/archive`.
+3. **Inspect an ended session** (daemon log + history paths)
+   ```bash
+   reshell info <name-or-id>
+   # examples:
+   reshell info demo
+   reshell info demo@1730000000
+   ```
+   Or read files directly:
+   ```bash
+   ls "$XDG_STATE_HOME/reshell/archive" 2>/dev/null \
+     || ls "$HOME/.local/state/reshell/archive"
+   less …/archive/demo@*/daemon.log
+   less …/archive/demo@*/history/0001.txt
+   ```
+4. **Confirm the process was not killed by the host**
+   ```bash
+   dmesg -T | tail -50          # OOM / kill signals (needs privileges)
+   journalctl --user -n 50      # if you use systemd user sessions
+   ```
+5. **Live session still present but attach fails**
+   ```bash
+   reshell info <name>          # paths, pid, state
+   reshell clean                # clear dead live leftovers (archives first; keeps archives)
+   reshell attach <name>
+   ```
+
+### What does `reshell clean` do?
+
+| Command | Effect |
+|---------|--------|
+| `reshell clean` | Remove **dead / orphan live session directories** under the session base dir. History and `daemon.log` are moved to the archive first. Running sessions are untouched. Archives are **not** deleted. (Same sweep `list` / `new` already run.) |
+| `reshell clean --all` | Same as `clean`, **plus** delete archived ended sessions (history + daemon logs) from the archive dir. |
+
+### Where are the logs?
+
+| What | Live session | After end (`kill` / shell exit / stale clean) |
+|------|--------------|-----------------------------------------------|
+| Shell output (primary screen) | `$session/history/*.txt` | `$archive/<name>@<unix>/history/*.txt` |
+| Daemon events | `$session/daemon.log` | `$archive/<name>@<unix>/daemon.log` |
+| Metadata | `$session/meta.json` | same under archive (`ended_unix`, `end_reason`) |
+
+`end_reason` is one of `shell_exit`, `killed`, `stale`, or `replaced`.
+
+Purge archives when you no longer need them: `reshell clean --all`.
 
 ## Why reshell?
 

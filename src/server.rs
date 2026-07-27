@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -20,7 +20,8 @@ use crate::history::HistoryWriter;
 use crate::protocol::{self, Message, Winsize};
 use crate::session::{
     self, append_daemon_log, cleanup_session_files, now_unix, open_session_dir_fd,
-    paths_from_dir_fd, write_client_pid, write_meta, AttachLock, SessionMeta, SessionPaths,
+    paths_from_dir_fd, write_archive_root, write_client_pid, write_meta, AttachLock, EndReason,
+    SessionMeta, SessionPaths,
 };
 use crate::termstate::TermState;
 use crate::vscode_si;
@@ -45,6 +46,8 @@ pub struct NewSessionOpts {
     pub name: String,
     pub shell: String,
     pub base: PathBuf,
+    /// Where to archive history/logs when the session ends.
+    pub archive: PathBuf,
     /// Optional log path override (`--log` / `RESHELL_LOG`). Default: `$session/daemon.log`.
     pub log_path: Option<PathBuf>,
 }
@@ -128,11 +131,12 @@ pub fn create_session(opts: NewSessionOpts) -> Result<()> {
                 bail!("session '{}' already exists (pid {})", opts.name, meta.pid);
             }
         }
-        cleanup_session_files(&paths)?;
+        cleanup_session_files(&paths, &opts.archive, EndReason::Replaced)?;
     }
 
     fs::create_dir_all(&paths.dir)
         .with_context(|| format!("create session dir {}", paths.dir.display()))?;
+    write_archive_root(&paths, &opts.archive)?;
 
     let (read_fd, write_fd) = nix::unistd::pipe().context("create readiness pipe")?;
 
@@ -263,6 +267,8 @@ fn run_daemon(opts: NewSessionOpts, paths: SessionPaths, ready_fd: OwnedFd) -> R
                 created_unix: created,
                 attached: false,
                 last_active_unix: created,
+                ended_unix: None,
+                end_reason: None,
             };
             write_meta(&paths, &meta)?;
 
@@ -493,6 +499,20 @@ fn server_loop(
                                 AttachLock::try_acquire(&dir_fd),
                             ) {
                                 (Ok(mut c), Ok(lock)) => {
+                                    // Record peer pid as soon as the attach lock is held so
+                                    // `is_attached` and `client.pid` stay consistent for
+                                    // switch/detach waiters (lock Drop clears the file).
+                                    if let Some(pid) = peer {
+                                        if let Ok(paths) =
+                                            paths_from_dir_fd(dir_fd.as_raw_fd())
+                                        {
+                                            if let Err(e) = write_client_pid(&paths, pid) {
+                                                log(&format!(
+                                                    "write client.pid failed: {e:#}"
+                                                ));
+                                            }
+                                        }
+                                    }
                                     match handle_client_messages(
                                         &mut c,
                                         master_fd,
@@ -505,17 +525,6 @@ fn server_loop(
                                             log("client detached immediately");
                                         }
                                         Ok(false) => {
-                                            if let Some(pid) = peer {
-                                                if let Ok(paths) =
-                                                    paths_from_dir_fd(dir_fd.as_raw_fd())
-                                                {
-                                                    if let Err(e) = write_client_pid(&paths, pid) {
-                                                        log(&format!(
-                                                            "write client.pid failed: {e:#}"
-                                                        ));
-                                                    }
-                                                }
-                                            }
                                             client = Some(c);
                                             attach_lock = Some(lock);
                                             log("client attached");
@@ -643,7 +652,8 @@ fn server_loop(
     let _ = signal::kill(shell_pid, Signal::SIGHUP);
     let _ = waitpid(shell_pid, None);
     if let Ok(paths) = paths_from_dir_fd(dir_fd.as_raw_fd()) {
-        cleanup_session_files(&paths)?;
+        let archive = session::read_archive_root(&paths, Path::new("/tmp"));
+        cleanup_session_files(&paths, &archive, EndReason::ShellExit)?;
     }
     Ok(())
 }
