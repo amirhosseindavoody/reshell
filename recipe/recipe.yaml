@@ -22,7 +22,7 @@ build:
       then: |
         set -euo pipefail
         cd "$SRC_DIR"
-        cargo install --locked --no-track --path . --root "$PREFIX"
+        cargo install --locked --no-track --force --path . --root "$PREFIX"
         test -x "$PREFIX/bin/reshell"
         rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
     # Windows: see build-win.bat — scrub Git/msys `link.exe` so MSVC's linker

@@ -54,7 +54,7 @@ if defined MSVC_LINK (
 echo PATH linker candidates:
 where link 2>nul
 
-cargo install --locked --no-track --path . --root "%PREFIX%\Library" || exit /b 1
+cargo install --locked --no-track --force --path . --root "%PREFIX%\Library" || exit /b 1
 
 if not exist "%PREFIX%\Library\bin\reshell.exe" (
   echo ERROR: reshell.exe missing after cargo install
