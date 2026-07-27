@@ -250,8 +250,100 @@ fn clean_removes_orphan_dirs() {
         .unwrap();
     assert!(out.status.success());
     let txt = String::from_utf8_lossy(&out.stdout);
-    assert!(txt.contains("removed"), "{txt}");
+    assert!(
+        txt.contains("cleaned") || txt.contains("removed"),
+        "{txt}"
+    );
     assert!(!base.join("orphan").exists());
+}
+
+#[test]
+fn kill_archives_history_listable_via_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    new_detached(base, "remember-me");
+    new_detached(base, "still-live");
+
+    // Produce primary-screen history the archive should keep.
+    let sock = wait_sock(base, "remember-me");
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    attach_winsize(&mut stream, 24, 80);
+    write_msg(&mut stream, 1, b"printf 'ARCHIVE_LINE_OK\\n'\n");
+    let _ = collect_data(&mut stream, Instant::now() + Duration::from_secs(1));
+    write_msg(&mut stream, 3, &[]);
+
+    let hist = base.join("remember-me/history/0001.txt");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if hist.exists() {
+            if let Ok(text) = std::fs::read_to_string(&hist) {
+                if text.contains("ARCHIVE_LINE_OK") {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    kill_session(base, "remember-me");
+    assert!(!base.join("remember-me").exists());
+
+    let list_live = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "list"])
+        .output()
+        .unwrap();
+    assert!(list_live.status.success(), "{}", String::from_utf8_lossy(&list_live.stderr));
+    let live_txt = String::from_utf8_lossy(&list_live.stdout);
+    assert!(live_txt.contains("still-live"), "{live_txt}");
+    assert!(!live_txt.contains("remember-me"), "live list should omit ended: {live_txt}");
+
+    let list = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "list", "--all"])
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    let txt = String::from_utf8_lossy(&list.stdout);
+    assert!(txt.contains("still-live"), "expected live row: {txt}");
+    assert!(txt.contains("remember-me"), "expected ended row: {txt}");
+    assert!(txt.contains("ended"), "{txt}");
+    assert!(txt.contains("killed"), "{txt}");
+
+    let info = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "info", "remember-me"])
+        .output()
+        .unwrap();
+    assert!(info.status.success(), "{}", String::from_utf8_lossy(&info.stderr));
+    let info_txt = String::from_utf8_lossy(&info.stdout);
+    assert!(info_txt.contains("state:       ended"), "{info_txt}");
+    assert!(info_txt.contains("daemon_log:"), "{info_txt}");
+    assert!(info_txt.contains("history"), "{info_txt}");
+
+    // History content survived under $dir/archive/.
+    let archive = base.join("archive");
+    let mut found = false;
+    if let Ok(rd) = std::fs::read_dir(&archive) {
+        for entry in rd.flatten() {
+            let hist = entry.path().join("history/0001.txt");
+            if hist.exists() {
+                let text = std::fs::read_to_string(&hist).unwrap_or_default();
+                if text.contains("ARCHIVE_LINE_OK") {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(found, "archived history should contain ARCHIVE_LINE_OK under {archive:?}");
+
+    let purge = Command::new(reshell_bin())
+        .args(["--dir", base.to_str().unwrap(), "clean", "--all"])
+        .output()
+        .unwrap();
+    assert!(purge.status.success(), "{}", String::from_utf8_lossy(&purge.stderr));
+    let purge_txt = String::from_utf8_lossy(&purge.stdout);
+    assert!(purge_txt.contains("purged"), "{purge_txt}");
+
+    kill_session(base, "still-live");
 }
 
 #[test]

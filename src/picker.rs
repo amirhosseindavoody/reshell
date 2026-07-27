@@ -91,7 +91,11 @@ struct ColWidths {
 /// first, then attach — still exclusive (one terminal at a time). The current
 /// session is marked with `*`. `n` creates a new session (name prompt). `k`
 /// kills the highlighted session after confirmation.
-pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> {
+pub fn pick_session(
+    base: &Path,
+    archive_root: &Path,
+    sessions: &[SessionRow],
+) -> Result<PickAction> {
     let mut tty = open_tty()?;
     let tty_fd = tty.as_raw_fd();
     if !nix::unistd::isatty(tty_fd).unwrap_or(false) {
@@ -207,7 +211,7 @@ pub fn pick_session(base: &Path, sessions: &[SessionRow]) -> Result<PickAction> 
                     )?;
                     first_draw = true;
                     if confirmed {
-                        match session::kill_session(base, &name) {
+                        match session::kill_session(base, &name, archive_root) {
                             Ok(()) => {
                                 entries.remove(cursor);
                                 if cursor >= entries.len() {

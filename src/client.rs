@@ -138,7 +138,11 @@ fn preflight_attach(base: &std::path::Path, name: &str, wait_if_attached: bool) 
         )
     })?;
     if !session::process_alive(meta.pid) {
-        let _ = session::cleanup_session_files(&paths);
+        let archive = session::read_archive_root(
+            &paths,
+            &session::resolve_archive_dir(None, base, true),
+        );
+        let _ = session::cleanup_session_files(&paths, &archive, session::EndReason::Stale);
         bail!(
             "session '{name}' is not running (daemon pid {} is dead; cleaned up leftovers)",
             meta.pid

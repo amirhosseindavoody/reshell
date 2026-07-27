@@ -32,6 +32,12 @@ struct Cli {
     #[arg(long, global = true, env = "RESHELL_DIR")]
     dir: Option<PathBuf>,
 
+    /// Override ended-session archive directory.
+    /// Default: `$XDG_STATE_HOME/reshell/archive` (or `$HOME/.local/state/reshell/archive`);
+    /// with `--dir`, defaults to `$dir/archive`.
+    #[arg(long, global = true, env = "RESHELL_ARCHIVE_DIR")]
+    archive_dir: Option<PathBuf>,
+
     /// Daemon log path (default: `$session/daemon.log`). Also accepts `RESHELL_LOG`.
     #[arg(long, global = true, env = "RESHELL_LOG")]
     log: Option<PathBuf>,
@@ -83,12 +89,17 @@ enum Commands {
         /// Machine-readable JSON (stable fields for scripts)
         #[arg(long)]
         json: bool,
+        /// Include ended (archived) sessions as well as live ones
+        #[arg(long)]
+        all: bool,
     },
     /// Show details for a session
     #[command(visible_alias = "i")]
     Info {
-        /// Session name (defaults to the current session when inside one,
-        /// otherwise the most recently active session)
+        /// Session name or archive id (`name@unix`). Defaults to the current
+        /// session when inside one, otherwise the most recently active live
+        /// session (falls back to the newest matching archive if that live
+        /// session is gone).
         #[arg(add = ArgValueCompleter::new(complete_session_name))]
         name: Option<String>,
         /// Machine-readable JSON
@@ -104,8 +115,16 @@ enum Commands {
         /// New session name
         new_name: String,
     },
-    /// Remove dead-session leftovers (also done automatically by `list`)
-    Clean,
+    /// Clean up session storage.
+    ///
+    /// Without flags: remove dead / orphan *live* session directories (after
+    /// archiving their history and daemon.log). Live sessions keep running;
+    /// archives are not deleted. Also runs automatically as part of `list`.
+    Clean {
+        /// Also purge archived ended sessions (history + daemon.log)
+        #[arg(long)]
+        all: bool,
+    },
     /// Terminate a session and its shell
     #[command(visible_alias = "k")]
     Kill {
@@ -218,10 +237,12 @@ fn run() -> Result<()> {
         return print_completion_registration(shell);
     }
 
+    let custom_base = cli.dir.is_some();
     let base = match cli.dir {
         Some(d) => d,
         None => session_base_dir()?,
     };
+    let archive = session::resolve_archive_dir(cli.archive_dir.as_deref(), &base, custom_base);
     let log = cli.log;
     let detach_key = parse_detach_key(&cli.detach_key)?;
 
@@ -233,28 +254,50 @@ fn run() -> Result<()> {
             name,
             shell,
             detach,
-        } => cmd_new(&base, name, shell, detach, log, detach_key),
-        Commands::Attach { name } => cmd_attach(&base, name, log, detach_key),
-        Commands::Detach { name } => cmd_detach(&base, name),
-        Commands::List { json } => cmd_list(&base, json),
-        Commands::Info { name, json } => cmd_info(&base, name, json),
+        } => cmd_new(&base, &archive, name, shell, detach, log, detach_key),
+        Commands::Attach { name } => cmd_attach(&base, &archive, name, log, detach_key),
+        Commands::Detach { name } => cmd_detach(&base, &archive, name),
+        Commands::List { json, all } => cmd_list(&base, &archive, json, all),
+        Commands::Info { name, json } => cmd_info(&base, &archive, name, json),
         Commands::Rename { old_name, new_name } => {
             session::rename_session(&base, &old_name, &new_name)?;
             println!("renamed {old_name} → {new_name}");
             Ok(())
         }
-        Commands::Clean => {
-            let n = session::cleanup_stale_sessions(&base)?;
-            if n == 0 {
+        Commands::Clean { all } => {
+            let n_live = session::cleanup_stale_sessions(&base, &archive)?;
+            if all {
+                let n_arch = session::purge_ended_sessions(&archive)?;
+                if n_live == 0 && n_arch == 0 {
+                    println!("(nothing to clean)");
+                } else {
+                    if n_live > 0 {
+                        println!(
+                            "cleaned {n_live} dead/orphan live session dir(s); \
+                             history/logs were archived under {}",
+                            archive.display()
+                        );
+                    }
+                    if n_arch > 0 {
+                        println!("purged {n_arch} ended session(s) from {}", archive.display());
+                    } else if n_live > 0 {
+                        println!("(no ended sessions to purge under {})", archive.display());
+                    }
+                }
+            } else if n_live == 0 {
                 println!("(nothing to clean)");
             } else {
-                println!("removed {n} stale session(s)");
+                println!(
+                    "cleaned {n_live} dead/orphan live session dir(s); \
+                     history/logs kept under {}",
+                    archive.display()
+                );
             }
             Ok(())
         }
         Commands::Kill { name, all } => {
             if all {
-                let killed = session::kill_all_sessions(&base)?;
+                let killed = session::kill_all_sessions(&base, &archive)?;
                 if killed.is_empty() {
                     println!("(no sessions)");
                 } else {
@@ -264,7 +307,7 @@ fn run() -> Result<()> {
                 }
             } else {
                 let name = name.expect("clap requires name unless --all");
-                session::kill_session(&base, &name)?;
+                session::kill_session(&base, &name, &archive)?;
                 println!("killed {name}");
             }
             Ok(())
@@ -307,8 +350,8 @@ fn complete_sessions(current: &OsStr, attachable_only: bool) -> Vec<CompletionCa
     let Some(current) = current.to_str() else {
         return Vec::new();
     };
-    let base = completion_base_dir();
-    let Ok(sessions) = session::list_sessions(&base) else {
+    let (base, archive) = completion_dirs();
+    let Ok(sessions) = session::list_sessions(&base, &archive) else {
         return Vec::new();
     };
     sessions
@@ -319,6 +362,21 @@ fn complete_sessions(current: &OsStr, attachable_only: bool) -> Vec<CompletionCa
         })
         .map(|(meta, _)| CompletionCandidate::new(meta.name))
         .collect()
+}
+
+fn completion_dirs() -> (PathBuf, PathBuf) {
+    let custom = dir_from_completion_args().is_some()
+        || std::env::var("RESHELL_DIR").map(|s| !s.is_empty()).unwrap_or(false);
+    let base = completion_base_dir();
+    let archive_explicit = archive_dir_from_completion_args()
+        .or_else(|| {
+            std::env::var("RESHELL_ARCHIVE_DIR")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        });
+    let archive = session::resolve_archive_dir(archive_explicit.as_deref(), &base, custom);
+    (base, archive)
 }
 
 fn completion_base_dir() -> PathBuf {
@@ -335,6 +393,14 @@ fn completion_base_dir() -> PathBuf {
 
 /// Parse `--dir` from the shell words passed to the dynamic completer.
 fn dir_from_completion_args() -> Option<PathBuf> {
+    flag_value_from_completion_args("--dir")
+}
+
+fn archive_dir_from_completion_args() -> Option<PathBuf> {
+    flag_value_from_completion_args("--archive-dir")
+}
+
+fn flag_value_from_completion_args(flag: &str) -> Option<PathBuf> {
     let args: Vec<_> = std::env::args_os().collect();
     let start = args
         .iter()
@@ -342,13 +408,14 @@ fn dir_from_completion_args() -> Option<PathBuf> {
         .map(|i| i + 1)
         .unwrap_or(0);
     let words = &args[start..];
+    let eq = format!("{flag}=");
     let mut i = 0;
     while i < words.len() {
         let w = words[i].to_string_lossy();
-        if w == "--dir" {
+        if w == flag {
             return words.get(i + 1).map(PathBuf::from);
         }
-        if let Some(rest) = w.strip_prefix("--dir=") {
+        if let Some(rest) = w.strip_prefix(&eq) {
             return Some(PathBuf::from(rest));
         }
         i += 1;
@@ -358,13 +425,14 @@ fn dir_from_completion_args() -> Option<PathBuf> {
 
 fn cmd_new(
     base: &Path,
+    archive: &Path,
     name: Option<String>,
     shell: Option<String>,
     detach: bool,
     log: Option<PathBuf>,
     detach_key: u8,
 ) -> Result<()> {
-    let _ = session::cleanup_stale_sessions(base)?;
+    let _ = session::cleanup_stale_sessions(base, archive)?;
     let name = match name {
         Some(n) => n,
         None => allocate_session_name(base)?,
@@ -374,6 +442,7 @@ fn cmd_new(
         name: name.clone(),
         shell,
         base: base.to_path_buf(),
+        archive: archive.to_path_buf(),
         log_path: log,
     })?;
     if detach {
@@ -384,20 +453,21 @@ fn cmd_new(
         eprintln!("{name}");
         // If this process is already inside a session, leave it and join the
         // new one via the outer attach client — never nest a second client.
-        join_session(base, &name, detach_key)
+        join_session(base, archive, &name, detach_key)
     }
 }
 
 fn cmd_attach(
     base: &Path,
+    archive: &Path,
     name: Option<String>,
     log: Option<PathBuf>,
     detach_key: u8,
 ) -> Result<()> {
     match name {
-        Some(n) => join_session(base, &n, detach_key),
+        Some(n) => join_session(base, archive, &n, detach_key),
         None => {
-            let mut sessions = session::list_sessions(base)?;
+            let mut sessions = session::list_sessions(base, archive)?;
 
             let stdin_fd = std::io::stdin().as_raw_fd();
             let is_tty = nix::unistd::isatty(stdin_fd).unwrap_or(false);
@@ -407,19 +477,19 @@ fn cmd_attach(
                     // Prompt for a name (editable suggested default), then create.
                     match picker::prompt_new_session_name(base)? {
                         Some(n) => {
-                            return cmd_new(base, Some(n), None, false, log, detach_key);
+                            return cmd_new(base, archive, Some(n), None, false, log, detach_key);
                         }
                         None => anyhow::bail!("cancelled"),
                     }
                 }
                 // Non-TTY: same as `reshell new` (auto name).
-                return cmd_new(base, None, None, false, log, detach_key);
+                return cmd_new(base, archive, None, None, false, log, detach_key);
             }
 
             if !is_tty {
                 // Scripts / pipes: keep the historical most-recent default.
-                let meta = session::most_recent_session(base)?;
-                return join_session(base, &meta.name, detach_key);
+                let meta = session::most_recent_session(base, archive)?;
+                return join_session(base, archive, &meta.name, detach_key);
             }
 
             // Detached (attachable) first by activity, then attached (gray).
@@ -431,8 +501,7 @@ fn cmd_attach(
                     .then_with(|| a.0.name.cmp(&b.0.name)),
             });
 
-            let current_name = session::current_session(base)?
-                .map(|m| m.name);
+            let current_name = session::current_session(base, archive)?.map(|m| m.name);
 
             let rows: Vec<picker::SessionRow> = sessions
                 .iter()
@@ -458,18 +527,18 @@ fn cmd_attach(
                 })
                 .collect();
 
-            match picker::pick_session(base, &rows)? {
+            match picker::pick_session(base, archive, &rows)? {
                 // `cmd_new` / `join_session` leave the current session when inside one.
                 picker::PickAction::CreateNew { name } => {
-                    cmd_new(base, Some(name), None, false, log, detach_key)
+                    cmd_new(base, archive, Some(name), None, false, log, detach_key)
                 }
-                picker::PickAction::Attach(n) => join_session(base, &n, detach_key),
+                picker::PickAction::Attach(n) => join_session(base, archive, &n, detach_key),
                 picker::PickAction::AttachAfterDetach(n) => {
                     // Confirmed in the picker: free the other terminal first, then
                     // join (still exclusive — only one attach at a time).
                     eprintln!("detaching {n}");
                     session::request_detach(base, &n)?;
-                    join_session(base, &n, detach_key)
+                    join_session(base, archive, &n, detach_key)
                 }
                 picker::PickAction::Cancelled => {
                     anyhow::bail!("cancelled");
@@ -479,8 +548,8 @@ fn cmd_attach(
     }
 }
 
-fn cmd_detach(base: &Path, name: Option<String>) -> Result<()> {
-    let name = resolve_session_name(base, name)?;
+fn cmd_detach(base: &Path, archive: &Path, name: Option<String>) -> Result<()> {
+    let name = resolve_session_name(base, archive, name)?;
     let paths = session::SessionPaths::for_name(base, &name);
     if !paths.meta.exists() {
         anyhow::bail!("session '{name}' not found");
@@ -499,8 +568,8 @@ fn cmd_detach(base: &Path, name: Option<String>) -> Result<()> {
 /// Invariant: if `current_session` is some other live session, ask its outer
 /// attach client to detach that session and attach to `target` instead of
 /// calling `client::attach` from this process. Same-session is a no-op.
-fn join_session(base: &Path, target: &str, detach_key: u8) -> Result<()> {
-    if let Some(cur) = session::current_session(base)? {
+fn join_session(base: &Path, archive: &Path, target: &str, detach_key: u8) -> Result<()> {
+    if let Some(cur) = session::current_session(base, archive)? {
         if cur.name == target {
             eprintln!("already in session '{target}'");
             return Ok(());
@@ -512,68 +581,155 @@ fn join_session(base: &Path, target: &str, detach_key: u8) -> Result<()> {
     client::attach(base, target, detach_key)
 }
 
-fn cmd_list(base: &Path, json: bool) -> Result<()> {
-    let sessions = session::list_sessions(base)?;
+fn cmd_list(base: &Path, archive: &Path, json: bool, all: bool) -> Result<()> {
+    let sessions = session::list_sessions(base, archive)?;
+    let ended = if all {
+        session::list_ended_sessions(archive)?
+    } else {
+        Vec::new()
+    };
+
     if json {
-        let rows: Vec<SessionJson> = sessions
+        let mut rows: Vec<SessionJson> = sessions
             .iter()
-            .map(|(meta, paths)| SessionJson::from_session(meta, paths))
+            .map(|(meta, paths)| SessionJson::from_session(meta, paths, None))
             .collect();
+        if all {
+            rows.extend(ended.iter().map(SessionJson::from_ended));
+        }
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    if sessions.is_empty() {
-        println!("(no sessions)");
+
+    if sessions.is_empty() && ended.is_empty() {
+        if all {
+            println!("(no live or ended sessions)");
+        } else {
+            println!("(no sessions)");
+        }
         return Ok(());
     }
-    println!(
-        "{:<20} {:>8} {:<10} {:<16} {:<16} SHELL",
-        "NAME", "PID", "STATE", "CREATED", "LAST ACTIVE"
-    );
-    for (meta, _) in sessions {
+
+    if all {
+        println!(
+            "{:<20} {:>8} {:<10} {:<16} {:<16} {}",
+            "NAME", "PID", "STATE", "CREATED", "LAST ACTIVE", "SHELL/REASON"
+        );
+    } else {
+        println!(
+            "{:<20} {:>8} {:<10} {:<16} {:<16} SHELL",
+            "NAME", "PID", "STATE", "CREATED", "LAST ACTIVE"
+        );
+    }
+    for (meta, _) in &sessions {
         let state = if meta.attached {
             "attached"
         } else {
             "detached"
         };
         let created = format_time_human(meta.created_unix);
-        let last_active = format_time_human(session::session_activity(&meta));
+        let last_active = format_time_human(session::session_activity(meta));
         println!(
             "{:<20} {:>8} {:<10} {:<16} {:<16} {}",
             meta.name, meta.pid, state, created, last_active, meta.shell
         );
     }
+    for e in &ended {
+        let reason = e.meta.end_reason.as_deref().unwrap_or("-");
+        let created = format_time_human(e.meta.created_unix);
+        let last = format_time_human(
+            e.meta
+                .ended_unix
+                .unwrap_or_else(|| session::session_activity(&e.meta)),
+        );
+        let detail = format!("{reason} ({})", e.archive_id);
+        println!(
+            "{:<20} {:>8} {:<10} {:<16} {:<16} {}",
+            e.meta.name, "-", "ended", created, last, detail
+        );
+    }
     Ok(())
 }
 
-fn resolve_session_name(base: &Path, name: Option<String>) -> Result<String> {
+fn resolve_session_name(base: &Path, archive: &Path, name: Option<String>) -> Result<String> {
     match name {
         Some(n) => Ok(n),
-        None => match session::current_session(base)? {
+        None => match session::current_session(base, archive)? {
             Some(meta) => Ok(meta.name),
-            None => Ok(session::most_recent_session(base)?.name),
+            None => Ok(session::most_recent_session(base, archive)?.name),
         },
     }
 }
 
-fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
-    let name = resolve_session_name(base, name)?;
-    let (meta, paths) = session::session_info(base, &name)?;
+fn cmd_info(base: &Path, archive: &Path, name: Option<String>, json: bool) -> Result<()> {
+    // Prefer live; if missing/dead after cleanup, fall back to newest archive.
+    // Archive ids (`name@unix`) are accepted via the ended-session lookup.
+    let resolved = match name {
+        Some(ref n) => Some(n.clone()),
+        None => match session::current_session(base, archive)? {
+            Some(meta) => Some(meta.name),
+            None => session::most_recent_session(base, archive)
+                .ok()
+                .map(|m| m.name),
+        },
+    };
+
+    if let Some(ref n) = resolved {
+        // Exact archive id first (contains `@`, not a valid live name).
+        if n.contains('@') {
+            if let Ok(e) = session::find_ended_session(archive, n) {
+                return print_session_info(&e.meta, &e.paths, json, Some(&e.archive_id));
+            }
+        }
+        match session::session_info(base, n, archive) {
+            Ok((meta, paths)) => return print_session_info(&meta, &paths, json, None),
+            Err(_) => {
+                if let Ok(e) = session::find_ended_session(archive, n) {
+                    return print_session_info(&e.meta, &e.paths, json, Some(&e.archive_id));
+                }
+            }
+        }
+    } else if let Ok(e) = session::list_ended_sessions(archive).map(|v| v.into_iter().next()) {
+        if let Some(e) = e {
+            return print_session_info(&e.meta, &e.paths, json, Some(&e.archive_id));
+        }
+    }
+
+    match resolved {
+        Some(n) => anyhow::bail!("session '{n}' not found (live or ended)"),
+        None => anyhow::bail!("no sessions found"),
+    }
+}
+
+fn print_session_info(
+    meta: &session::SessionMeta,
+    paths: &session::SessionPaths,
+    json: bool,
+    archive_id: Option<&str>,
+) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&SessionJson::from_session(&meta, &paths))?
+            serde_json::to_string_pretty(&SessionJson::from_session(meta, paths, archive_id))?
         );
         return Ok(());
     }
-    let state = if meta.attached {
+    let state = if meta.ended_unix.is_some() {
+        "ended"
+    } else if meta.attached {
         "attached"
     } else {
         "detached"
     };
     println!("name:        {}", meta.name);
+    if let Some(id) = archive_id {
+        println!("archive_id:  {id}");
+    }
     println!("pid:         {}", meta.pid);
     println!("state:       {state}");
+    if let Some(reason) = meta.end_reason.as_deref() {
+        println!("end_reason:  {reason}");
+    }
     println!("shell:       {}", meta.shell);
     println!(
         "created:     {} ({})",
@@ -590,13 +746,24 @@ fn cmd_info(base: &Path, name: Option<String>, json: bool) -> Result<()> {
         format_time_human(last),
         last
     );
+    if let Some(ended) = meta.ended_unix {
+        println!(
+            "ended:       {} ({})",
+            format_time_human(ended),
+            ended
+        );
+    }
     println!("dir:         {}", paths.dir.display());
-    println!("socket:      {}", paths.socket.display());
-    println!("meta:        {}", paths.meta.display());
-    println!("attach_lock: {}", paths.attach_lock.display());
+    if meta.ended_unix.is_none() {
+        println!("socket:      {}", paths.socket.display());
+        println!("meta:        {}", paths.meta.display());
+        println!("attach_lock: {}", paths.attach_lock.display());
+    } else {
+        println!("meta:        {}", paths.meta.display());
+    }
     println!("daemon_log:  {}", paths.daemon_log.display());
     println!("history_dir: {}", paths.history_dir().display());
-    let history_files = history::list_history_files(&paths);
+    let history_files = history::list_history_files(paths);
     if history_files.is_empty() {
         println!("history:     (none yet)");
     } else {
@@ -621,6 +788,14 @@ struct SessionJson {
     attached: bool,
     created_unix: u64,
     last_active_unix: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ended_unix: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
     dir: String,
     socket: String,
     meta: String,
@@ -631,8 +806,19 @@ struct SessionJson {
 }
 
 impl SessionJson {
-    fn from_session(meta: &session::SessionMeta, paths: &session::SessionPaths) -> Self {
+    fn from_session(
+        meta: &session::SessionMeta,
+        paths: &session::SessionPaths,
+        archive_id: Option<&str>,
+    ) -> Self {
         let history_files = history::list_history_files(paths);
+        let state = if meta.ended_unix.is_some() {
+            Some("ended".into())
+        } else if meta.attached {
+            Some("attached".into())
+        } else {
+            Some("detached".into())
+        };
         Self {
             name: meta.name.clone(),
             pid: meta.pid,
@@ -640,6 +826,10 @@ impl SessionJson {
             attached: meta.attached,
             created_unix: meta.created_unix,
             last_active_unix: meta.last_active_unix,
+            ended_unix: meta.ended_unix,
+            end_reason: meta.end_reason.clone(),
+            archive_id: archive_id.map(|s| s.to_string()),
+            state,
             dir: paths.dir.display().to_string(),
             socket: paths.socket.display().to_string(),
             meta: paths.meta.display().to_string(),
@@ -651,6 +841,10 @@ impl SessionJson {
                 .map(|p| p.display().to_string())
                 .collect(),
         }
+    }
+
+    fn from_ended(e: &session::EndedSession) -> Self {
+        Self::from_session(&e.meta, &e.paths, Some(&e.archive_id))
     }
 }
 
