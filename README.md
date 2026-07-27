@@ -52,26 +52,51 @@ Install globally (adds `reshell` to your PATH):
 pixi global install --git https://github.com/amirhosseindavoody/reshell.git --branch main reshell
 ```
 
-**Windows:** the global package builds a **Windows `ssh` client** (`reshell ssh …`).
-Session daemons still run only on Linux; after install, use:
+**Linux:** the same install exposes the full CLI (daemon + `ssh` client).
+
+### Windows (prebuilt ssh client)
+
+On Windows, reshell is an **`ssh` client only** (`reshell ssh …`). Session daemons
+still run on Linux. Prefer a **prebuilt** package so you do **not** need Visual
+Studio (source builds need MSVC `link.exe`; Git Bash’s unix `link` otherwise
+fails with `/usr/bin/link: extra operand` —
+[#29](https://github.com/amirhosseindavoody/reshell/issues/29)).
+
+You still need the [OpenSSH Client](https://learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse)
+optional feature.
+
+**Install prebuilt with pixi** (recommended):
 
 ```powershell
-pixi global install --force-reinstall --git https://github.com/amirhosseindavoody/reshell.git --branch main reshell
+Invoke-WebRequest https://github.com/amirhosseindavoody/reshell/releases/download/windows-client/reshell-win-64.conda -OutFile reshell-win-64.conda
+pixi global install --force-reinstall --path .\reshell-win-64.conda
 reshell ssh myserver
 ```
 
-(Requires OpenSSH client. Use `--force-reinstall` if a previous install left a
-broken environment.) The Windows package is an **ssh client only**; session
-daemons still run on Linux. Local commands like `new` / `attach` / `list` are
-hidden in `reshell --help` on Windows.
+**Or install the bare exe** (no pixi):
 
-If the Windows **source build** fails with `/usr/bin/link: extra operand`, Git
-Bash’s unix `link.exe` is shadowing the MSVC linker — current `main` scrubs that
-during the recipe. You still need MSVC available via the conda `vs20xx`
-activation that comes with the Rust compiler (or Visual Studio Build Tools with
-the C++ workload).
+```powershell
+$dir = "$env:LOCALAPPDATA\reshell"
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+Invoke-WebRequest https://github.com/amirhosseindavoody/reshell/releases/download/windows-client/reshell-x86_64-pc-windows-msvc.exe -OutFile "$dir\reshell.exe"
+# Add $dir to your user PATH, or run: & "$dir\reshell.exe" ssh myserver
+```
 
-**Linux:** the same install exposes the full CLI (daemon + `ssh` client).
+Artifacts are published from CI to the rolling
+[`windows-client`](https://github.com/amirhosseindavoody/reshell/releases/tag/windows-client)
+release on every push to `main`.
+
+**Source build** (`pixi global install --git …`) requires **Visual Studio Build
+Tools** with the C++ workload:
+
+```powershell
+winget install Microsoft.VisualStudio.BuildTools --accept-package-agreements --accept-source-agreements --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+pixi global install --force-reinstall --git https://github.com/amirhosseindavoody/reshell.git --branch main reshell
+```
+
+Local commands like `new` / `attach` / `list` are Linux-only and are hidden in
+`reshell --help` on Windows.
+
 ## Usage
 
 ```bash
