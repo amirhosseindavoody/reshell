@@ -13,7 +13,7 @@ source:
 
 build:
   # Bump when changing Windows linker discovery / install layout.
-  number: 4
+  number: 5
   script:
     # Use `cargo install --root` (same pattern as conda-forge ripgrep) so the
     # binary lands in a known place even when cargo writes under
@@ -25,12 +25,12 @@ build:
         cargo install --locked --no-track --force --path . --root "$PREFIX"
         test -x "$PREFIX/bin/reshell"
         rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
-    # Windows: build-win.ps1 finds MSVC link.exe (vswhere / VCToolsInstallDir /
-    # Program Files scan), pins CARGO_TARGET_*_LINKER, strips Git/msys/conda
-    # unix link from PATH, and hard-fails with a prebuilt-install / winget hint
-    # if MSVC is missing (issue #29: "/usr/bin/link: extra operand").
+    # Windows: build-win.bat invokes host PowerShell on build-win.ps1 (MSVC
+    # discovery, PATH scrub, hard-fail if MSVC missing — issue #29).
+    # .ps1 alone fails under rattler-build ("interpreter powershell was not
+    # found in the build environment"); cmd.exe is always available.
     - if: win
-      then: build-win.ps1
+      then: build-win.bat
 
 requirements:
   build:

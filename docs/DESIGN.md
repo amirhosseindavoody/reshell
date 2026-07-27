@@ -591,7 +591,7 @@ Mirrors the csv-utils dual-manifest pattern:
 |------|------|
 | `Cargo.toml` / `Cargo.lock` | Rust crate; lockfile used with `--locked` in conda builds |
 | `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build; platforms `linux-64` + `win-64` + `win-arm64` |
-| `recipe/recipe.yaml` | rattler-build via `cargo install --root`; Windows uses `build-win.ps1` (MSVC via vswhere / Program Files scan, strips Git/conda unix `link`) |
+| `recipe/recipe.yaml` | rattler-build via `cargo install --root`; Windows `build-win.bat` → `build-win.ps1` (MSVC discovery, strips Git/conda unix `link`) |
 | `.github/workflows/windows-package.yml` | Builds win-64 on `windows-latest`; uploads artifacts; publishes rolling `windows-client` release (prebuilt `.conda` + `.exe`) |
 | `scripts/update-version.sh` | CalVer `YYYY.M.D+N` across Cargo / pixi / recipe |
 
