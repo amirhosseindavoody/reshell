@@ -1,13 +1,17 @@
 name: Windows package
 
-# Build a win-64 conda package on a runner that has MSVC, so we can verify the
-# Windows recipe (issue #29) and publish an artifact for offline install.
+# Build a win-64 conda package + bare exe on a runner that has MSVC.
+# Publishes a rolling GitHub Release `windows-client` so end users can install
+# without Visual Studio (issue #29: Git unix link.exe shadows MSVC).
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   win64:
@@ -28,13 +32,84 @@ jobs:
           where.exe link
 
       - name: Build conda package
-        run: pixi build
+        run: pixi build --output-dir dist
 
-      - name: Upload .conda artifact
+      - name: Build bare exe (same MSVC toolchain)
+        shell: pwsh
+        run: |
+          # GHA images have Git's unix link.exe on PATH; pin MSVC like build-win.ps1.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $msvcRoot = Join-Path $installPath "VC\Tools\MSVC"
+          $ver = Get-ChildItem $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $link = Join-Path $ver.FullName "bin\Hostx64\x64\link.exe"
+          if (-not (Test-Path $link)) { Write-Error "MSVC link.exe not found at $link"; exit 1 }
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $link
+          $env:PATH = "$(Split-Path $link);$(($env:PATH -split ';' | Where-Object { $_ -and $_ -notmatch '(?i)\\Git\\usr\\bin|\\Library\\usr\\bin' }) -join ';')"
+          Write-Host "Using MSVC linker: $link"
+          pixi run cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\release\reshell.exe" "dist\reshell-x86_64-pc-windows-msvc.exe" -Force
+          & "dist\reshell-x86_64-pc-windows-msvc.exe" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage fixed-name conda artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $conda = Get-ChildItem -Path dist, . -Recurse -Filter "*.conda" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match 'reshell' } |
+            Select-Object -First 1
+          if (-not $conda) {
+            Write-Error "No reshell .conda package found after pixi build"
+            Get-ChildItem -Recurse -Filter "*.conda" | Select-Object -ExpandProperty FullName
+            exit 1
+          }
+          Copy-Item -LiteralPath $conda.FullName -Destination "dist\reshell-win-64.conda" -Force
+          Write-Host "Staged conda: $($conda.FullName) -> dist\reshell-win-64.conda"
+          Get-Item dist\reshell-win-64.conda, dist\reshell-x86_64-pc-windows-msvc.exe |
+            Format-Table Name, Length
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: reshell-win-64-conda
+          name: reshell-win-64
           path: |
-            *.conda
-            **/*.conda
+            dist/reshell-win-64.conda
+            dist/reshell-x86_64-pc-windows-msvc.exe
           if-no-files-found: error
+
+      - name: Publish rolling windows-client release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-client
+          name: Windows ssh client (prebuilt)
+          body: |
+            Prebuilt **win-64** `reshell` ssh client — no Visual Studio Build Tools required.
+
+            ### Install with pixi (recommended)
+
+            ```powershell
+            Invoke-WebRequest https://github.com/amirhosseindavoody/reshell/releases/download/windows-client/reshell-win-64.conda -OutFile reshell-win-64.conda
+            pixi global install --force-reinstall --path .\reshell-win-64.conda
+            reshell ssh --help
+            ```
+
+            ### Install bare exe
+
+            ```powershell
+            $dir = "$env:LOCALAPPDATA\reshell"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            Invoke-WebRequest https://github.com/amirhosseindavoody/reshell/releases/download/windows-client/reshell-x86_64-pc-windows-msvc.exe -OutFile "$dir\reshell.exe"
+            # Then add $dir to your user PATH, or run: & "$dir\reshell.exe" ssh myserver
+            ```
+
+            Built from commit `${{ github.sha }}`. Fixes [#29](https://github.com/amirhosseindavoody/reshell/issues/29).
+          files: |
+            dist/reshell-win-64.conda
+            dist/reshell-x86_64-pc-windows-msvc.exe
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: false

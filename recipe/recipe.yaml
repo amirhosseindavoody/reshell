@@ -13,7 +13,7 @@ source:
 
 build:
   # Bump when changing Windows linker discovery / install layout.
-  number: 3
+  number: 4
   script:
     # Use `cargo install --root` (same pattern as conda-forge ripgrep) so the
     # binary lands in a known place even when cargo writes under
@@ -25,9 +25,10 @@ build:
         cargo install --locked --no-track --force --path . --root "$PREFIX"
         test -x "$PREFIX/bin/reshell"
         rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
-    # Windows: PowerShell script finds MSVC link.exe via VCToolsInstallDir /
-    # vswhere, pins CARGO_TARGET_*_LINKER, and strips Git's unix link from PATH
-    # (issue #29: "/usr/bin/link: extra operand").
+    # Windows: build-win.ps1 finds MSVC link.exe (vswhere / VCToolsInstallDir /
+    # Program Files scan), pins CARGO_TARGET_*_LINKER, strips Git/msys/conda
+    # unix link from PATH, and hard-fails with a prebuilt-install / winget hint
+    # if MSVC is missing (issue #29: "/usr/bin/link: extra operand").
     - if: win
       then: build-win.ps1
 
@@ -36,7 +37,8 @@ requirements:
     - ${{ compiler('rust') }}
     # Only need a C compiler activation on Unix. On Windows, rust_win-64 already
     # depends on vs_win-64; a second VS activation can blow PATH length and
-    # leave Git's link.exe first.
+    # leave Git's link.exe first. Prefer the prebuilt windows-client release
+    # when the host has no Visual Studio Build Tools.
     - if: unix
       then: ${{ compiler('c') }}
 
