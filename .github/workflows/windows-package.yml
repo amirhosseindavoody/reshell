@@ -22,7 +22,9 @@ jobs:
 
       - uses: prefix-dev/setup-pixi@v0.8.8
         with:
-          environments: default
+          # pixi build pulls its own recipe build env; skip workspace install
+          # (avoids lockfile / platform churn blocking the package job).
+          run-install: false
 
       - name: Show MSVC linker
         shell: pwsh
@@ -34,7 +36,10 @@ jobs:
       - name: Build conda package
         run: pixi build --output-dir dist
 
-      - name: Build bare exe (same MSVC toolchain)
+      - name: Install Rust (bare exe)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build bare exe (MSVC, scrub Git link)
         shell: pwsh
         run: |
           # GHA images have Git's unix link.exe on PATH; pin MSVC like build-win.ps1.
@@ -47,7 +52,7 @@ jobs:
           $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $link
           $env:PATH = "$(Split-Path $link);$(($env:PATH -split ';' | Where-Object { $_ -and $_ -notmatch '(?i)\\Git\\usr\\bin|\\Library\\usr\\bin' }) -join ';')"
           Write-Host "Using MSVC linker: $link"
-          pixi run cargo build --release --locked
+          cargo build --release --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item "target\release\reshell.exe" "dist\reshell-x86_64-pc-windows-msvc.exe" -Force
