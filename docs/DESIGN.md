@@ -591,7 +591,7 @@ Mirrors the csv-utils dual-manifest pattern:
 |------|------|
 | `Cargo.toml` / `Cargo.lock` | Rust crate; lockfile used with `--locked` in conda builds |
 | `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build; platforms `linux-64` + `win-64` + `win-arm64` |
-| `recipe/recipe.yaml` | rattler-build via `cargo install --root` → `$PREFIX/bin/reshell` (Unix) or `%PREFIX%\Library\bin\reshell.exe` (Windows) |
+| `recipe/recipe.yaml` | rattler-build via `cargo install --root`; Windows uses `build-win.bat` to avoid Git `link.exe` shadowing MSVC |
 | `scripts/update-version.sh` | CalVer `YYYY.M.D+N` across Cargo / pixi / recipe |
 
 `win-64` builds an ssh-client-only binary (daemon modules are `cfg(unix)`). Dev
@@ -635,10 +635,11 @@ Linux.
 - **`reshell ssh` wrapper** — Thin `ssh -t` relay with remote version check /
   pixi install, named session create/attach, and reconnect backoff + R/Q
   (see §4.4).
-- **Windows client package** — `win-64` / `win-arm64` pixi platforms build an
-  ssh-only `reshell.exe` via `cargo install --root` into `Library\bin` so
-  `pixi global install` exposes a real binary (earlier `copy target\release\…`
-  could miss the triple-specific path and yield an empty package).
+- **Windows client package** — `win-64` / `win-arm64` build an ssh-only
+  `reshell.exe` via `cargo install --root` into `Library\bin`. The Windows
+  recipe (`build-win.bat`) removes Git/msys `link.exe` from PATH and pins
+  `CARGO_TARGET_*_LINKER` to MSVC’s linker so builds do not fail with
+  `/usr/bin/link: extra operand` ([#29](https://github.com/amirhosseindavoody/reshell/issues/29)).
 - **Attach exclusivity** — Advisory `flock` on `attached` for the life of the
   connection; stale files without a holder are cleared.
 - **In-session leave-and-join** — `attach` / `new` / picker always leave the
