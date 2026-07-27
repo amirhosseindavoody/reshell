@@ -14,18 +14,17 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 
 - Survive SSH hangup: client exit or `SIGHUP` must not kill the session shell.
 - Minimal input interception: only a single detach byte (default **Ctrl+\** / ASCII `0x1c`; overridable via `--detach-key` / `RESHELL_DETACH_KEY`).
-- Explicit sessions: `new`, `attach`, `list`, `info`, `rename`, `clean`, `kill` — no transparent SSH wrap in v1.
+- Explicit sessions: `new`, `attach`, `list`, `info`, `rename`, `clean`, `kill`, plus optional `ssh` client wrapper.
 - Durable primary-screen history as rotating text files under the session dir (not a VT buffer; not replayed on attach); retained in a durable archive when the session ends.
 - Shell-agnostic: PTY passthrough so bash, zsh, fish, and full-screen apps work.
-- Linux servers only (`linux-64` pixi platform).
+- Linux servers only for the session daemon (`linux-64` pixi platform). `reshell ssh` is the client entry point that SSHes into that daemon host (usable from WSL on Windows, or Linux).
 
 ### Non-Goals (v1)
 
 - Window splitting, tabs, or status bars.
 - VT screen-buffer emulation / multiplexer-style scrollback UI (reattach relies on DEC restore + child redraw; history is logged to text files, not replayed onto the TTY).
 - Multi-client shared attach (second attach is rejected).
-- macOS / Windows.
-- Automatic `reshell ssh …` wrapper.
+- Native Windows daemon / Unix-socket server (daemon remains Linux).
 
 ## 3. Prior Art
 
@@ -82,6 +81,11 @@ reshell clean                  # archive then remove dead live dirs (keeps archi
 reshell clean --all            # also purge archives
 reshell kill demo
 reshell kill --all
+
+# Client SSH wrapper (remote daemon + reconnect)
+reshell ssh myserver
+reshell ssh -n demo user@host
+reshell ssh -- -J bastion -p 2222 user@host
 ```
 
 ### 4.2 Session picker (TTY)
@@ -104,7 +108,36 @@ Non-TTY: most recently active session, or auto-create when none exist.
 | Session base dir | `$XDG_RUNTIME_DIR/reshell` or `/tmp/reshell-$UID` | `--dir` / `RESHELL_DIR` |
 | Ended-session archive | `$XDG_STATE_HOME/reshell/archive` (or `~/.local/state/…`); with `--dir`: `$dir/archive` | `--archive-dir` / `RESHELL_ARCHIVE_DIR` |
 | Daemon log | `$base/$name/daemon.log` | `--log` / `RESHELL_LOG` |
-| Default shell | `/bin/zsh` | `--shell` on `new` |
+| Default shell | `/bin/zsh` | `--shell` on `new` / `ssh` |
+| Remote install (ssh) | pixi global from GitHub `main` | `--install-git` / `--install-ref`; `--no-install` to skip |
+
+### 4.4 `reshell ssh` (thin client)
+
+```text
+┌────────────────────┐   ssh -t    ┌──────────────────────────┐
+│ reshell ssh (local)│ ──────────► │ remote bootstrap script  │
+│  reconnect + R/Q   │             │  ensure reshell version  │
+└────────────────────┘             │  new/attach session      │
+                                   └────────────┬─────────────┘
+                                                │ Unix socket
+                                   ┌────────────▼─────────────┐
+                                   │ reshell session daemon   │
+                                   │  (same as local attach)  │
+                                   └──────────────────────────┘
+```
+
+1. Local process generates or takes `--name`, then runs `ssh -t <dest> <remote-cmd>`.
+2. Remote script (base64-transported) finds `reshell`, compares `--version` to the
+   local crate version; on miss/mismatch runs `pixi global install --git … --branch …`
+   unless `--no-install`.
+3. If `reshell info <name>` succeeds → `attach`; else `new <name> --shell …`.
+4. Local does **not** speak the framed protocol; the remote attach client is the
+   interactive end of the SSH TTY (same detach key via `--detach-key`).
+5. On non-zero ssh exit with a local TTY: wait with exponential backoff
+   (1s → 2s → … → 60s). **R** retries immediately; **Q**/Ctrl+C quits. Exit 0
+   (clean detach) does not reconnect. Non-TTY (scripts) fails after one drop.
+
+Module: [`src/ssh.rs`](../src/ssh.rs).
 
 ## 5. Architecture
 
@@ -159,6 +192,7 @@ reshell/
 │   ├── session.rs       # base dir, meta, list/info/rename/clean/kill, switch_to
 │   ├── server.rs        # daemonize, openpty, accept, multiplex I/O
 │   ├── client.rs        # raw TTY, detach key, SIGWINCH / SIGHUP / SIGUSR1
+│   ├── ssh.rs           # `reshell ssh` thin wrapper + reconnect
 │   ├── protocol.rs      # length-prefixed framing (see PROTOCOL.md)
 │   ├── history.rs       # rotating on-disk text history (primary screen)
 │   ├── termstate.rs     # DEC private mode + OSC title tracking
@@ -170,18 +204,20 @@ reshell/
 │   ├── attach_race.rs
 │   ├── cli_detach.rs
 │   ├── history_files.rs
-│   └── switch_frees.rs
+│   ├── switch_frees.rs
+│   └── ssh_mode.rs
 ├── docs/DESIGN.md
 └── README.md
 ```
 
 | File | Responsibility |
 |------|----------------|
-| [`src/main.rs`](../src/main.rs) | Clap CLI: `new` / `attach` / `detach` / `list` / `info` / `rename` / `clean` / `kill` / `completion` (aliases `n`/`a`/`d`/`ls`/`i`/`r`/`k`); dynamic session-name completion; detach-key + log flags; default shell `/bin/zsh` |
+| [`src/main.rs`](../src/main.rs) | Clap CLI: `new` / `attach` / `detach` / `list` / `info` / `rename` / `clean` / `kill` / `ssh` / `completion` (aliases `n`/`a`/`d`/`ls`/`i`/`r`/`k`); dynamic session-name completion; detach-key + log flags; default shell `/bin/zsh` |
 | [`src/picker.rs`](../src/picker.rs) | Small raw-TTY session picker + name prompt for bare `reshell` / `attach` with no name |
 | [`src/session.rs`](../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill/detach, attach lock, most-recent / current session, `client.pid` / `switch_to` |
 | [`src/server.rs`](../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, history writer, peer pid |
 | [`src/client.rs`](../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP` / `SIGUSR1`, protocol I/O |
+| [`src/ssh.rs`](../src/ssh.rs) | `reshell ssh`: remote bootstrap/install, `ssh -t` relay, reconnect backoff + R/Q |
 | [`src/protocol.rs`](../src/protocol.rs) | Length-prefixed framing (see [PROTOCOL.md](PROTOCOL.md)) |
 | [`src/history.rs`](../src/history.rs) | Rotating on-disk text history (~2000 lines/file); line-cursor collapse of redraws; pauses on alt-screen |
 | [`src/termstate.rs`](../src/termstate.rs) | DEC private mode + OSC window-title tracking for restore-on-attach |
@@ -537,9 +573,11 @@ Wire format details live in [PROTOCOL.md](PROTOCOL.md).
 | `reshell rename <old> <new>` | `r` | Rename a live session directory |
 | `reshell clean` | | Remove dead / orphan live dirs (archives history/logs first); `--all` also purges archives |
 | `reshell kill [name]` | `k` | Terminate daemon (+ `--all`); archives then removes live dir |
+| `reshell ssh [dest]` | | SSH to Linux host; ensure remote reshell; create/attach; reconnect on drop |
 | `reshell completion <shell>` | | Shell completions |
 
-Shared flags: `--dir`, `--archive-dir`, `--detach-key`, `--log`, `--shell` (on `new`).
+Shared flags: `--dir`, `--archive-dir`, `--detach-key`, `--log`, `--shell` (on `new` / `ssh`).
+`ssh` also: `-n`/`--name`, `--no-install`, `--install-git`, `--install-ref`, trailing ssh args.
 
 ## 11. Packaging and Toolchain
 
@@ -572,6 +610,8 @@ conda Rust toolchain is used, not an older system rustup.
   `history/0001.txt`; alt-screen output is skipped; `info` lists history paths.
 - **Integration** (`tests/switch_frees.rs`): in-session switch detaches the original
   session so its attach lock is freed.
+- **Integration** (`tests/ssh_mode.rs`): fake `ssh` binary; remote bootstrap creates
+  a session via `RESHELL_DIR`; non-TTY does not enter reconnect wait; ssh args forwarded.
 - Shared framing helpers live in `tests/common/` so integration tests stay DRY.
 
 Attach’s TTY path is exercised manually or via an external PTY driver; the smoke
@@ -582,13 +622,17 @@ Linux.
 
 ## 13. Open Questions
 
-1. **`reshell ssh …` wrapper** — Thin SSH + remote `reshell` helper remains an
-   explicit post-v1 idea (see [IMPROVEMENTS.md](IMPROVEMENTS.md) §4).
+1. **Native Windows client binary** — `reshell ssh` is designed as a portable SSH
+   relay, but the crate still targets Linux (WSL on Windows works today). A
+   Windows-native build that only ships the ssh wrapper remains optional.
 2. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
    protocol coverage stays the CI default to avoid flakes.
 
 ### Resolved
 
+- **`reshell ssh` wrapper** — Thin `ssh -t` relay with remote version check /
+  pixi install, named session create/attach, and reconnect backoff + R/Q
+  (see §4.4).
 - **Attach exclusivity** — Advisory `flock` on `attached` for the life of the
   connection; stale files without a holder are cleared.
 - **In-session leave-and-join** — `attach` / `new` / picker always leave the
@@ -606,6 +650,8 @@ Linux.
 
 - After SSH hangup, `reshell attach <name>` reconnects to the same shell and
   children without restarting them.
+- `reshell ssh <host>` ensures a compatible remote binary, creates/attaches a
+  session, and reconnects after link drops (R/Q while waiting).
 - Nested TUIs (ratatui/crossterm, etc.) work with only the configured detach key
   intercepted; reattach restores mouse/alt-screen/title and forces a full paint.
 - Bare `reshell` on a TTY can create, attach, switch (freeing the previous

@@ -144,21 +144,24 @@ default. Non-TTY (scripts) keeps the most-recent fallback; empty non-TTY still
 auto-creates. `reshell detach` can also free an attached session without killing
 the shell.
 
-### 4.5 `reshell ssh …` wrapper (post-v1)
+### 4.5 `reshell ssh …` wrapper — done
 
-**Today:** Explicit non-goal — no transparent SSH wrap.
+**Was:** Explicit non-goal — no transparent SSH wrap.
 
-**Proposal:** A thin wrapper that SSHes to a host and runs `reshell` remotely.
-Matches what many people expect from this niche; keep it optional and explicit
-so local session semantics stay clear.
+**Now:** `reshell ssh [dest]` (or `reshell ssh -- <ssh-args…>`) SSHes to a Linux
+host, checks that remote `reshell` matches the local version (else
+`pixi global install --git …`), creates or attaches a named session, and
+reconnects on link drop with backoff (1s → 60s) plus **R** / **Q**. Local process
+is a thin `ssh -t` relay; the daemon stays on the server. See [DESIGN.md](DESIGN.md)
+§4.4 and the root README.
 
 ## 5. Suggested Priority
 
 | Priority | Items | Why |
 |----------|-------|-----|
 | First | §§2.1–2.6 (hardening, CI, tests) | Correctness and maintainability without product drift |
-| Next | §§3.1–4.4 done; §4.5+ next | Low surface area; matches dtach/abduco ergonomics |
-| Later | §4.5+ (optional depth) | Real capability gains; still avoid multiplexer chrome |
+| Next | §§3.1–4.5 done | Low surface area; matches dtach/abduco ergonomics |
+| Later | Native Windows ssh-only build, deeper polish | Optional; WSL + Linux client cover the main path |
 
 When implementing any item, update user-facing README and/or [DESIGN.md](DESIGN.md) /
 [PROTOCOL.md](PROTOCOL.md) in the same change if behavior or interfaces change

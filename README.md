@@ -13,6 +13,7 @@ A lightweight tool to keep shells alive and running after SSH disconnects.
 - Primary-screen output is logged to rotating text history files under the session dir (skipped while a full-screen TUI owns the alternate screen)
 - VS Code/Cursor sticky scroll: finishes the outer `reshell` command and injects shell integration into the session (bash, zsh, fish)
 - Targeted at SSH sessions into Linux servers
+- **`reshell ssh`** from a client machine (Windows via WSL, or Linux): SSH in, ensure a compatible remote `reshell`, create/attach a session daemon, and auto-reconnect if the link drops
 - Defaults to **zsh** (`/bin/zsh`); override with `--shell` for bash, fish, etc.
 
 ## Quick start
@@ -102,7 +103,41 @@ reshell clean --all                # also purge archived history/logs
 reshell kill demo
 # or: reshell k demo
 # or: reshell kill --all   # terminate every live session
+
+# SSH wrapper: ensure remote reshell, create/attach a session, reconnect on drop
+reshell ssh myserver
+# or: reshell ssh -n demo user@host
+# or: reshell ssh -- -J bastion -p 2222 user@host
 ```
+
+### `reshell ssh` (client → Linux server)
+
+Use this when you want a long-lived remote session from a laptop (including Windows
+with WSL / OpenSSH talking to a Linux host). Local `reshell` is a thin SSH relay;
+the session daemon always runs on the server.
+
+```bash
+# Host alias from ~/.ssh/config, or user@host
+reshell ssh myserver
+reshell ssh -n demo user@host --shell /bin/bash
+
+# Raw ssh args (destination among them)
+reshell ssh -- -J bastion -p 2222 user@host
+```
+
+On connect, the remote side:
+
+1. Looks for `reshell` on `PATH` (and `~/.pixi/bin`)
+2. If missing or not the same version as the local client, runs  
+   `pixi global install --git https://github.com/amirhosseindavoody/reshell.git --branch main reshell`  
+   (override with `--install-git` / `--install-ref`; skip with `--no-install`)
+3. Creates the named session if needed, then attaches (same detach key as local)
+
+If the SSH link drops, the local client waits and retries with backoff (**1s**, then
+2s, 4s, … up to **60s**). Press **R** to retry immediately, **Q** (or Ctrl+C) to
+quit. A clean detach (default **Ctrl+\\**) exits without reconnecting. The session
+name is fixed for the life of the local process so reconnects reattach to the same
+daemon.
 
 Short subcommand aliases (also listed in `reshell --help`): `n` new, `a` attach,
 `d` detach, `ls` list, `i` info, `r` rename, `k` kill.
@@ -291,13 +326,13 @@ already on the machine, or you already pair abduco with dvtm by habit.
 
 | Tool | What it solves | Why it is not a substitute |
 |---|---|---|
-| **mosh** / **Eternal Terminal** | Roaming / high-latency SSH (predictive echo, reconnect) | Great on flaky networks; they are not a general “leave an interactive job on the server and come back tomorrow” session manager for arbitrary TUIs |
+| **mosh** / **Eternal Terminal** | Roaming / high-latency SSH (predictive echo, reconnect) | Great on flaky networks; they are not a general “leave an interactive job on the server and come back tomorrow” session manager for arbitrary TUIs. Prefer `reshell ssh` when you want a durable *server-side* session with optional reconnect |
 | **nohup** / **disown** / **`systemd-run`** | Keep a *non-interactive* process alive after logout | No reattach to a live interactive TTY |
 | **`ssh -t` + background tricks** | Ad-hoc survival | Fragile; no first-class attach/list/kill |
 
-**Bottom line:** use reshell as the thin hangup layer; use a multiplexer when you
-need panes; use mosh/ET when the *network* is the problem; use nohup/systemd when
-you do not need an interactive terminal at all.
+**Bottom line:** use reshell as the thin hangup layer (`reshell ssh` from the client);
+use a multiplexer when you need panes; use mosh/ET when the *network* is the problem;
+use nohup/systemd when you do not need an interactive terminal at all.
 
 ## Development
 
