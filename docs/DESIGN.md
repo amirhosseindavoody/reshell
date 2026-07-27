@@ -17,14 +17,16 @@ SSH disconnects kill the remote interactive shell and everything attached to tha
 - Explicit sessions: `new`, `attach`, `list`, `info`, `rename`, `clean`, `kill`, plus optional `ssh` client wrapper.
 - Durable primary-screen history as rotating text files under the session dir (not a VT buffer; not replayed on attach); retained in a durable archive when the session ends.
 - Shell-agnostic: PTY passthrough so bash, zsh, fish, and full-screen apps work.
-- Linux servers only for the session daemon (`linux-64` pixi platform). `reshell ssh` is the client entry point that SSHes into that daemon host (usable from WSL on Windows, or Linux).
+- Linux servers only for the session daemon (`linux-64` pixi platform). Windows
+  (`win-64`) ships an `ssh`-only client binary via the same pixi package so
+  `pixi global install` on Windows exposes `reshell` → `reshell ssh <host>`.
 
 ### Non-Goals (v1)
 
 - Window splitting, tabs, or status bars.
 - VT screen-buffer emulation / multiplexer-style scrollback UI (reattach relies on DEC restore + child redraw; history is logged to text files, not replayed onto the TTY).
 - Multi-client shared attach (second attach is rejected).
-- Native Windows daemon / Unix-socket server (daemon remains Linux).
+- Native Windows session daemon / Unix-socket server (daemon remains Linux).
 
 ## 3. Prior Art
 
@@ -192,7 +194,8 @@ reshell/
 │   ├── session.rs       # base dir, meta, list/info/rename/clean/kill, switch_to
 │   ├── server.rs        # daemonize, openpty, accept, multiplex I/O
 │   ├── client.rs        # raw TTY, detach key, SIGWINCH / SIGHUP / SIGUSR1
-│   ├── ssh.rs           # `reshell ssh` thin wrapper + reconnect
+│   ├── ssh.rs           # `reshell ssh` thin wrapper + reconnect (Linux + Windows)
+│   ├── nameutil.rs      # portable session-name validation / generation
 │   ├── protocol.rs      # length-prefixed framing (see PROTOCOL.md)
 │   ├── history.rs       # rotating on-disk text history (primary screen)
 │   ├── termstate.rs     # DEC private mode + OSC title tracking
@@ -217,7 +220,8 @@ reshell/
 | [`src/session.rs`](../src/session.rs) | Base dir, name validation, `meta.json`, list/info/rename/clean/kill/detach, attach lock, most-recent / current session, `client.pid` / `switch_to` |
 | [`src/server.rs`](../src/server.rs) | Daemonize, openpty, spawn shell, accept clients, multiplex I/O, history writer, peer pid |
 | [`src/client.rs`](../src/client.rs) | Raw TTY, configurable detach key, `SIGWINCH` / `SIGHUP` / `SIGUSR1`, protocol I/O |
-| [`src/ssh.rs`](../src/ssh.rs) | `reshell ssh`: remote bootstrap/install, `ssh -t` relay, reconnect backoff + R/Q |
+| [`src/ssh.rs`](../src/ssh.rs) | `reshell ssh`: remote bootstrap/install, `ssh -t` relay, reconnect backoff + R/Q (compiles on Windows) |
+| [`src/nameutil.rs`](../src/nameutil.rs) | Portable session-name validation / generation (shared by daemon and ssh client) |
 | [`src/protocol.rs`](../src/protocol.rs) | Length-prefixed framing (see [PROTOCOL.md](PROTOCOL.md)) |
 | [`src/history.rs`](../src/history.rs) | Rotating on-disk text history (~2000 lines/file); line-cursor collapse of redraws; pauses on alt-screen |
 | [`src/termstate.rs`](../src/termstate.rs) | DEC private mode + OSC window-title tracking for restore-on-attach |
@@ -586,12 +590,13 @@ Mirrors the csv-utils dual-manifest pattern:
 | File | Role |
 |------|------|
 | `Cargo.toml` / `Cargo.lock` | Rust crate; lockfile used with `--locked` in conda builds |
-| `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build |
-| `recipe/recipe.yaml` | rattler-build → `$PREFIX/bin/reshell` |
+| `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build; platforms `linux-64` + `win-64` |
+| `recipe/recipe.yaml` | rattler-build → `$PREFIX/bin/reshell` (Unix) or `%LIBRARY_BIN%\reshell.exe` (Windows) |
 | `scripts/update-version.sh` | CalVer `YYYY.M.D+N` across Cargo / pixi / recipe |
 
-Dev commands go through pixi (`pixi run build`, `pixi run -- cargo …`) so the
-conda Rust toolchain is used, not an older system rustup.
+`win-64` builds an ssh-client-only binary (daemon modules are `cfg(unix)`). Dev
+commands on Linux still go through pixi (`pixi run build`, `pixi run -- cargo …`)
+so the conda Rust toolchain is used, not an older system rustup.
 
 ## 12. Testing Strategy
 
@@ -622,9 +627,8 @@ Linux.
 
 ## 13. Open Questions
 
-1. **Native Windows client binary** — `reshell ssh` is designed as a portable SSH
-   relay, but the crate still targets Linux (WSL on Windows works today). A
-   Windows-native build that only ships the ssh wrapper remains optional.
+1. **Windows arm64 package** — `win-64` ships the ssh client; `win-arm64` can
+   follow the same pattern if needed.
 2. **Full client TTY path in CI** — Needs a reliable external PTY driver; wire
    protocol coverage stays the CI default to avoid flakes.
 
@@ -633,6 +637,9 @@ Linux.
 - **`reshell ssh` wrapper** — Thin `ssh -t` relay with remote version check /
   pixi install, named session create/attach, and reconnect backoff + R/Q
   (see §4.4).
+- **Windows client package** — `win-64` pixi platform builds an ssh-only
+  `reshell.exe` so `pixi global install` on Windows exposes a binary (daemon
+  remains Linux-only).
 - **Attach exclusivity** — Advisory `flock` on `attached` for the life of the
   connection; stale files without a holder are cleared.
 - **In-session leave-and-join** — `attach` / `new` / picker always leave the

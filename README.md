@@ -52,6 +52,17 @@ Install globally (adds `reshell` to your PATH):
 pixi global install --git https://github.com/amirhosseindavoody/reshell.git --branch main reshell
 ```
 
+**Windows:** the global package builds a **Windows `ssh` client** (`reshell ssh …`).
+Session daemons still run only on Linux; after install, use:
+
+```powershell
+reshell ssh myserver
+```
+
+(Requires OpenSSH client on the Windows machine.) Local commands like `new` /
+`attach` / `list` are Linux-only and are hidden in `reshell --help` on Windows.
+
+**Linux:** the same install exposes the full CLI (daemon + `ssh` client).
 ## Usage
 
 ```bash
@@ -113,8 +124,8 @@ reshell ssh myserver
 ### `reshell ssh` (client → Linux server)
 
 Use this when you want a long-lived remote session from a laptop (including Windows
-with WSL / OpenSSH talking to a Linux host). Local `reshell` is a thin SSH relay;
-the session daemon always runs on the server.
+with the native Windows `reshell` build from `pixi global install`, or WSL). Local
+`reshell` is a thin SSH relay; the session daemon always runs on the server.
 
 ```bash
 # Host alias from ~/.ssh/config, or user@host

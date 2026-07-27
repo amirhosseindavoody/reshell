@@ -270,32 +270,7 @@ pub fn ensure_base_dir(base: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_session_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("session name must not be empty");
-    }
-    if name.len() > 64 {
-        bail!("session name too long (max 64)");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    {
-        bail!("session name may only contain [A-Za-z0-9._-]");
-    }
-    Ok(())
-}
-
-/// Auto-generated name: `session-{unix_secs}-{4 hex digits}`.
-/// The random suffix avoids collisions when two `new` calls share a second.
-pub fn generate_session_name() -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = now.as_secs();
-    let suffix = random_u16(now.subsec_nanos(), std::process::id());
-    format!("session-{secs}-{suffix:04x}")
-}
+pub use crate::nameutil::{generate_session_name, validate_session_name};
 
 /// Pick an auto name that does not already have a session directory.
 pub fn allocate_session_name(base: &Path) -> Result<String> {
@@ -307,20 +282,6 @@ pub fn allocate_session_name(base: &Path) -> Result<String> {
         }
     }
     bail!("could not allocate a unique session name");
-}
-
-fn random_u16(nanos: u32, pid: u32) -> u16 {
-    let mut buf = [0u8; 2];
-    if fill_random(&mut buf).is_ok() {
-        return u16::from_le_bytes(buf);
-    }
-    ((nanos ^ pid.wrapping_mul(0x9E37)) & 0xffff) as u16
-}
-
-fn fill_random(buf: &mut [u8]) -> Result<()> {
-    let mut f = File::open("/dev/urandom").context("open /dev/urandom")?;
-    f.read_exact(buf).context("read /dev/urandom")?;
-    Ok(())
 }
 
 pub fn now_unix() -> u64 {

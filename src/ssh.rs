@@ -1,33 +1,24 @@
 //! `reshell ssh` — thin SSH wrapper with remote bootstrap and reconnect.
 //!
-//! Local client:
+//! Local client (Linux or Windows):
 //! 1. Spawns `ssh -t` to the destination.
 //! 2. Remote script ensures a compatible `reshell` (install via pixi if needed),
-//!    then creates or attaches a named session daemon.
+//!    then creates or attaches a named session daemon on Linux.
 //! 3. On SSH / connection failure, enters a reconnect wait with exponential
 //!    backoff (1s → 60s). Press `R` to retry immediately, `Q` to quit.
 //! 4. Clean detach (remote exit 0) exits locally without reconnecting.
 //!
 //! The local process does not speak the Unix-socket protocol; the remote
-//! `reshell attach` / `new` owns the session. This keeps the Windows→Linux
-//! path (OpenSSH client + Linux daemon) a thin relay.
+//! `reshell attach` / `new` owns the session.
 
-use std::io::{self, ErrorKind, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use nix::errno::Errno;
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::termios::{
-    tcgetattr, tcsetattr, LocalFlags, SetArg, SpecialCharacterIndices, Termios,
-};
-use nix::unistd::{read as nix_read, isatty};
 
-use crate::session;
+use crate::nameutil;
 
 /// Default git source used when the remote needs `pixi global install`.
 pub const DEFAULT_INSTALL_GIT: &str = "https://github.com/amirhosseindavoody/reshell.git";
@@ -38,12 +29,6 @@ pub const DEFAULT_INSTALL_REF: &str = "main";
 pub const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// Cap for reconnect backoff (one minute).
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
-
-static INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn handle_interrupt(_: nix::libc::c_int) {
-    INTERRUPT_FLAG.store(true, Ordering::Relaxed);
-}
 
 /// Options for `reshell ssh`.
 #[derive(Debug, Clone)]
@@ -85,10 +70,10 @@ pub fn run(opts: SshOpts) -> Result<()> {
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let name = match opts.name.clone() {
         Some(n) => {
-            session::validate_session_name(&n)?;
+            nameutil::validate_session_name(&n)?;
             n
         }
-        None => session::generate_session_name(),
+        None => nameutil::generate_session_name(),
     };
     let shell = opts.shell.clone().unwrap_or_else(|| "/bin/zsh".into());
     let ssh_bin = opts
@@ -100,6 +85,9 @@ pub fn run(opts: SshOpts) -> Result<()> {
         bail!("ssh destination required (e.g. `reshell ssh myserver` or `reshell ssh -- user@host`)");
     }
 
+    // Validate detach-key syntax early (forwarded as a string to the remote).
+    let _ = crate::protocol::parse_detach_key(&opts.detach_key)?;
+
     let remote_cmd = build_remote_command(RemoteBootstrap {
         version: &version,
         name: &name,
@@ -110,7 +98,10 @@ pub fn run(opts: SshOpts) -> Result<()> {
         install_ref: &opts.install_ref,
     });
 
-    eprintln!("reshell ssh: session '{name}' via ssh (detach key {}); reconnect: R, quit: Q", opts.detach_key);
+    eprintln!(
+        "reshell ssh: session '{name}' via ssh (detach key {}); reconnect: R, quit: Q",
+        opts.detach_key
+    );
 
     let mut delay = INITIAL_RECONNECT_DELAY;
     let mut attempt: u32 = 0;
@@ -140,8 +131,7 @@ pub fn run(opts: SshOpts) -> Result<()> {
         );
 
         // Non-interactive stdin: fail after the first drop (scripts/CI).
-        let stdin_fd = io::stdin().as_raw_fd();
-        if !isatty(stdin_fd).unwrap_or(false) {
+        if !stdin_is_tty() {
             bail!(
                 "ssh exited with {}; reconnect requires a TTY (press R while waiting)",
                 code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
@@ -172,7 +162,7 @@ pub struct RemoteBootstrap<'a> {
     pub install_ref: &'a str,
 }
 
-/// Build the remote `bash -lc` script that ensures reshell and attaches.
+/// Build the remote command that ensures reshell and attaches.
 pub fn build_remote_command(b: RemoteBootstrap<'_>) -> String {
     // Script is transported as base64 so SSH quoting stays simple and Windows
     // OpenSSH clients do not mangle nested quotes.
@@ -186,7 +176,6 @@ pub fn build_remote_command(b: RemoteBootstrap<'_>) -> String {
 /// Shell script run on the Linux server after SSH login.
 pub fn remote_bootstrap_script(b: RemoteBootstrap<'_>) -> String {
     let no_install = if b.no_install { "1" } else { "0" };
-    // Values are embedded inside single-quoted shell assignments via sh_quote.
     format!(
         r#"set -euo pipefail
 EXPECTED={expected}
@@ -301,7 +290,6 @@ fn run_ssh_once(
     if let Some(dest) = destination {
         cmd.arg(dest);
     }
-    // Remote command as a single argument so ssh does not word-split oddly.
     cmd.arg(remote_cmd);
     cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -322,121 +310,23 @@ fn exit_status_label(status: ExitStatus) -> String {
     }
 }
 
-fn wait_for_reconnect(delay: Duration) -> Result<WaitOutcome> {
-    let stdin_fd = io::stdin().as_raw_fd();
-    let orig = tcgetattr(io::stdin().as_fd()).context("tcgetattr")?;
-    let mut raw = orig.clone();
-    // Non-canonical, no echo; return as soon as one byte is available.
-    raw.local_flags.remove(LocalFlags::ICANON | LocalFlags::ECHO);
-    raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 0;
-    raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
-    tcsetattr(io::stdin().as_fd(), SetArg::TCSANOW, &raw).context("tcsetattr reconnect")?;
-    let _guard = TermiosGuard {
-        fd: stdin_fd,
-        termios: orig,
-    };
-
-    INTERRUPT_FLAG.store(false, Ordering::Relaxed);
-    unsafe {
-        let _ = nix::sys::signal::signal(
-            nix::sys::signal::Signal::SIGINT,
-            nix::sys::signal::SigHandler::Handler(handle_interrupt),
-        );
-    }
-
-    let deadline = Instant::now() + delay;
-    let mut last_print = Instant::now() - Duration::from_secs(2);
-
-    loop {
-        if INTERRUPT_FLAG.load(Ordering::Relaxed) {
-            eprintln!();
-            return Ok(WaitOutcome::Quit);
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            eprint!("\r\x1b[K");
-            let _ = io::stderr().flush();
-            return Ok(WaitOutcome::TimedOut);
-        }
-
-        if now.duration_since(last_print) >= Duration::from_millis(200) {
-            let left = deadline.saturating_duration_since(now);
-            let secs = left.as_secs().max(1);
-            eprint!(
-                "\r\x1b[Kreshell ssh: reconnecting in {secs}s…  (R retry now, Q quit)"
-            );
-            let _ = io::stderr().flush();
-            last_print = now;
-        }
-
-        let mut fds = [PollFd::new(
-            unsafe { BorrowedFd::borrow_raw(stdin_fd) },
-            PollFlags::POLLIN,
-        )];
-        let wait = Duration::from_millis(100)
-            .min(deadline.saturating_duration_since(Instant::now()));
-        let wait_ms = wait.as_millis().min(i32::MAX as u128) as i32;
-        match poll(&mut fds, wait_ms as u16) {
-            Ok(_) => {}
-            Err(Errno::EINTR) => continue,
-            Err(e) => return Err(e).context("poll stdin"),
-        }
-
-        if fds[0]
-            .revents()
-            .map(|r| r.contains(PollFlags::POLLIN))
-            .unwrap_or(false)
-        {
-            let mut buf = [0u8; 32];
-            match nix_read(stdin_fd, &mut buf) {
-                Ok(0) => {}
-                Ok(n) => {
-                    for &b in &buf[..n] {
-                        match b {
-                            b'r' | b'R' => {
-                                eprint!("\r\x1b[K");
-                                let _ = io::stderr().flush();
-                                return Ok(WaitOutcome::RetryNow);
-                            }
-                            b'q' | b'Q' | 0x03 /* Ctrl+C */ => {
-                                eprint!("\r\x1b[K");
-                                let _ = io::stderr().flush();
-                                return Ok(WaitOutcome::Quit);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(Errno::EAGAIN) | Err(Errno::EINTR) => {}
-                Err(e) => {
-                    let err = io::Error::from(e);
-                    if err.kind() != ErrorKind::WouldBlock {
-                        return Err(err).context("read stdin");
-                    }
-                }
-            }
-        }
+fn classify_key(b: u8) -> Option<WaitOutcome> {
+    match b {
+        b'r' | b'R' => Some(WaitOutcome::RetryNow),
+        b'q' | b'Q' | 0x03 => Some(WaitOutcome::Quit),
+        _ => None,
     }
 }
 
-struct TermiosGuard {
-    fd: i32,
-    termios: Termios,
+fn print_reconnect_status(left: Duration) {
+    let secs = left.as_secs().max(1);
+    eprint!("\r\x1b[Kreshell ssh: reconnecting in {secs}s…  (R retry now, Q quit)");
+    let _ = io::stderr().flush();
 }
 
-impl Drop for TermiosGuard {
-    fn drop(&mut self) {
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = tcsetattr(fd, SetArg::TCSAFLUSH, &self.termios);
-        // Restore default SIGINT so later code sees normal Ctrl+C.
-        unsafe {
-            let _ = nix::sys::signal::signal(
-                nix::sys::signal::Signal::SIGINT,
-                nix::sys::signal::SigHandler::SigDfl,
-            );
-        }
-    }
+fn clear_status_line() {
+    eprint!("\r\x1b[K");
+    let _ = io::stderr().flush();
 }
 
 /// Single-quote a string for safe embedding in a POSIX shell script.
@@ -486,16 +376,260 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+#[cfg(unix)]
+mod tty {
+    use super::*;
+    use std::io::ErrorKind;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use nix::errno::Errno;
+    use nix::poll::{poll, PollFd, PollFlags};
+    use nix::sys::termios::{
+        tcgetattr, tcsetattr, LocalFlags, SetArg, SpecialCharacterIndices, Termios,
+    };
+    use nix::unistd::{isatty, read as nix_read};
+
+    static INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn handle_interrupt(_: nix::libc::c_int) {
+        INTERRUPT_FLAG.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stdin_is_tty() -> bool {
+        isatty(io::stdin().as_raw_fd()).unwrap_or(false)
+    }
+
+    pub fn wait_for_reconnect(delay: Duration) -> Result<WaitOutcome> {
+        let stdin_fd = io::stdin().as_raw_fd();
+        let orig = tcgetattr(io::stdin().as_fd()).context("tcgetattr")?;
+        let mut raw = orig.clone();
+        raw.local_flags.remove(LocalFlags::ICANON | LocalFlags::ECHO);
+        raw.control_chars[SpecialCharacterIndices::VMIN as usize] = 0;
+        raw.control_chars[SpecialCharacterIndices::VTIME as usize] = 0;
+        tcsetattr(io::stdin().as_fd(), SetArg::TCSANOW, &raw).context("tcsetattr reconnect")?;
+        let _guard = TermiosGuard {
+            fd: stdin_fd,
+            termios: orig,
+        };
+
+        INTERRUPT_FLAG.store(false, Ordering::Relaxed);
+        unsafe {
+            let _ = nix::sys::signal::signal(
+                nix::sys::signal::Signal::SIGINT,
+                nix::sys::signal::SigHandler::Handler(handle_interrupt),
+            );
+        }
+
+        let deadline = Instant::now() + delay;
+        let mut last_print = Instant::now() - Duration::from_secs(2);
+
+        loop {
+            if INTERRUPT_FLAG.load(Ordering::Relaxed) {
+                eprintln!();
+                return Ok(WaitOutcome::Quit);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                clear_status_line();
+                return Ok(WaitOutcome::TimedOut);
+            }
+
+            if now.duration_since(last_print) >= Duration::from_millis(200) {
+                print_reconnect_status(deadline.saturating_duration_since(now));
+                last_print = now;
+            }
+
+            let mut fds = [PollFd::new(
+                unsafe { BorrowedFd::borrow_raw(stdin_fd) },
+                PollFlags::POLLIN,
+            )];
+            let wait = Duration::from_millis(100)
+                .min(deadline.saturating_duration_since(Instant::now()));
+            let wait_ms = wait.as_millis().min(i32::MAX as u128) as i32;
+            match poll(&mut fds, wait_ms as u16) {
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(e) => return Err(e).context("poll stdin"),
+            }
+
+            if fds[0]
+                .revents()
+                .map(|r| r.contains(PollFlags::POLLIN))
+                .unwrap_or(false)
+            {
+                let mut buf = [0u8; 32];
+                match nix_read(stdin_fd, &mut buf) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        for &b in &buf[..n] {
+                            if let Some(out) = classify_key(b) {
+                                clear_status_line();
+                                return Ok(out);
+                            }
+                        }
+                    }
+                    Err(Errno::EAGAIN) | Err(Errno::EINTR) => {}
+                    Err(e) => {
+                        let err = io::Error::from(e);
+                        if err.kind() != ErrorKind::WouldBlock {
+                            return Err(err).context("read stdin");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    struct TermiosGuard {
+        fd: i32,
+        termios: Termios,
+    }
+
+    impl Drop for TermiosGuard {
+        fn drop(&mut self) {
+            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+            let _ = tcsetattr(fd, SetArg::TCSAFLUSH, &self.termios);
+            unsafe {
+                let _ = nix::sys::signal::signal(
+                    nix::sys::signal::Signal::SIGINT,
+                    nix::sys::signal::SigHandler::SigDfl,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod tty {
+    use super::*;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+        ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    pub fn stdin_is_tty() -> bool {
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            if handle.is_null() || handle == (-1isize as _) {
+                return false;
+            }
+            let mut mode = 0u32;
+            GetConsoleMode(handle, &mut mode) != 0
+        }
+    }
+
+    pub fn wait_for_reconnect(delay: Duration) -> Result<WaitOutcome> {
+        let handle = io::stdin().as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let mut orig_mode = 0u32;
+        let has_console = unsafe { GetConsoleMode(handle, &mut orig_mode) != 0 };
+        if has_console {
+            let raw = orig_mode
+                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+            unsafe {
+                SetConsoleMode(handle, raw);
+            }
+        }
+        let _guard = ConsoleModeGuard {
+            handle,
+            mode: orig_mode,
+            restore: has_console,
+        };
+
+        let deadline = Instant::now() + delay;
+        let mut last_print = Instant::now() - Duration::from_secs(2);
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                clear_status_line();
+                return Ok(WaitOutcome::TimedOut);
+            }
+
+            if now.duration_since(last_print) >= Duration::from_millis(200) {
+                print_reconnect_status(deadline.saturating_duration_since(now));
+                last_print = now;
+            }
+
+            let wait = Duration::from_millis(100)
+                .min(deadline.saturating_duration_since(Instant::now()));
+            let wait_ms = wait.as_millis().min(u32::MAX as u128) as u32;
+            let wr = unsafe { WaitForSingleObject(handle, wait_ms) };
+            if wr != WAIT_OBJECT_0 {
+                continue;
+            }
+
+            let mut buf = [0u8; 32];
+            let mut read = 0u32;
+            let ok = unsafe {
+                ReadFile(
+                    handle,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len() as u32,
+                    &mut read,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 || read == 0 {
+                continue;
+            }
+            for &b in &buf[..read as usize] {
+                if let Some(out) = classify_key(b) {
+                    clear_status_line();
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    struct ConsoleModeGuard {
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        mode: u32,
+        restore: bool,
+    }
+
+    impl Drop for ConsoleModeGuard {
+        fn drop(&mut self) {
+            if self.restore {
+                unsafe {
+                    SetConsoleMode(self.handle, self.mode);
+                }
+            }
+            // Do not CloseHandle stdin.
+        }
+    }
+}
+
+use tty::{stdin_is_tty, wait_for_reconnect};
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn backoff_doubles_then_caps() {
-        assert_eq!(next_reconnect_delay(Duration::from_secs(1)), Duration::from_secs(2));
-        assert_eq!(next_reconnect_delay(Duration::from_secs(2)), Duration::from_secs(4));
-        assert_eq!(next_reconnect_delay(Duration::from_secs(32)), Duration::from_secs(60));
-        assert_eq!(next_reconnect_delay(Duration::from_secs(60)), Duration::from_secs(60));
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(1)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(2)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(32)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -515,7 +649,6 @@ mod tests {
 
     #[test]
     fn base64_roundtrip_known() {
-        // "f" -> Zg==, "fo" -> Zm8=, "foo" -> Zm9v
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
@@ -547,7 +680,6 @@ mod tests {
             install_ref: DEFAULT_INSTALL_REF,
         });
         assert!(cmd.contains("base64 -d"));
-        assert!(!cmd.contains("$HOME/.pixi/bin:$PATH") || cmd.contains("base64"));
     }
 
     #[test]
