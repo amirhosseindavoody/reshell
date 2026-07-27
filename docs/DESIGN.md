@@ -592,7 +592,7 @@ Mirrors the csv-utils dual-manifest pattern:
 | `Cargo.toml` / `Cargo.lock` | Rust crate; lockfile used with `--locked` in conda builds |
 | `pixi.toml` / `pixi.lock` | Conda env: Rust from conda-forge; tasks; pixi-build; platforms `linux-64` + `win-64` + `win-arm64` |
 | `recipe/recipe.yaml` | rattler-build via `cargo install --root`; Windows `build-win.bat` → `build-win.ps1` (MSVC discovery, strips Git/conda unix `link`) |
-| `.github/workflows/windows-package.yml` | Builds win-64 on `windows-latest`; uploads artifacts; publishes rolling `windows-client` release (prebuilt `.conda` + `.exe`) |
+| `.github/workflows/package.yml` | `pixi build` for linux-64 + win-64; uploads artifacts; publishes rolling `packages` GitHub Release |
 | `scripts/update-version.sh` | CalVer `YYYY.M.D+N` across Cargo / pixi / recipe |
 
 `win-64` builds an ssh-client-only binary (daemon modules are `cfg(unix)`). Dev
@@ -624,7 +624,10 @@ Attach’s TTY path is exercised manually or via an external PTY driver; the smo
 test intentionally talks the wire protocol so CI does not need a controlling TTY.
 
 CI (`.github/workflows/ci.yml`) runs `cargo test --locked` and `pixi run test` on
-Linux.
+Linux. Packaging (`.github/workflows/package.yml`) runs `pixi build` for
+linux-64 and win-64 and publishes the rolling
+[`packages`](https://github.com/amirhosseindavoody/reshell/releases/tag/packages)
+release.
 
 ## 13. Open Questions
 
@@ -642,11 +645,13 @@ Linux.
   vswhere / Program Files scan, pins `CARGO_TARGET_*_LINKER`, strips
   Git/msys/conda unix `link` from `PATH`, and **hard-fails** with a prebuilt /
   winget hint if MSVC is missing
-  ([#29](https://github.com/amirhosseindavoody/reshell/issues/29)). CI publishes
-  a rolling [`windows-client`](https://github.com/amirhosseindavoody/reshell/releases/tag/windows-client)
-  release (`.conda` + bare `.exe`) so end users need not install Visual Studio.
-  Source builds still require host VS Build Tools — MSVC is not redistributable
-  via conda.
+  ([#29](https://github.com/amirhosseindavoody/reshell/issues/29)). CI
+  (`.github/workflows/package.yml`) runs `pixi build` for **linux-64** and
+  **win-64** and publishes a rolling
+  [`packages`](https://github.com/amirhosseindavoody/reshell/releases/tag/packages)
+  release so end users install known-good `.conda` files without a local
+  toolchain. Source builds on Windows still require host VS Build Tools —
+  MSVC is not redistributable via conda.
 - **Attach exclusivity** — Advisory `flock` on `attached` for the life of the
   connection; stale files without a holder are cleared.
 - **In-session leave-and-join** — `attach` / `new` / picker always leave the

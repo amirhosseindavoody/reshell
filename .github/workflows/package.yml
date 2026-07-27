@@ -1,0 +1,185 @@
+name: Package
+
+# Build linux-64 + win-64 conda packages with `pixi build` and publish them to
+# the rolling GitHub Release `packages`. PR runs upload artifacts (and also
+# refresh the release for same-repo PRs) so a green check means installable
+# binaries exist — no local MSVC / toolchain required (#29).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*", "20*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux64:
+    name: pixi build (linux-64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.8
+        with:
+          run-install: false
+
+      - name: pixi build
+        run: pixi build --output-dir dist
+
+      - name: Stage fixed-name artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          conda=$(find dist . -name 'reshell*.conda' -type f | head -n1)
+          if [ -z "$conda" ]; then
+            echo "No reshell .conda found after pixi build"
+            find . -name '*.conda' -type f || true
+            exit 1
+          fi
+          cp -f "$conda" dist/reshell-linux-64.conda
+          ls -la dist/reshell-linux-64.conda
+          # Smoke-check: list archive members (conda is a zip).
+          python3 - <<'PY'
+          import zipfile
+          z = zipfile.ZipFile("dist/reshell-linux-64.conda")
+          names = z.namelist()
+          print("members:", len(names))
+          assert any("reshell" in n for n in names), names[:20]
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reshell-linux-64
+          path: dist/reshell-linux-64.conda
+          if-no-files-found: error
+
+  win64:
+    name: pixi build (win-64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.8
+        with:
+          run-install: false
+
+      - name: Show MSVC linker
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -products * -property installationPath
+          where.exe link
+
+      - name: pixi build
+        run: pixi build --output-dir dist
+
+      - name: Stage fixed-name artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $conda = Get-ChildItem -Path dist, . -Recurse -Filter "reshell*.conda" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $conda) {
+            Write-Error "No reshell .conda package found after pixi build"
+            Get-ChildItem -Recurse -Filter "*.conda" | Select-Object -ExpandProperty FullName
+            exit 1
+          }
+          Copy-Item -LiteralPath $conda.FullName -Destination "dist\reshell-win-64.conda" -Force
+          Write-Host "Staged $($conda.FullName) -> dist\reshell-win-64.conda"
+          Get-Item dist\reshell-win-64.conda | Format-Table Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reshell-win-64
+          path: dist/reshell-win-64.conda
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release (packages)
+    needs: [linux64, win64]
+    runs-on: ubuntu-latest
+    # Publish on main, tags, manual runs, and same-repo PRs (so a green PR
+    # already produces installable release assets).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - name: Download linux-64
+        uses: actions/download-artifact@v4
+        with:
+          name: reshell-linux-64
+          path: dist
+
+      - name: Download win-64
+        uses: actions/download-artifact@v4
+        with:
+          name: reshell-win-64
+          path: dist
+
+      - name: Show assets
+        run: ls -la dist && sha256sum dist/*
+
+      - name: Resolve release tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            name="reshell ${GITHUB_REF_NAME}"
+            latest=true
+          else
+            tag="packages"
+            name="Prebuilt packages (linux-64 + win-64)"
+            latest=false
+          fi
+          {
+            echo "tag=${tag}"
+            echo "name=${name}"
+            echo "latest=${latest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          make_latest: ${{ steps.meta.outputs.latest }}
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            Prebuilt conda packages from `pixi build` (CI-verified).
+
+            | Platform | Asset |
+            |----------|--------|
+            | Linux x86_64 | `reshell-linux-64.conda` |
+            | Windows x86_64 (ssh client) | `reshell-win-64.conda` |
+
+            ### Linux
+
+            ```bash
+            curl -fsSL -o reshell-linux-64.conda \
+              https://github.com/amirhosseindavoody/reshell/releases/download/${{ steps.meta.outputs.tag }}/reshell-linux-64.conda
+            pixi global install --force-reinstall --path ./reshell-linux-64.conda
+            reshell --help
+            ```
+
+            ### Windows
+
+            ```powershell
+            Invoke-WebRequest https://github.com/amirhosseindavoody/reshell/releases/download/${{ steps.meta.outputs.tag }}/reshell-win-64.conda -OutFile reshell-win-64.conda
+            pixi global install --force-reinstall --path .\reshell-win-64.conda
+            reshell ssh --help
+            ```
+
+            Commit: `${{ github.sha }}`
+            Workflow: `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+          files: |
+            dist/reshell-linux-64.conda
+            dist/reshell-win-64.conda
