@@ -60,9 +60,16 @@ pixi global install --force-reinstall --git https://github.com/amirhosseindavood
 reshell ssh myserver
 ```
 
-(Requires OpenSSH client on the Windows machine. Use `--force-reinstall` if a
-previous install left an empty environment.) Local commands like `new` /
-`attach` / `list` are Linux-only and are hidden in `reshell --help` on Windows.
+(Requires OpenSSH client. Use `--force-reinstall` if a previous install left a
+broken environment.) The Windows package is an **ssh client only**; session
+daemons still run on Linux. Local commands like `new` / `attach` / `list` are
+hidden in `reshell --help` on Windows.
+
+If the Windows **source build** fails with `/usr/bin/link: extra operand`, Git
+Bash’s unix `link.exe` is shadowing the MSVC linker — current `main` scrubs that
+during the recipe. You still need MSVC available via the conda `vs20xx`
+activation that comes with the Rust compiler (or Visual Studio Build Tools with
+the C++ workload).
 
 **Linux:** the same install exposes the full CLI (daemon + `ssh` client).
 ## Usage

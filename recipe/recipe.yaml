@@ -12,13 +12,12 @@ source:
   use_gitignore: true
 
 build:
-  # Bump when changing install layout so cached empty Windows builds are not reused.
-  number: 1
+  # Bump when changing install layout / Windows linker workaround.
+  number: 2
   script:
     # Use `cargo install --root` (same pattern as conda-forge ripgrep) so the
     # binary lands in a known place even when cargo writes under
-    # target/<triple>/release/. A silent miss on Windows previously produced a
-    # package with no .exe — pixi then reported that reshell "exposes nothing".
+    # target/<triple>/release/.
     - if: unix
       then: |
         set -euo pipefail
@@ -26,18 +25,11 @@ build:
         cargo install --locked --no-track --path . --root "$PREFIX"
         test -x "$PREFIX/bin/reshell"
         rm -f "$PREFIX/.crates.toml" "$PREFIX/.crates2.json"
+    # Windows: see build-win.bat — scrub Git/msys `link.exe` so MSVC's linker
+    # is used (otherwise: "/usr/bin/link: extra operand", issue #29).
     - if: win
-      then: |
-        @echo on
-        cd /d "%SRC_DIR%" || exit /b 1
-        cargo install --locked --no-track --path . --root "%PREFIX%\Library" || exit /b 1
-        if not exist "%PREFIX%\Library\bin\reshell.exe" (
-          echo ERROR: reshell.exe missing after cargo install
-          dir /s /b "%PREFIX%"
-          exit /b 1
-        )
-        if exist "%PREFIX%\Library\.crates.toml" del /F /Q "%PREFIX%\Library\.crates.toml"
-        if exist "%PREFIX%\Library\.crates2.json" del /F /Q "%PREFIX%\Library\.crates2.json"
+      then:
+        - build-win.bat
 
 requirements:
   build:
